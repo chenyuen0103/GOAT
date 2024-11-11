@@ -4,7 +4,7 @@ This is the official implementation for the algorithm **G**radual D**O**main **A
 
 # Install the repo
 ```
-git clone https://github.com/yifei-he/GOAT.git
+git clone https://github.com/chenyuen0103/GOAT.git
 cd GOAT
 pip install -r requirements.txt
 ```
