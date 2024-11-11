@@ -21,7 +21,7 @@ def save_data(data_dir='dataset_32x32', save_file='dataset_32x32.mat', target_si
     data_generator = datagen.flow_from_directory(
         data_dir, shuffle=False, target_size=target_size, **image_options)
     while True:
-        next_x, next_y = data_generator.next()
+        next_x, next_y = next(data_generator)
         Xs.append(next_x)
         Ys.append(next_y)
         if data_generator.batch_index == 0:
@@ -56,7 +56,7 @@ def resize(path, size=64):
         if os.path.isfile(path+item):
             im = Image.open(path+item)
             f, e = os.path.splitext(path+item)
-            imResize = im.resize((size,size), Image.ANTIALIAS)
+            imResize = im.resize((size,size), Image.LANCZOS)
             imResize.save(f + '.png', 'PNG')
 
 for folder in ['./dataset_32x32/M/', './dataset_32x32/F/']:
