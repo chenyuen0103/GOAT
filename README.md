@@ -1,6 +1,6 @@
 ## Generative Gradual Domain Adaptation with Optimal Transport (GOAT)
 
-This is the official implementation for the algorithm **G**radual D**O**main **A**daptation with Optimal **T**ransport (GOAT) in the paper ["Gradual Domain Adaptation: Theory and Algorithms."](https://arxiv.org/abs/2310.13852). The algorithm design is motivated by our previous work, ["Understanding gradual domain adaptation: Improved analysis, optimal path and beyond"](https://arxiv.org/abs/2204.08200), published in ICML 2022.
+This is the official implementation for the algorithm **G**radual D**O**main **A**daptation with Optimal **T**ransport (GOAT) in the paper ["Gradual Domain Adaptation: Theory and Algorithms."](https://arxiv.org/abs/2310.13852) at JMLR. The algorithm design is motivated by our previous work, ["Understanding gradual domain adaptation: Improved analysis, optimal path and beyond"](https://arxiv.org/abs/2204.08200), published in ICML 2022.
 
 # Install the repo
 ```
@@ -25,13 +25,15 @@ Here, `dataset` can be selected from `[mnist, portraits, covtype, color_mnist]`;
 # Citation
 
 ```
-@misc{he2023gradual,
-      title={Gradual Domain Adaptation: Theory and Algorithms}, 
-      author={Yifei He and Haoxiang Wang and Bo Li and Han Zhao},
-      year={2023},
-      eprint={2310.13852},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG}
+@article{JMLR:v25:23-1180,
+  author  = {Yifei He and Haoxiang Wang and Bo Li and Han Zhao},
+  title   = {Gradual Domain Adaptation: Theory and Algorithms},
+  journal = {Journal of Machine Learning Research},
+  year    = {2024},
+  volume  = {25},
+  number  = {361},
+  pages   = {1--40},
+  url     = {http://jmlr.org/papers/v25/23-1180.html}
 }
 ```
 ```
