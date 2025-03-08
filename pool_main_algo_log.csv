@@ -1,0 +1,3 @@
+Domain Index,Domain Type,Epoch,Train Set Size,Train Loss,Train Acc,Target Loss,Target Acc
+0,source,5,9000,48.8018,91.1222,0.0272,12.91
+1,real,5,9000,49.5187,91.3556,0.0261,13.4
