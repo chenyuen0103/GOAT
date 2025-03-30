@@ -12,6 +12,7 @@ import argparse
 import random
 import torch.backends.cudnn as cudnn
 import time
+import os
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -82,6 +83,7 @@ def run_mnist_experiment(target, gt_domains, generated_domains):
 
     elapsed = round(time.time() - t, 2)
     print(elapsed)
+    os.makedirs("logs", exist_ok=True)
     with open(f"logs/mnist_{target}_{gt_domains}_layer.txt", "a") as f:
         f.write(f"seed{args.seed}with{gt_domains}gt{generated_domains}generated,{round(direct_acc, 2)},{round(st_acc, 2)},{round(direct_acc_all, 2)},{round(st_acc_all, 2)},{round(generated_acc, 2)}\n")
 
@@ -140,6 +142,7 @@ def run_mnist_ablation(target, gt_domains, generated_domains):
         all_domains3 += generate_domains(generated_domains, encoded_intersets[i], encoded_intersets[i+1])
     _, generated_acc3 = self_train(args, model_copy3.mlp, all_domains3, epochs=10)
 
+    os.makedirs("logs", exist_ok=True)
     with open(f"logs/mnist_{target}_{generated_domains}_ablation.txt", "a") as f:
         f.write(f"seed{args.seed}generated{generated_domains},{round(direct_acc, 2)},{round(st_acc, 2)},{round(st_acc_all, 2)},{round(generated_acc1, 2)},{round(generated_acc4.item(), 2)},{round(generated_acc2, 2)},{round(generated_acc3, 2)}\n")
 
@@ -175,6 +178,7 @@ def run_portraits_experiment(gt_domains, generated_domains):
     direct_acc, st_acc, direct_acc_all, st_acc_all, generated_acc = run_goat(model_copy, source_model, src_trainset, tgt_trainset, all_sets, generated_domains, epochs=5)
 
     elapsed = round(time.time() - t, 2)
+    os.makedirs("logs", exist_ok=True)
     with open(f"logs/portraits_exp_time.txt", "a") as f:
         f.write(f"seed{args.seed}with{gt_domains}gt{generated_domains}generated,{round(direct_acc, 2)},{round(st_acc, 2)},{round(direct_acc_all, 2)},{round(st_acc_all, 2)},{round(generated_acc, 2)}\n")
 
@@ -208,6 +212,7 @@ def run_covtype_experiment(gt_domains, generated_domains):
 
     direct_acc, st_acc, direct_acc_all, st_acc_all, generated_acc = run_goat(model_copy, source_model, src_trainset, tgt_trainset, all_sets, generated_domains, epochs=5)
 
+    os.makedirs("logs", exist_ok=True)
     with open(f"logs/covtype_exp_{args.log_file}.txt", "a") as f:
             f.write(f"seed{args.seed}with{gt_domains}gt{generated_domains}generated,{round(direct_acc, 2)},{round(st_acc, 2)},{round(st_acc_all, 2)},{round(generated_acc, 2)}\n")
 
@@ -247,7 +252,8 @@ def run_color_mnist_experiment(gt_domains, generated_domains):
     all_sets.append(tgt_trainset)
 
     direct_acc, st_acc, direct_acc_all, st_acc_all, generated_acc = run_goat(model_copy, source_model, src_trainset, tgt_trainset, all_sets, generated_domains, epochs=10)
-        
+    
+    os.makedirs("logs", exist_ok=True)
     with open(f"logs/color{args.log_file}.txt", "a") as f:
         f.write(f"seed{args.seed}with{gt_domains}gt{generated_domains}generated,{round(direct_acc, 2)},{round(st_acc, 2)},{round(direct_acc_all, 2)},{round(st_acc_all, 2)},{round(generated_acc, 2)}\n")
 

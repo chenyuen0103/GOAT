@@ -1,0 +1,10 @@
+.idea/
+.DS_Store
+dataset_32x32
+__pycache__
+dataset_32x32*
+src/
+*.zip
+*.gz
+*.mat
+logs/*
