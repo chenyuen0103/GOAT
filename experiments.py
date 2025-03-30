@@ -1,91 +1,622 @@
 import torch
 from model import *
 import torch.optim as optim
+import torchvision
 from train_model import *
 from util import *
 from ot_util import ot_ablation
 from da_algo import *
 from ot_util import generate_domains
+from expansion_util import *
 from dataset import *
 import copy
 import argparse
 import random
 import torch.backends.cudnn as cudnn
 import time
-import os
+import os 
+from torch.utils.tensorboard import SummaryWriter
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset
+import pickle
+import csv
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-def get_source_model(args, trainset, testset, n_class, mode, encoder=None, epochs=50, verbose=True):
 
-    print("Start training source model")
+def plot_encoded_domains(encoded_source, encoded_inter, encoded_target, title_src="Encoded Source", title_inter = "Encoded Inter",
+                         title_tgt="Encoded Target", method='goat', save_dir = 'plots',pca=None):
+
+    src_data = torch.tensor(encoded_source.data) if not torch.is_tensor(encoded_source.data) else encoded_source.data
+    inter_data = torch.tensor(encoded_inter.data) if not torch.is_tensor(encoded_inter.data) else encoded_inter.data
+    tgt_data = torch.tensor(encoded_target.data) if not torch.is_tensor(encoded_target.data) else encoded_target.data
+    src_data = src_data.reshape(src_data.shape[0], -1)
+    inter_data = inter_data.reshape(inter_data.shape[0], -1)
+    tgt_data = tgt_data.reshape(tgt_data.shape[0], -1)
+
+
+    all_data = torch.cat([src_data, inter_data, tgt_data], dim=0).view(len(src_data) + len(inter_data) + len(tgt_data), -1)
+    fit_data = torch.cat([src_data, tgt_data], dim=0).view(len(src_data) + len(tgt_data), -1)
+    if pca is None:
+        fit_data = torch.cat([src_data, tgt_data], dim=0)
+        pca = PCA(n_components=2)
+        pca.fit(fit_data.cpu().numpy())
+
+    z_all = pca.transform(all_data.cpu().numpy())
+
+    z_src = z_all[:len(src_data)]
+    z_inter = z_all[len(src_data):len(src_data) + len(inter_data)]
+    z_tgt = z_all[len(src_data) + len(inter_data):]
+
+
+
+
+    y_src = encoded_source.targets.cpu().numpy()
+    y_inter = encoded_inter.targets.cpu().numpy()
+    y_tgt = encoded_target.targets.cpu().numpy()
+
+    fig, axs = plt.subplots(1, 3, figsize=(16, 5), sharex=True, sharey=True)
+
+    for c in np.unique(y_src):
+        axs[0].scatter(z_src[y_src == c, 0], z_src[y_src == c, 1], label=f"Class {c}", alpha=0.6, s=10)
+    axs[0].set_title(title_src)
+    axs[0].set_xlabel("PC 1")
+    axs[0].set_ylabel("PC 2")
+    axs[0].legend()
+    axs[0].grid(True)
+
+    for c in np.unique(y_inter):
+        axs[1].scatter(z_inter[y_inter == c, 0], z_inter[y_inter == c, 1], label=f"Class {c}", alpha=0.6, s=10)
+    axs[1].set_title(title_inter)
+    axs[1].set_xlabel("PC 1")
+    axs[1].legend()
+    axs[1].grid(True)
+
+    for c in np.unique(y_tgt):
+        axs[2].scatter(z_tgt[y_tgt == c, 0], z_tgt[y_tgt == c, 1], label=f"Class {c}", alpha=0.6, s=10)
+    axs[2].set_title(title_tgt)
+    axs[2].set_xlabel("PC 1")
+    axs[2].legend()
+    axs[2].grid(True)
+    os.makedirs(save_dir, exist_ok=True)
+    plt.suptitle("Encoded Source vs Target Projections")
+    plt.tight_layout()
+    plt.savefig(f"{save_dir}/encoded_domains_{method}.png")
+    plt.close()
+
+    return pca  # optionally return the fitted PCA
+
+
+def log_progress(log_file, step, step_type, domain_idx, dataset, acc1=None, acc2=None, acc3=None, target_acc=None):
+    """
+    Logs training progress to a CSV file.
+
+    Args:
+        log_file (str): Path to the CSV log file.
+        step (int): The sequential step number.
+        step_type (str): Type of domain (Real_Intermediate, Synthetic_Intermediate, Final_Adaptation).
+        domain_idx (int): The index of the domain (0,1,2,...).
+        dataset (str): Dataset type (Ground-Truth, Synthetic, Target, etc.).
+        acc1, acc2, acc3 (float, optional): Accuracy values.
+        target_acc (float, optional): Accuracy on the target domain.
+    """
+    if not os.path.exists(log_file):
+        with open(log_file, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Step", "Type", "Domain_Index", "Dataset", "Direct_Acc", "ST_Acc", "Generated_Acc", "Target_Acc", "Timestamp"])
+
+    with open(log_file, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            step, step_type, domain_idx, dataset, 
+            round(acc1, 4) if acc1 is not None else "", 
+            round(acc2, 4) if acc2 is not None else "", 
+            round(acc3, 4) if acc3 is not None else "", 
+            round(target_acc, 4) if target_acc is not None else "", 
+            time.time()
+        ])
+
+
+def init_tensorboard(log_dir='logs/tensorboard'):
+    os.makedirs(log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=log_dir)
+    return writer
+
+
+def get_source_model(args, trainset, testset, n_class, mode, encoder=None, epochs=50, verbose=True, model_path="cache/source_model.pth", target_dataset = None, force_recompute=False):
+
     model = Classifier(encoder, MLP(mode=mode, n_class=n_class, hidden=1024)).to(device)
+    if os.path.exists(model_path) and not force_recompute:
+        print(f"✅ Loading cached trained model from {model_path}")
+        model.load_state_dict(torch.load(model_path, weights_only=True))
+        return model
 
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-    testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-
-    for epoch in range(1, epochs+1):
-        train(epoch, trainloader, model, optimizer, verbose=verbose)
-        if epoch % 5 == 0:
-            test(testloader, model, verbose=verbose)
-
+    model = get_source_model_old(args, trainset, testset, n_class, mode, encoder, epochs=epochs, target_dataset=target_dataset)
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    torch.save(model.state_dict(), model_path)  # ✅ Save model for future runs
+    
     return model
 
 
-def run_goat(model_copy, source_model, src_trainset, tgt_trainset, all_sets, generated_domains, epochs=10):
+def get_source_model_old(args, trainset, testset, n_class, mode, encoder=None, epochs=50, verbose=True, target_dataset=None):
+    print("Start training source model (with optional SSL)")
+    model = Classifier(encoder, MLP(mode=mode, n_class=n_class, hidden=1024)).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    
+    trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    if target_dataset is not None:
+        tgt_loader = DataLoader(target_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+        tgt_iter = iter(tgt_loader)  # infinite loop handled later
 
+    for epoch in range(1, epochs + 1):
+        model.train()
+        train_loss = 0
+        for _, batch in enumerate(trainloader):
+            if len(batch) == 2:
+                data, labels = batch
+                weight = None
+            else:
+                data, labels, weight = batch
+                weight = weight.to(device)
+
+            data = data.to(device)
+            labels = labels.to(device)
+            optimizer.zero_grad()
+
+            output = model(data)
+            if weight is None:
+                loss = F.cross_entropy(output, labels)
+            else:
+                criterion = nn.CrossEntropyLoss(reduction='none')
+                loss = criterion(output, labels)
+                loss = (loss * weight).mean()
+
+            loss.backward()
+            train_loss += loss.item()
+            optimizer.step()
+            # 🔹 Get target batch for contrastive loss
+        if target_dataset is not None:
+            unsup_loss_total = 0
+            for _, tgt_batch in enumerate(tgt_loader):
+
+                x_tgt, _ = tgt_batch
+                x_tgt = x_tgt.to(device)
+
+
+                x1 = augment(x_tgt)
+                x2 = augment(x_tgt)
+                z1 = model.encoder(x1)
+                z2 = model.encoder(x2)
+                z1 = F.normalize(z1.view(z1.size(0), -1) + 1e-6, dim=1)
+                z2 = F.normalize(z2.view(z2.size(0), -1) + 1e-6, dim=1)
+
+                unsup_loss = nt_xent_loss(z1, z2) * 0.1
+                optimizer.zero_grad()
+                unsup_loss.backward()
+                optimizer.step()
+                unsup_loss_total += unsup_loss.item()
+
+            print(f"[Epoch {epoch}] Classification Loss: {train_loss / len(trainloader):.4f} | Contrastive Loss (unsup): {unsup_loss_total / len(tgt_loader):.4f}")
+        else:
+            print(f"[Epoch {epoch}] Total Loss: {train_loss / len(trainloader):.4f}")
+
+        if epoch % 5 == 0:
+            test(testloader, model, verbose=verbose)
+    
+    return model
+
+# def get_source_model_old(args, trainset, testset, n_class, mode, encoder=None, epochs=50, verbose=True):
+#     print("Start training source model")
+#     model = Classifier(encoder, MLP(mode=mode, n_class=n_class, hidden=1024)).to(device)
+#     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+#     trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+#     testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+
+#     for epoch in range(1, epochs+1):
+#         train(epoch, trainloader, model, optimizer, verbose=verbose)
+#         if epoch % 5 == 0:
+#             test(testloader, model, verbose=verbose)
+#     return model
+
+
+def nt_xent_loss(z_i, z_j, temperature=1):
+    z = torch.cat([z_i, z_j], dim=0)  # (2N, d)
+    z = F.normalize(z + 1e-6, dim=1)
+    similarity = z @ z.T  # cosine similarity matrix
+    N = z_i.size(0)
+
+    labels = torch.arange(N, device=z.device)
+    labels = torch.cat([labels, labels], dim=0)
+
+    mask = torch.eye(2*N, dtype=torch.bool, device=z.device)
+    similarity = similarity.masked_fill(mask, -9e15)
+
+    similarity = similarity / temperature
+    similarity = torch.clamp(similarity, min=-100, max=100)
+    loss = F.cross_entropy(similarity, labels)
+    return loss
+
+import kornia.augmentation as K
+
+augment = nn.Sequential(
+    K.RandomResizedCrop((28, 28), scale=(0.8, 1.0)),
+    K.RandomHorizontalFlip(),
+    K.RandomAffine(degrees=10, translate=(0.1, 0.1)),
+).to(device)
+
+
+
+def train_encoder_self_supervised(model, target_dataset, epochs=10, batch_size=128, lr=1e-3):
+    print("🔁 Self-supervised training on target domain")
+
+    encoder = model.encoder.to(device)
+    encoder.eval()  # Just to get output shape from one forward pass
+
+    # Get encoder output dimension dynamically
+    dummy_input = torch.randn(1, 1, 28, 28).to(device)
+    with torch.no_grad():
+        dummy_output = encoder(dummy_input)
+    flattened_dim = dummy_output.view(1, -1).shape[1]  # e.g. 32*28*28 = 25088
+
+    encoder.train()  # Back to train mode
+
+    projection_head = model.mlp.to(device)
+
+    optimizer = torch.optim.Adam(list(encoder.parameters()) + list(projection_head.parameters()), lr=lr)
+    loader = DataLoader(target_dataset, batch_size=batch_size, shuffle=True)
+
+    for epoch in range(epochs):
+        encoder.train()
+        projection_head.train()
+        total_loss = 0
+        for batch_idx, x in enumerate(loader):
+            if len(x) == 3:
+                imgs, _, _ = x
+            else:
+                imgs = x[0]
+
+            imgs1 = augment(imgs).to(device)
+            imgs2 = augment(imgs).to(device)
+
+            z1 = projection_head(encoder(imgs1))
+            z2 = projection_head(encoder(imgs2))
+            # print("z1 mean:", z1.mean().item(), "std:", z1.std().item())
+            # print("z2 mean:", z2.mean().item(), "std:", z2.std().item())
+
+            loss = nt_xent_loss(z1, z2)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            print(f"Batch loss: {loss.item():.4f}")
+            # if batch_idx % 20 == 0:
+            #     print(f"[Epoch {epoch+1}, Batch {batch_idx}] Grad norms:")
+            #     for name, param in encoder.named_parameters():
+            #         if param.requires_grad and param.grad is not None:
+            #             print(f"  {name}: {param.grad.norm().item():.4e}")
+
+
+        print(f"[SSL] Epoch {epoch+1}: Loss = {total_loss / len(loader):.4f}")
+
+    return encoder
+
+
+def run_goat(model_copy, source_model, src_trainset, tgt_trainset, all_sets, deg_idx,generated_domains, epochs=10, target = 60):
+    step_counter = 0
     # get the performance of direct adaptation from the source to target, st involves self-training on target
+    # print("------------Direct adapt performance----------")
     direct_acc, st_acc = self_train(args, model_copy, [tgt_trainset], epochs=epochs)
     # get the performance of GST from the source to target, st involves self-training on target
+    # Also self-train on unlabeled target 
+    print("------------Self-train on pooled domains----------")
     direct_acc_all, st_acc_all = self_train(args, source_model, all_sets, epochs=epochs)
-
+    cache_dir = f"cache/target{target}/"
     # encode the source and target domains
-    e_src_trainset, e_tgt_trainset = get_encoded_dataset(source_model.encoder, src_trainset), get_encoded_dataset(source_model.encoder, tgt_trainset)
+    e_src_trainset, e_tgt_trainset = get_encoded_dataset(source_model.encoder, src_trainset, cache_path=os.path.join(cache_dir, "encoded_0.pt"), force_recompute=False), get_encoded_dataset(source_model.encoder, tgt_trainset, cache_path=os.path.join(cache_dir, f"encoded_{target}.pt"), force_recompute=False)
+    pca_model = plot_encoded_domains(e_src_trainset, e_src_trainset, e_tgt_trainset, method = 'goat')
 
     # encode the intermediate ground-truth domains
     intersets = all_sets[:-1]
     encoded_intersets = [e_src_trainset]
-    for i in intersets:
-        encoded_intersets.append(get_encoded_dataset(source_model.encoder, i))
+    for i, interset in enumerate(intersets):
+        cache_path = os.path.join(cache_dir, f"encoded_{deg_idx[i]}.pt")
+        encoded_intersets.append(get_encoded_dataset(source_model.encoder, interset, cache_path=cache_path), force_recompute=True)
     encoded_intersets.append(e_tgt_trainset)
 
     # generate intermediate domains
     generated_acc = 0
     if generated_domains > 0:
         all_domains = []
+        all_y_transported = []
         for i in range(len(encoded_intersets)-1):
-            all_domains += generate_domains(generated_domains, encoded_intersets[i], encoded_intersets[i+1])
+            new_domains = generate_domains(generated_domains, encoded_intersets[i], encoded_intersets[i+1])[0]
+            new_y_transported = generate_domains(generated_domains, encoded_intersets[i], encoded_intersets[i+1])[1]
+            all_domains += new_domains
+            all_y_transported.append(new_y_transported)
+            
+        print(f"Generating {generated_domains} beteween each pair of the {len(intersets)} ground-truth domains...")
+        # Plotting all generated intermediate domains
+        print("Plotting all generated intermediate domains...")
+        domain_idx = 0
+        for i in range(len(encoded_intersets) - 1):
+            src_dom = encoded_intersets[i]
+            tgt_dom = encoded_intersets[i + 1]
+            for j in range(generated_domains):
+                gen_dom = all_domains[domain_idx]
+                plot_encoded_domains(src_dom, gen_dom, tgt_dom,
+                                     title_src=f"Encoded {deg_idx[i-1] if i < len(deg_idx) else 'X'}",
+                                     title_inter=f"Generated {j+1}",
+                                     title_tgt=f"Encoded {deg_idx[i] if i < len(deg_idx) else 'X'}",
+                                     save_dir='plots/target{}/'.format(target),
+                                     method=f"goat_pair{i}_step{j}",
+                                        pca=pca_model)
+                domain_idx += 1
 
         _, generated_acc = self_train(args, source_model.mlp, all_domains, epochs=epochs)
+        # plot all intermediate domains
+            
     
     return direct_acc, st_acc, direct_acc_all, st_acc_all, generated_acc
 
 
+
+def run_main_algo_oracle(model_copy, source_model, src_trainset, tgt_trainset, all_sets, deg_idx, generated_domains, epochs=10, log_file="main_algo_log.csv", target = 60):
+    """
+    Runs the main algorithm following the same structure as run_goat.
+    """
+    domain_indices = []
+    domain_types = []
+    # First, process source and real intermediate datasets
+    datasets = [src_trainset] + all_sets  # Include source and real domains
+    domain_indices.extend(range(len(datasets)))
+    domain_types.extend(["source"] + ["real"] * (len(all_sets) - 1) + ["target"])  
+    print("------------Direct adapt performance----------")
+    direct_acc, st_acc = self_train(args, model_copy, [tgt_trainset], epochs=epochs)
+    # get the performance of GST from the source to target, st involves self-training on target
+    # Also self-train on unlabeled target 
+    print("------------Self-train on pooled domains----------")
+    direct_acc_all, st_acc_all = self_train(args, source_model, all_sets, epochs=epochs)
+    cache_dir = f"cache/target{target}/"
+    plot_dir = f"plots/target{target}/"
+
+    os.makedirs(cache_dir, exist_ok=True)
+    e_src_trainset, e_tgt_trainset = get_encoded_dataset(source_model.encoder, src_trainset, cache_path=os.path.join(cache_dir, "encoded_0.pt"), force_recompute=False), get_encoded_dataset(source_model.encoder, tgt_trainset, cache_path=os.path.join(cache_dir, f"encoded_{target}.pt"), force_recompute=False)
+    # breakpoint()
+    pca_model = plot_encoded_domains(e_src_trainset, e_src_trainset, e_tgt_trainset, save_dir = plot_dir, method = 'main_algo_oracle')
+
+    # Get the performance of direct adaptation from the source to target
+    # direct_acc, st_acc = self_train(args, model_copy, [tgt_trainset], [len(all_sets)-1], ['target'], epochs=epochs, log_file="direct_"+log_file)
+
+    # Get the performance of self-training across all ground-truth domains
+    # direct_acc_all, st_acc_all = self_train(args, source_model, all_sets, domain_indices, domain_types, epochs=epochs, log_file="pool_"+log_file)
+
+    # Encode the intermediate ground-truth domains
+    intersets = all_sets[:-1]
+    encoded_intersets = [e_src_trainset]
+    # breakpoint()
+    for i, interset in enumerate(intersets):
+        cache_path = os.path.join(cache_dir, f"encoded_{deg_idx[i]}.pt")
+        encoded_intersets.append(get_encoded_dataset(source_model.encoder, interset, cache_path=cache_path))
+    encoded_intersets.append(e_tgt_trainset)
+
+    # breakpoint()
+    print(f"Generating {generated_domains} beteween each pair of the {len(intersets)} ground-truth domains...")
+    # Generate intermediate domains using Wasserstein interpolaftion
+    generated_acc = 0
+    if generated_domains > 0:
+        all_domains = []
+
+        synthetic_indices = []
+        base_idx = len(domain_indices) - 1
+        # ✅ Generate synthetic domains for adaptation
+        for i in range(len(encoded_intersets) - 1):
+            output = generate_gauss_domains(
+                source_dataset=encoded_intersets[i],
+                target_dataset=encoded_intersets[i + 1],
+                n_wsteps=generated_domains,
+                device=device
+            )
+            
+            all_domains += output[1]
+            # all_domains.extend(inter_domains)
+            synthetic_indices.extend([base_idx + i + 1] * generated_domains)
+        print("Plotting all generated intermediate domains...")
+        domain_idx = 0
+        for i in range(len(encoded_intersets) - 1):
+            src_dom = encoded_intersets[i]
+            tgt_dom = encoded_intersets[i + 1]
+            for j in range(generated_domains):
+                gen_dom = all_domains[domain_idx]
+                # breakpoint()
+                plot_encoded_domains(src_dom, gen_dom, tgt_dom,
+                                    title_src=f"Encoded {deg_idx[i-1] if i < len(deg_idx) else 'X'}",
+                                    title_inter=f"Generated {j+1}",
+                                    title_tgt=f"Encoded {deg_idx[i] if i < len(deg_idx) else 'X'}",
+                                    save_dir=plot_dir,
+                                    method=f"oracle_gen_pair{i}_step{j}",
+                                    pca=pca_model)
+                domain_idx += 1
+
+        # Train on synthetic domains and log
+        domain_indices.extend(synthetic_indices)
+        domain_types.extend(["synthetic"] * len(synthetic_indices))
+        # breakpoint()
+        _, generated_acc = self_train(args, source_model.mlp, all_domains, epochs=epochs)
+
+    return 0, 0, 0, 0, generated_acc
+
+
+
+def run_main_algo(model_copy, source_model, src_trainset, tgt_trainset, all_sets, deg_idx, generated_domains, epochs=10, log_file="main_algo_log.csv", target = 60, stop_threshold = 0.1):
+    """
+    Runs the main algorithm following the same structure as run_goat.
+    """
+    domain_indices = []
+    domain_types = []
+    # First, process source and real intermediate datasets
+    # breakpoint()
+    datasets = [src_trainset] + all_sets  # Include source and real domains
+    domain_indices.extend(range(len(datasets)))
+    domain_types.extend(["source"] + ["real"] * (len(all_sets) - 1) + ["target"])
+    direct_acc, st_acc = self_train(args, model_copy, [tgt_trainset], epochs=epochs)
+    # get the performance of GST from the source to target, st involves self-training on target
+    # Also self-train on unlabeled target 
+    print("------------Self-train on pooled domains----------")
+    direct_acc_all, st_acc_all = self_train(args, source_model, all_sets, epochs=epochs)
+    cache_dir = "cache/target{}/".format(target)
+    plot_dir = "plots/target{}/".format(target)
+    os.makedirs(cache_dir, exist_ok=True)
+    e_src_trainset, e_tgt_trainset = get_encoded_dataset(source_model.encoder, src_trainset, cache_path=os.path.join(cache_dir, "encoded_0.pt")), get_encoded_dataset(source_model.encoder, tgt_trainset, cache_path=os.path.join(cache_dir, f"encoded_{target}.pt"))
+    pca_model = plot_encoded_domains(e_src_trainset, e_src_trainset, e_tgt_trainset, method = 'main_algo')
+    # Encode the intermediate ground-truth domains
+    intersets = all_sets[:-1]
+    encoded_intersets = [e_src_trainset]
+    # breakpoint()
+    for i, interset in enumerate(intersets):
+        cache_path = os.path.join(cache_dir, f"encoded_{deg_idx[i]}.pt")
+        encoded_intersets.append(get_encoded_dataset(source_model.encoder, interset, cache_path=cache_path, force_recompute=True))
+    encoded_intersets.append(e_tgt_trainset)
+
+    # breakpoint()
+    print(f"Generating {generated_domains} beteween each pair of the {len(intersets)} ground-truth domains...")
+    # Generate intermediate domains using Wasserstein interpolaftion
+    generated_acc = 0
+    if generated_domains > 0:
+        all_domains = []
+        synthetic_indices = []
+        base_idx = len(domain_indices) - 1
+        teacher = source_model.mlp
+        # ✅ Generate synthetic domains for adaptation
+        dom_count = 1
+        for i in range(len(encoded_intersets) - 1):
+            w2_target = 99
+            src_encoded = encoded_intersets[i]
+            tgt_encoded = encoded_intersets[i + 1]
+            # for step in range(generated_domains):
+            while w2_target > stop_threshold:
+                # Generate one intermediate domain
+                w2_target, domain = generate_gauss_domains(
+                    src_encoded,
+                    tgt_encoded,
+                    n_wsteps=1,
+                    device=device,
+                )  # pick the first step only
+                domain = domain[0]
+                src_encoded = domain
+                # breakpoint()
+                
+                # Self-train on the generated domain
+                st_acc, teacher = self_train_one_domain(
+                    args,
+                    teacher,
+                    domain,
+                    tgt_encoded,
+                    epochs=epochs,
+                    source_idx = dom_count,
+                )
+                dom_count += 1
+                print(f"W2 distance to target: {w2_target}")
+
+                all_domains.append(domain)
+            # all_domains.extend(inter_domains)
+            synthetic_indices.extend([base_idx + i + 1] * generated_domains)
+
+        print("Plotting all generated intermediate domains...")
+        domain_idx = 0
+        for i in range(len(encoded_intersets) - 1):
+            src_dom = encoded_intersets[i]
+            tgt_dom = encoded_intersets[i + 1]
+            for j in range(generated_domains):
+                gen_dom = all_domains[domain_idx]
+                # breakpoint()
+                plot_encoded_domains(src_dom, gen_dom, tgt_dom,
+                                    title_src=f"Encoded {deg_idx[i-1] if i < len(deg_idx) else 'X'}",
+                                    title_inter=f"Generated {j+1}",
+                                    title_tgt=f"Encoded {deg_idx[i] if i < len(deg_idx) else 'X'}",
+                                    save_dir=plot_dir,
+                                    method=f"main_algo_gen_pair{i}_step{j}",
+                                    pca=pca_model)
+                domain_idx += 1
+
+        # Train on synthetic domains and log
+        domain_indices.extend(synthetic_indices)
+        domain_types.extend(["synthetic"] * len(synthetic_indices))
+        _, generated_acc = self_train(args, source_model.mlp, all_domains, epochs=epochs, log_file="gradual_"+log_file)
+        
+
+    return 0, 0, 0, 0, generated_acc
+
+
 def run_mnist_experiment(target, gt_domains, generated_domains):
 
-    t = time.time()
-
     src_trainset, tgt_trainset = get_single_rotate(False, 0), get_single_rotate(False, target)
-
+    # breakpoint()
     encoder = ENCODER().to(device)
-    source_model = get_source_model(args, src_trainset, src_trainset, 10, "mnist", encoder=encoder, epochs=5)
-    model_copy = copy.deepcopy(source_model)
+
+    # 🧠 Step 1: Train on source (supervised)
+    source_model = get_source_model(
+        args,
+        src_trainset,
+        src_trainset,
+        n_class=10,
+        mode="mnist",
+        encoder=encoder,
+        epochs=5,
+        model_path=f"cache/target{target}/mnist_source_model_{target}.pth",
+        target_dataset=tgt_trainset,
+        force_recompute=False
+    )
+
+    # 🧪 Step 2: (Optional) Improve encoder using self-supervised learning on target domain
+    # encoder = train_encoder_self_supervised(
+    #     model=source_model,
+    #     target_dataset=tgt_trainset,
+    #     epochs=10,  # you can tune this
+    #     batch_size=args.batch_size,
+    #     lr=1e-3
+    # )
+
+    # 🔁 Step 3: Reattach classifier head to updated encoder
+    # source_model = Classifier(encoder, MLP(mode="mnist", n_class=10, hidden=1024)).to(device)
+
+    # ✅ Step 4: Copy for adaptation algorithm
+
+    source_model_main_algo = copy.deepcopy(source_model)
+    source_model_goat = copy.deepcopy(source_model)
+
+
+    main_model_copy = copy.deepcopy(source_model_main_algo)  # used in run_main_algo
+    goat_model_copy = copy.deepcopy(source_model_goat)  # used in run_goat
+
+
 
     all_sets = []
+    deg_idx = []
     for i in range(1, gt_domains+1):
         all_sets.append(get_single_rotate(False, i*target//(gt_domains+1)))
+        deg_idx.append(i*target//(gt_domains+1))
         print(i*target//(gt_domains+1))
     all_sets.append(tgt_trainset)
+    deg_idx.append(target)
+    # breakpoint()
+    _, _, _, _, main_algo_acc = run_main_algo_oracle(main_model_copy, source_model_main_algo, src_trainset, tgt_trainset, all_sets, deg_idx, generated_domains, epochs=5, target = target)
+    
+    direct_acc, st_acc, direct_acc_all, st_acc_all, generated_acc = run_goat(goat_model_copy, source_model_goat, src_trainset, tgt_trainset, all_sets, deg_idx,generated_domains, epochs=5, target = target)
 
-    direct_acc, st_acc, direct_acc_all, st_acc_all, generated_acc = run_goat(model_copy, source_model, src_trainset, tgt_trainset, all_sets, generated_domains, epochs=5)
 
-    elapsed = round(time.time() - t, 2)
+    # elapsed = round(time.time() - t, 2)
     print(elapsed)
     os.makedirs("logs", exist_ok=True)
     with open(f"logs/mnist_{target}_{gt_domains}_layer.txt", "a") as f:
         f.write(f"seed{args.seed}with{gt_domains}gt{generated_domains}generated,{round(direct_acc, 2)},{round(st_acc, 2)},{round(direct_acc_all, 2)},{round(st_acc_all, 2)},{round(generated_acc, 2)}\n")
+
+    # with open(f"logs/mnist_{target}_{gt_domains}_layer.txt", "a") as f:
+    #     f.write(f"seed{args.seed}with{gt_domains}gt{generated_domains}generated,{round(direct_acc, 2)},{round(st_acc, 2)},{round(direct_acc_all, 2)},{round(st_acc_all, 2)},{round(generated_acc, 2)}, Main Algorithm: {round(main_algo_acc, 2)}\n")
+
 
 
 def run_mnist_ablation(target, gt_domains, generated_domains):
@@ -119,27 +650,27 @@ def run_mnist_ablation(target, gt_domains, generated_domains):
     all_domains1 = []
     for i in range(len(encoded_intersets)-1):
         plan = ot_ablation(len(src_trainset), "random")
-        all_domains1 += generate_domains(generated_domains, encoded_intersets[i], encoded_intersets[i+1], plan=plan)
+        all_domains1 += generate_domains(generated_domains, encoded_intersets[i], encoded_intersets[i+1], plan=plan)[0]
     _, generated_acc1 = self_train(args, model_copy1.mlp, all_domains1, epochs=10)
     
     # uniform plan
     all_domains4 = []
     for i in range(len(encoded_intersets)-1):
         plan = ot_ablation(len(src_trainset), "uniform")
-        all_domains4 += generate_domains(generated_domains, encoded_intersets[i], encoded_intersets[i+1], plan=plan)
+        all_domains4 += generate_domains(generated_domains, encoded_intersets[i], encoded_intersets[i+1], plan=plan)[0]
     _, generated_acc4 = self_train(args, model_copy4.mlp, all_domains4, epochs=10)
     
     # OT plan
     all_domains2 = []
     for i in range(len(encoded_intersets)-1):
-        all_domains2 += generate_domains(generated_domains, encoded_intersets[i], encoded_intersets[i+1])
+        all_domains2 += generate_domains(generated_domains, encoded_intersets[i], encoded_intersets[i+1])[0]
     _, generated_acc2 = self_train(args, model_copy2.mlp, all_domains2, epochs=10)
 
     # ground-truth plan
     all_domains3 = []
     for i in range(len(encoded_intersets)-1):
         plan = np.identity(len(src_trainset))
-        all_domains3 += generate_domains(generated_domains, encoded_intersets[i], encoded_intersets[i+1])
+        all_domains3 += generate_domains(generated_domains, encoded_intersets[i], encoded_intersets[i+1])[0]
     _, generated_acc3 = self_train(args, model_copy3.mlp, all_domains3, epochs=10)
 
     os.makedirs("logs", exist_ok=True)
@@ -181,6 +712,9 @@ def run_portraits_experiment(gt_domains, generated_domains):
     os.makedirs("logs", exist_ok=True)
     with open(f"logs/portraits_exp_time.txt", "a") as f:
         f.write(f"seed{args.seed}with{gt_domains}gt{generated_domains}generated,{round(direct_acc, 2)},{round(st_acc, 2)},{round(direct_acc_all, 2)},{round(st_acc_all, 2)},{round(generated_acc, 2)}\n")
+        # f.write(f"seed{args.seed}with{gt_domains}gt{generated_domains}generated,"
+        #         f"{round(direct_acc.item(), 2)},{round(st_acc.item(), 2)},{round(direct_acc_all.item(), 2)},"
+        #         f"{round(st_acc_all.item(), 2)},{round(generated_acc.item(), 2)}\n")
 
 
 def run_covtype_experiment(gt_domains, generated_domains):
@@ -229,12 +763,18 @@ def run_color_mnist_experiment(gt_domains, generated_domains):
     src_trainset, tgt_trainset = EncodeDataset(src_x, src_y.astype(int), ToTensor()), EncodeDataset(trg_val_x, trg_val_y.astype(int), ToTensor())
 
     encoder = ENCODER().to(device)
-    source_model = get_source_model(args, src_trainset, src_trainset, 10, "mnist", encoder=encoder, epochs=20)
+    vae = VAE(x_dim=28*28, z_dim=16).to(device)
+    vae_path = f'models/colored_mnist/vae.pt'
+    if os.path.exists(vae_path):
+        vae.load_state_dict(torch.load(vae_path))
+    else:
+        train_vae(vae, trainloader, valloader, testloader, vae_path, save=True)
+
+    source_model = get_source_model(args, src_trainset, src_trainset, 10, "mnist", encoder=vae.encoder, epochs=20)
     model_copy = copy.deepcopy(source_model)
 
     def get_domains(n_domains):
         domain_set = []
-        
         domain_idx = []
         if n_domains == total_domains:
             domain_idx = range(n_domains)
@@ -251,20 +791,101 @@ def run_color_mnist_experiment(gt_domains, generated_domains):
     all_sets = get_domains(gt_domains)
     all_sets.append(tgt_trainset)
 
+    images = tgt_trainset.data[:5]
+
+    # Ensure the images are in the correct shape for plotting
+    # Remove the last dimension if it's a single channel (grayscale)
+    images = images.squeeze(-1)
+
+    # Plot the images
+    plt.figure(figsize=(10, 2))  # Set a wide figure size for 5 images
+    for i, img in enumerate(images):
+        plt.subplot(1, 5, i + 1)  # Create a subplot (1 row, 5 columns)
+        plt.imshow(img, cmap="gray")  # Display the image in grayscale
+        plt.axis("off")  # Turn off the axis
+        plt.title(f"Image {i + 1}")
+
+    plt.tight_layout()  # Adjust spacing
+    plt.show()
+
+    # breakpoint()
     direct_acc, st_acc, direct_acc_all, st_acc_all, generated_acc = run_goat(model_copy, source_model, src_trainset, tgt_trainset, all_sets, generated_domains, epochs=10)
     
     os.makedirs("logs", exist_ok=True)
     with open(f"logs/color{args.log_file}.txt", "a") as f:
-        f.write(f"seed{args.seed}with{gt_domains}gt{generated_domains}generated,{round(direct_acc, 2)},{round(st_acc, 2)},{round(direct_acc_all, 2)},{round(st_acc_all, 2)},{round(generated_acc, 2)}\n")
+        values = [direct_acc, st_acc, direct_acc_all, st_acc_all, generated_acc]
+        values = [round(v.item(), 2) if isinstance(v, torch.Tensor) else round(v, 2) for v in values]
+        f.write(f"seed{args.seed}with{gt_domains}gt{generated_domains}generated,{','.join(map(str, values))}\n")
+
+        # f.write(f"seed{args.seed}with{gt_domains}gt{generated_domains}generated,{round(direct_acc, 2)},{round(st_acc, 2)},{round(direct_acc_all, 2)},{round(st_acc_all, 2)},{round(generated_acc, 2)}\n")
+        # f.write(f"seed{args.seed}with{gt_domains}gt{generated_domains}generated,"
+        #         f"{round(direct_acc, 2)},{round(st_acc, 2)},{round(direct_acc_all, 2)},"
+        #         f"{round(st_acc_all, 2)},{round(generated_acc.item(), 2)}\n")
+
+
+
+
+def log_generated_images_tensorboard(writer, images, epoch, tag='Generated Images'):
+    """
+    Log a grid of generated images to TensorBoard.
+
+    Args:
+        writer (SummaryWriter): TensorBoard SummaryWriter.
+        images (torch.Tensor or np.ndarray): Generated images.
+        epoch (int): Current epoch number for logging.
+        tag (str): Tag name for the images in TensorBoard.
+    """
+    if isinstance(images, np.ndarray):
+        images = torch.from_numpy(images)
+    
+    # Handle different tensor shapes
+    if images.ndim == 3 and images.shape[2] == 32:
+        # Shape: (H, W, N) where N=32 is batch size
+        H, W, N = images.shape
+        C = 1  # Assuming grayscale; adjust if necessary
+
+        # Rearrange to (N, C, H, W)
+        images = images.transpose(2, 0, 1)  # Now (N, H, W)
+        images = images.reshape(N, C, H, W)  # Now (N, C, H, W)
+        print(f"Rearranged images to shape: {images.shape}")
+    elif images.ndim == 4:
+        # Shape: (N, C, H, W)
+        pass  # Already in the correct format
+    else:
+        print(f"Unsupported image shape for TensorBoard logging: {images.shape}")
+        return  # Exit the function to prevent errors
+
+    # Handle images with different channel counts
+    if images.shape[1] > 3:
+        # Select the first 3 channels for RGB visualization
+        images = images[:, :3, :, :]
+        print(f"Selected first 3 channels from {images.shape[1]} channels for TensorBoard visualization.")
+    elif images.shape[1] == 1:
+        # Duplicate the single channel to create RGB images
+        images = images.repeat(1, 3, 1, 1)
+        print("Duplicated single channel to 3 channels for TensorBoard visualization.")
+    elif images.shape[1] == 3:
+        pass  # RGB images are fine
+    else:
+        # For unexpected channel counts, select the first 3 or adjust as needed
+        images = images[:, :3, :, :] if images.shape[1] > 3 else images.repeat(1, 3, 1, 1)
+        print(f"Adjusted images to 3 channels for TensorBoard visualization.")
+
+    # Log images (grid format)
+    grid = torchvision.utils.make_grid(images[:16], nrow=4, normalize=True)
+    writer.add_image(tag, grid, epoch)
+    print(f"Logged generated images for epoch {epoch} to TensorBoard under tag '{tag}'.")
+
+
+
 
 
 def main(args):
-    
+    writer = init_tensorboard()
     print(args)
-    
     if args.dataset == "mnist":
         if args.mnist_mode == "normal":
-            run_mnist_experiment(args.rotation_angle, args.gt_domains, args.generated_domains)
+            run_mnist_experiment(args.rotation_angle, args.gt_domains, args.generated_domains) 
         else:
            run_mnist_ablation(args.rotation_angle, args.gt_domains, args.generated_domains)
     else:
@@ -274,9 +895,9 @@ def main(args):
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description="GOAT experiments")
-    parser.add_argument("--dataset", choices=["mnist", "portraits", "covtype", "color_mnist"])
+    parser.add_argument("--dataset", choices=["mnist", "portraits", "covtype", "color_mnist"],default="mnist")
     parser.add_argument("--gt-domains", default=0, type=int)
-    parser.add_argument("--generated-domains", default=0, type=int)
+    parser.add_argument("--generated-domains", default=3, type=int)
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--mnist-mode", default="normal", choices=["normal", "ablation"])
     parser.add_argument("--rotation-angle", default=45, type=int)
@@ -284,6 +905,7 @@ if __name__ == '__main__':
     parser.add_argument("--lr", default=1e-4, type=float)
     parser.add_argument("--num-workers", default=2, type=int)
     parser.add_argument("--log-file", default="")
+    parser.add_argument("--lambda-unsup", default=0.5, type=float)
     args = parser.parse_args()
 
     main(args)

@@ -11,7 +11,7 @@ from tensorflow.keras.datasets import mnist
 class DomainDataset(Dataset):
     def __init__(self, x, weight, transform=None):
         self.data = x.cpu().detach()
-        self.targets = -1 * torch.ones(len(self.data))
+        self.targets = -1 * torch.ones(len(self.data)).cpu().detach()
         self.weight = weight
         self.transform = transform
 

@@ -88,6 +88,7 @@ def pushforward(X_S, X_T, plan, t):
 def generate_domains(n_inter, dataset_s, dataset_t, plan=None, entry_cutoff=0, conf=0):
     print("------------Generate Intermediate domains----------")
     all_domains = []
+    # generate_images = []
     
     xs, xt = dataset_s.data, dataset_t.data
     ys = dataset_s.targets
@@ -113,11 +114,15 @@ def generate_domains(n_inter, dataset_s, dataset_t, plan=None, entry_cutoff=0, c
             all_domains.append(DomainDataset(torch.from_numpy(x).float(), weights))
         else:
             all_domains.append(DomainDataset(x, weights))
+        # generate_images.append(x)
     all_domains.append(dataset_t)
 
     print(f"Total data for each intermediate domain: {len(x)}")
+    # breakpoint()
+    return all_domains, yt_hat #, generate_images
 
-    return all_domains
+
+
 
 
 def ot_ablation(size, mode):

@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader, random_split, ConcatDataset, Subset
 from dataset import *
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 
 
 from PIL import Image
@@ -70,7 +71,7 @@ def get_loaders(raw_trainset, raw_testset, batch_size):
     return trainloader, valloader, testloader 
 
 
-def get_encoded_dataset(encoder, dataset):
+def get_encoded_dataset_old(encoder, dataset):
     loader = DataLoader(dataset, batch_size=128, shuffle=True)
 
     latent, labels = [], []
@@ -85,4 +86,18 @@ def get_encoded_dataset(encoder, dataset):
     
     encoded_dataset = EncodeDataset(latent.float().cpu().detach(), labels)
 
+    return encoded_dataset
+
+def get_encoded_dataset(encoder, dataset, cache_path, force_recompute=False):
+    """Returns the encoded dataset if cached; otherwise, computes and saves it."""
+    # breakpoint()
+    if cache_path and os.path.exists(cache_path) and not force_recompute:
+        print(f"✅ Loading cached encoded dataset from {cache_path}")
+        return torch.load(cache_path)
+    
+    print(f"🔄 Computing encoded dataset and caching at {cache_path}")
+    encoded_dataset = get_encoded_dataset_old(encoder, dataset)
+    if cache_path:
+        torch.save(encoded_dataset, cache_path)
+    
     return encoded_dataset

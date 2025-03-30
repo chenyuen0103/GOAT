@@ -8,3 +8,16 @@ src/
 *.gz
 *.mat
 logs/*
+__pycache__/
+cache/
+*pkl
+*.gz
+data*/
+*pt
+*mat
+dataset_32x32
+models
+logs
+src*
+*.png
+plots/

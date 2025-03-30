@@ -1,4 +1,5 @@
 import torch.nn as nn
+import torch
 
 class Encoder(nn.Module):
     def __init__(self, backbone):
@@ -65,6 +66,7 @@ class ENCODER(nn.Module):
                 nn.Conv2d(32, 32, 3, padding="same"),
                 nn.ReLU(),
             )
+            dummy_input = torch.randn(1, 3, 28, 28)
         else:
             self.encode = nn.Sequential(
                     nn.Conv2d(1, 32, 3, padding="same"),
@@ -73,7 +75,14 @@ class ENCODER(nn.Module):
                     nn.ReLU(),
                     nn.Conv2d(32, 32, 3, padding="same"),
                     nn.ReLU(),
+                    
                 )
+            dummy_input = torch.randn(1, 1, 28, 28)
+
+        # Compute output dimension
+        with torch.no_grad():
+            dummy_output = self.encode(dummy_input)
+            self.output_dim = int(torch.flatten(dummy_output, 1).shape[1])
 
         
     def forward(self, x):
@@ -119,6 +128,7 @@ class MLP(nn.Module):
                 nn.BatchNorm1d(hidden),
                 nn.Linear(hidden, n_class)
             )
+
         
     def forward(self, x):
         return self.mlp(x)
