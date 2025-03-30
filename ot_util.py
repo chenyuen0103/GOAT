@@ -118,8 +118,8 @@ def generate_domains(n_inter, dataset_s, dataset_t, plan=None, entry_cutoff=0, c
     all_domains.append(dataset_t)
 
     print(f"Total data for each intermediate domain: {len(x)}")
-
-    return all_domains #, generate_images
+    # breakpoint()
+    return all_domains, yt_hat #, generate_images
 
 
 

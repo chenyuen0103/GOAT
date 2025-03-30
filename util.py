@@ -88,14 +88,16 @@ def get_encoded_dataset_old(encoder, dataset):
 
     return encoded_dataset
 
-def get_encoded_dataset(encoder, dataset, cache_path):
+def get_encoded_dataset(encoder, dataset, cache_path, force_recompute=False):
     """Returns the encoded dataset if cached; otherwise, computes and saves it."""
-    if os.path.exists(cache_path):
+    # breakpoint()
+    if cache_path and os.path.exists(cache_path) and not force_recompute:
         print(f"✅ Loading cached encoded dataset from {cache_path}")
         return torch.load(cache_path)
     
     print(f"🔄 Computing encoded dataset and caching at {cache_path}")
     encoded_dataset = get_encoded_dataset_old(encoder, dataset)
-    torch.save(encoded_dataset, cache_path)
+    if cache_path:
+        torch.save(encoded_dataset, cache_path)
     
     return encoded_dataset

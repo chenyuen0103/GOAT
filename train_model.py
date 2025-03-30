@@ -113,7 +113,10 @@ def test(val_loader, model, vae=False, verbose=True):
                     test_loss += criterion(output, labels).item()
                 elif len(x) == 3:
                     criterion = nn.CrossEntropyLoss(reduction='none')
-                    loss = criterion(output, labels)
+                    print(f"[DEBUG] labels.min = {labels.min()}, labels.max = {labels.max()}")
+                    print(f"[DEBUG] output.shape = {output.shape}")
+
+                    loss = criterion(output, labels.long())
                     test_loss += (loss * weight).mean().item()
 
                 predicted = output.argmax(dim=1)

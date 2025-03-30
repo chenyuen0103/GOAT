@@ -9,3 +9,6 @@ dataset_32x32
 models
 logs
 src*
+
+*.png
+plots/
