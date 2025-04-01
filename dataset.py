@@ -9,9 +9,10 @@ from tensorflow.keras.datasets import mnist
 
 
 class DomainDataset(Dataset):
-    def __init__(self, x, weight, transform=None):
+    def __init__(self, x, weight, targets = None, transform=None):
         self.data = x.cpu().detach()
-        self.targets = -1 * torch.ones(len(self.data)).cpu().detach()
+        self.targets = -1 * torch.ones(len(self.data)).cpu().detach() if targets is None else targets.cpu().detach()
+        self.targets = self.targets.long()
         self.weight = weight
         self.transform = transform
 

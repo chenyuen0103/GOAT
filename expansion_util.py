@@ -25,6 +25,9 @@ def compute_w2_distance_pot(X_src, X_tgt, p=2):
         w2_distance (float)
     """
     # Convert to numpy
+
+    X_src = X_src.view(X_src.size(0), -1)
+    X_tgt = X_tgt.view(X_tgt.size(0), -1)
     Xs = X_src.detach().cpu().numpy()
     Xt = X_tgt.detach().cpu().numpy()
 
@@ -52,6 +55,70 @@ def get_conf_idx(logits, confidence_q=0.2):
     labels = np.argmax(logits, axis=1)
     
     return labels, indices
+
+
+import numpy as np
+import torch
+from geomloss import SamplesLoss  # differentiable Sinkhorn loss
+from torch.optim import Adam
+
+
+def find_next_distribution(mu_t_samples, mu_T_samples, max_iters=100, lr=1e-2, delta=1.0, penalty_weight=10.0, p=2):
+    """
+    Find mu_{t+1} = argmin_{nu in B^delta(mu_t)} W_p(nu, mu_T)
+    
+    Args:
+        mu_t_samples (np.ndarray): [n, d] array of samples from mu_t (labeled source)
+        mu_T_samples (np.ndarray): [n, d] array of samples from target mu_T (unlabeled target)
+        max_iters (int): number of optimization steps
+        lr (float): learning rate
+        delta (float): Wasserstein radius
+        penalty_weight (float): penalty multiplier for constraint
+        p (int): Wasserstein-p distance (default: 2)
+        
+    Returns:
+        np.ndarray: optimized samples representing mu_{t+1}
+    """
+    def flatten_if_needed(X):
+        """Ensure samples are 2D (n_samples, n_features)"""
+        if isinstance(X, torch.Tensor) and X.ndim > 2:
+            return X.view(X.size(0), -1)
+        return X
+    
+    # Ensure mu_t_samples and mu_T_samples are 2D
+    mu_t_samples = flatten_if_needed(mu_t_samples)
+    mu_T_samples = flatten_if_needed(mu_T_samples)
+
+
+
+    # Convert to torch tensors
+    x_t = torch.tensor(mu_t_samples, dtype=torch.float32, requires_grad=False)
+    x_T = torch.tensor(mu_T_samples, dtype=torch.float32, requires_grad=False)
+
+    # Initialize nu as a copy of mu_t, and make it trainable
+    # y = torch.tensor(mu_t_samples.copy(), dtype=torch.float32, requires_grad=True)
+    y = mu_t_samples.clone().detach().requires_grad_(True).float()
+
+
+    optimizer = Adam([y], lr=lr)
+    sinkhorn = SamplesLoss("sinkhorn", p=p, blur=0.05)
+
+    for _ in range(max_iters):
+        optimizer.zero_grad()
+        nu = y
+
+        loss_target = sinkhorn(nu, x_T)
+        loss_constraint = sinkhorn(nu, x_t)
+
+        # Penalty: encourage staying within Wasserstein ball of mu_t
+        penalty = torch.relu(loss_constraint - delta)
+        loss = loss_target + penalty_weight * penalty
+
+        loss.backward()
+        optimizer.step()
+
+    return y.detach().cpu().numpy()
+
 
 
 def wasserstein_interpolation(n_samples, encoded_src, encoded_tgt, delta=0.5, lr=0.05, max_iters=50, device="cuda"):
@@ -202,6 +269,7 @@ def generate_qda_domains(
     return all_domains
 
 
+
 def generate_gauss_domains(
     source_dataset,
     target_dataset,
@@ -336,6 +404,68 @@ def generate_gauss_domains(
     all_domains.append(target_dataset)
     print(f"Total data for each intermediate domain: {len(z_intermediate)}")
     return avg_target, all_domains  # Returns a list of `DomainDataset` objects
+
+
+def generate_domains_find_next(
+    source_dataset,
+    src_pseudo_labels,
+    target_dataset,
+    tgt_pseudo_labels,
+    n_wsteps=5,
+    delta=1,
+    device="cuda"
+):
+    all_domains = []
+    classes = sorted(np.unique(source_dataset.targets.numpy()))
+
+    source_data = source_dataset.data.to(device)
+    source_targets = source_dataset.targets.to(device)
+    target_data = target_dataset.data.to(device)
+    target_targets = target_dataset.targets.to(device)
+    # target_pseudo_labels = target_dataset.pseudo_labels.to(device)
+    all_w2_target = []
+
+    for step in range(n_wsteps):
+        z_new_list = []
+        y_new_list = []
+        weights_list = []
+
+        for cls in classes:
+            # Take samples for each class
+            # src_cls_data = source_data[source_targets == cls]
+            src_cls_data = source_data[src_pseudo_labels == cls]
+            # tgt_cls_data = target_data[target_targets == cls]
+            tgt_cls_data = target_data[tgt_pseudo_labels == cls]
+            # tgt_cls_truth = target_data[target_targets == cls]
+
+            # print(f"Processing class {cls}... with {src_cls_data.shape[0]} samples")
+
+            # Move one step toward target in Wasserstein ball
+            mu_next = find_next_distribution(src_cls_data, tgt_cls_data, delta=delta)
+            num_samples  = len(src_cls_data)
+            y_samples = torch.full((num_samples,), cls, dtype=torch.long)
+            weights = np.ones(num_samples)
+            if len(mu_next) !=len(y_samples): 
+                breakpoint()
+            z_new_list.append(torch.tensor(mu_next, dtype=torch.float32, device=device))
+
+            y_new_list.append(y_samples)
+            weights_list.append(weights)
+            # compute w2 distance to target
+            all_w2_target.append(compute_w2_distance_pot(
+                src_cls_data, tgt_cls_data))
+
+        z_intermediate = torch.cat(z_new_list, dim=0)
+        y_intermediate = torch.cat(y_new_list, dim=0)
+        weights_intermediate = np.concatenate(weights_list)
+        w2_target = np.mean(all_w2_target)
+
+        domain_dataset = DomainDataset(z_intermediate, weights_intermediate)
+        domain_dataset.targets = y_intermediate
+        all_domains.append(domain_dataset)
+
+    all_domains.append(target_dataset)  # add target domain at the end
+    return all_domains, w2_target
 
 
 # def estimate_class_conditional_gaussian_params(

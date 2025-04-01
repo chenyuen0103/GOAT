@@ -12,3 +12,4 @@ src*
 
 *.png
 plots/
+*cache*

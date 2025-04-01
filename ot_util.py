@@ -81,9 +81,69 @@ def pushforward(X_S, X_T, plan, t):
     weights = plan[plan > 0]
     assert len(nonzero_indices) == len(weights)
     x_t= (1-t)*X_S[nonzero_indices[:,0]] + t*X_T[nonzero_indices[:,1]]
+
     
     return x_t, weights
 
+def pushforward_with_y(X_S, y_s, X_T, y_T, plan, t):
+    print(f'Pushforward to t={t}')
+    assert 0 <= t <= 1
+    nonzero_indices = np.argwhere(plan > 0)
+    weights = plan[plan > 0]
+    assert len(nonzero_indices) == len(weights)
+    x_t= (1-t)*X_S[nonzero_indices[:,0]] + t*X_T[nonzero_indices[:,1]]
+    y_t = (1-t)*y_s[nonzero_indices[:,0]] + t*y_T[nonzero_indices[:,1]]
+    
+    
+    return x_t, y_t, weights
+
+
+from geomstats.geometry.hypersphere import Hypersphere
+sphere = Hypersphere(dim=2)
+
+
+def pushforward_geo(X_S, X_T, plan, t):
+    print(f'Geodesic pushforward to t={t}')
+    indices = np.argwhere(plan > 0)
+    weights = plan[plan > 0]
+    
+    xs = X_S[indices[:, 0]]
+    xt = X_T[indices[:, 1]]
+
+    # Ensure shape is [N, d] not [d, N]
+    if xs.shape[0] < xs.shape[1]:
+        xs = xs.T
+    if xt.shape[0] < xt.shape[1]:
+        xt = xt.T
+
+    # Convert to torch and normalize onto the sphere
+    xs = torch.tensor(xs, dtype=torch.float64).view(len(xs), -1)
+    xt = torch.tensor(xt, dtype=torch.float64).view(len(xt), -1)
+
+    xs = xs / xs.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    xt = xt / xt.norm(dim=1, keepdim=True).clamp(min=1e-8)
+
+    xs_np = xs.cpu().numpy()
+    xt_np = xt.cpu().numpy()
+
+    assert xs_np.shape == xt_np.shape, f"Shape mismatch: xs={xs_np.shape}, xt={xt_np.shape}"
+
+    inner_prods = np.sum(xs_np * xt_np, axis=1)
+    inner_prods = np.clip(inner_prods, -1.0, 1.0)
+    valid_mask = (np.abs(inner_prods) < 0.999)
+
+    breakpoint()
+    xs_np_valid = xs_np[valid_mask]
+    xt_np_valid = xt_np[valid_mask]
+    weights_valid = weights[valid_mask]
+
+    if len(xs_np_valid) == 0:
+        raise ValueError("No valid log-exp pairs remain after filtering.")
+
+    log_vecs = sphere.metric.log(xt_np_valid, base_point=xs_np_valid)
+    x_t = sphere.metric.exp(t * log_vecs, base_point=xs_np_valid)
+
+    return x_t, weights_valid
 
 def generate_domains(n_inter, dataset_s, dataset_t, plan=None, entry_cutoff=0, conf=0):
     print("------------Generate Intermediate domains----------")
@@ -107,14 +167,18 @@ def generate_domains(n_inter, dataset_s, dataset_t, plan=None, entry_cutoff=0, c
     yt_hat = yt_hat[conf_idx]
 
     print(f"Remaining data after confidence filter: {len(conf_idx)}")
-
+    start = 0
     for i in range(1, n_inter+1):
-        x, weights = pushforward(xs, xt, plan, i / (n_inter+1))
+        # x, weights = pushforward(xs, xt, plan, i / (n_inter+1))
+        x, y ,weights = pushforward_with_y(xs, ys, xt, yt_hat, plan, i / (n_inter+1))
+        y_tensor = torch.tensor(y, dtype=torch.long)
         if isinstance(x, np.ndarray):
-            all_domains.append(DomainDataset(torch.from_numpy(x).float(), weights))
+            all_domains.append(DomainDataset(torch.from_numpy(x).float(), weights, y_tensor))
         else:
-            all_domains.append(DomainDataset(x, weights))
-        # generate_images.append(x)
+            all_domains.append(DomainDataset(x, weights, y_tensor))
+
+    
+    # generate_images.append(x)
     all_domains.append(dataset_t)
 
     print(f"Total data for each intermediate domain: {len(x)}")

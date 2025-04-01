@@ -125,88 +125,241 @@ def init_tensorboard(log_dir='logs/tensorboard'):
     writer = SummaryWriter(log_dir=log_dir)
     return writer
 
-def get_source_model(args, trainset, testset, n_class, mode, encoder=None, epochs=50, verbose=True, model_path="cache/source_model.pth", target_dataset = None, force_recompute=False):
+def get_source_model(args, trainset, testset, n_class, mode, encoder=None, epochs=50, verbose=True, model_path="cache{args.ssl_weight}/source_model.pth", target_dataset = None, ssl_weight = 0.5, force_recompute=False):
 
     model = Classifier(encoder, MLP(mode=mode, n_class=n_class, hidden=1024)).to(device)
     if os.path.exists(model_path) and not force_recompute:
         print(f"✅ Loading cached trained model from {model_path}")
-        model.load_state_dict(torch.load(model_path, weights_only=True))
+        model.load_state_dict(torch.load(model_path))
         return model
 
-    model = get_source_model_old(args, trainset, testset, n_class, mode, encoder, epochs=epochs, target_dataset=target_dataset)
+    model = get_source_model_old(args, trainset, testset, n_class, mode, encoder, epochs=epochs, augment_fn=augment,target_dataset=target_dataset, ssl_weight=args.ssl_weight, verbose=verbose)
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
     torch.save(model.state_dict(), model_path)  # ✅ Save model for future runs
     
     return model
 
 
-def get_source_model_old(args, trainset, testset, n_class, mode, encoder=None, epochs=50, verbose=True, target_dataset=None):
-    print("Start training source model (with optional SSL)")
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+
+
+def train_joint(model, trainloader, tgt_loader, optimizer, device, augment_fn, ssl_weight=0.1):
+    model.train()
+    total_sup_loss = 0
+    total_ssl_loss = 0
+
+    tgt_iter = iter(tgt_loader)  # Create iterator for SSL samples
+
+    for batch in trainloader:
+        if len(batch) == 2:
+            data, labels = batch
+            weights = None
+        else:
+            data, labels, weights = batch
+            weights = weights.to(device)
+
+        data, labels = data.to(device), labels.to(device)
+
+        # --- Supervised Forward ---
+        outputs = model(data)
+        if weights is None:
+            sup_loss = F.cross_entropy(outputs, labels)
+        else:
+            criterion = nn.CrossEntropyLoss(reduction='none')
+            sup_loss = criterion(outputs, labels)
+            sup_loss = (sup_loss * weights).mean()
+
+        # --- SSL Forward ---
+        try:
+            x_tgt, _ = next(tgt_iter)
+        except StopIteration:
+            tgt_iter = iter(tgt_loader)
+            x_tgt, _ = next(tgt_iter)
+
+        x_tgt = x_tgt.to(device)
+        x1, x2 = augment_fn(x_tgt), augment_fn(x_tgt)
+        z1 = F.normalize(model.encoder(x1).view(x1.size(0), -1) + 1e-6, dim=1)
+        z2 = F.normalize(model.encoder(x2).view(x2.size(0), -1) + 1e-6, dim=1)
+        ssl_loss = nt_xent_loss(z1, z2)
+
+        # --- Combine Losses ---
+        total_loss = sup_loss + ssl_weight * ssl_loss
+
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
+
+        total_sup_loss += sup_loss.item()
+        total_ssl_loss += ssl_loss.item()
+
+    return total_sup_loss / len(trainloader), total_ssl_loss / len(trainloader)
+
+def train_supervised(model, trainloader, optimizer, device):
+    model.train()
+    total_loss = 0
+
+    for batch in trainloader:
+        if len(batch) == 2:
+            data, labels = batch
+            weights = None
+        else:
+            data, labels, weights = batch
+            weights = weights.to(device)
+
+        data, labels = data.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(data)
+
+        if weights is None:
+            loss = F.cross_entropy(outputs, labels)
+        else:
+            criterion = nn.CrossEntropyLoss(reduction='none')
+            loss = criterion(outputs, labels)
+            loss = (loss * weights).mean()
+
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+
+    return total_loss / len(trainloader)
+
+
+def train_contrastive_ssl(model, tgt_loader, optimizer, augment_fn, device, ssl_weight=0.5):
+
+    model.train()
+    total_ssl_loss = 0
+
+    for x_tgt, _ in tgt_loader:
+        x_tgt = x_tgt.to(device)
+
+        x1 = augment_fn(x_tgt)
+        x2 = augment_fn(x_tgt)
+
+        z1 = model.encoder(x1)
+        z2 = model.encoder(x2)
+
+        z1 = F.normalize(z1.view(z1.size(0), -1) + 1e-6, dim=1)
+        z2 = F.normalize(z2.view(z2.size(0), -1) + 1e-6, dim=1)
+
+        ssl_loss = nt_xent_loss(z1, z2) * ssl_weight
+
+        optimizer.zero_grad()
+        ssl_loss.backward()
+        optimizer.step()
+        total_ssl_loss += ssl_loss.item()
+
+    return total_ssl_loss / len(tgt_loader)
+
+
+def get_source_model_old(args, trainset, testset, n_class, mode, encoder=None, epochs=50, augment_fn=None, target_dataset=None, ssl_weight = 0.1,verbose=True):
+    print("🔧 Training source model...")
     model = Classifier(encoder, MLP(mode=mode, n_class=n_class, hidden=1024)).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    
+
     trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-    if target_dataset is not None:
-        tgt_loader = DataLoader(target_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-        tgt_iter = iter(tgt_loader)  # infinite loop handled later
+    tgt_loader = DataLoader(target_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers) if target_dataset else None
 
+    # for epoch in range(1, epochs + 1):
+    #     sup_loss = train_supervised(model, trainloader, optimizer, device)
+    #     msg = f"[Epoch {epoch}] Supervised Loss: {sup_loss:.4f}"
+
+    #     if tgt_loader and augment_fn:
+    #         ssl_loss = train_contrastive_ssl(model, tgt_loader, optimizer, augment_fn, device, ssl_weight=ssl_weight)
+    #         msg += f" | SSL Loss: {ssl_loss:.4f}"
+    #     print(msg)
+
+    #     if epoch % 5 == 0:
+    #         test(testloader, model, verbose=verbose)
     for epoch in range(1, epochs + 1):
-        model.train()
-        train_loss = 0
-        for _, batch in enumerate(trainloader):
-            if len(batch) == 2:
-                data, labels = batch
-                weight = None
-            else:
-                data, labels, weight = batch
-                weight = weight.to(device)
-
-            data = data.to(device)
-            labels = labels.to(device)
-            optimizer.zero_grad()
-
-            output = model(data)
-            if weight is None:
-                loss = F.cross_entropy(output, labels)
-            else:
-                criterion = nn.CrossEntropyLoss(reduction='none')
-                loss = criterion(output, labels)
-                loss = (loss * weight).mean()
-
-            loss.backward()
-            train_loss += loss.item()
-            optimizer.step()
-            # 🔹 Get target batch for contrastive loss
-        if target_dataset is not None:
-            unsup_loss_total = 0
-            for _, tgt_batch in enumerate(tgt_loader):
-
-                x_tgt, _ = tgt_batch
-                x_tgt = x_tgt.to(device)
-
-
-                x1 = augment(x_tgt)
-                x2 = augment(x_tgt)
-                z1 = model.encoder(x1)
-                z2 = model.encoder(x2)
-                z1 = F.normalize(z1.view(z1.size(0), -1) + 1e-6, dim=1)
-                z2 = F.normalize(z2.view(z2.size(0), -1) + 1e-6, dim=1)
-
-                unsup_loss = nt_xent_loss(z1, z2) * 0.1
-                optimizer.zero_grad()
-                unsup_loss.backward()
-                optimizer.step()
-                unsup_loss_total += unsup_loss.item()
-
-            print(f"[Epoch {epoch}] Classification Loss: {train_loss / len(trainloader):.4f} | Contrastive Loss (unsup): {unsup_loss_total / len(tgt_loader):.4f}")
+        if tgt_loader and augment_fn:
+            sup_loss, ssl_loss = train_joint(model, trainloader, tgt_loader, optimizer, device, augment_fn, ssl_weight)
+            msg = f"[Epoch {epoch}] Supervised Loss: {sup_loss:.4f} | SSL Loss: {ssl_loss:.4f}"
         else:
-            print(f"[Epoch {epoch}] Total Loss: {train_loss / len(trainloader):.4f}")
+            sup_loss = train_supervised(model, trainloader, optimizer, device)
+            msg = f"[Epoch {epoch}] Supervised Loss: {sup_loss:.4f}"
+
+        print(msg)
 
         if epoch % 5 == 0:
             test(testloader, model, verbose=verbose)
-    
+
     return model
+
+
+# def get_source_model_old(args, trainset, testset, n_class, mode, encoder=None, epochs=50, verbose=True, target_dataset=None):
+#     print("Start training source model (with optional SSL)")
+#     model = Classifier(encoder, MLP(mode=mode, n_class=n_class, hidden=1024)).to(device)
+#     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    
+#     trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+#     testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+#     if target_dataset is not None:
+#         tgt_loader = DataLoader(target_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+#         tgt_iter = iter(tgt_loader)  # infinite loop handled later
+
+#     for epoch in range(1, epochs + 1):
+#         model.train()
+#         train_loss = 0
+#         for _, batch in enumerate(trainloader):
+#             if len(batch) == 2:
+#                 data, labels = batch
+#                 weight = None
+#             else:
+#                 data, labels, weight = batch
+#                 weight = weight.to(device)
+
+#             data = data.to(device)
+#             labels = labels.to(device)
+#             optimizer.zero_grad()
+
+#             output = model(data)
+#             if weight is None:
+#                 loss = F.cross_entropy(output, labels)
+#             else:
+#                 criterion = nn.CrossEntropyLoss(reduction='none')
+#                 loss = criterion(output, labels)
+#                 loss = (loss * weight).mean()
+
+#             loss.backward()
+#             train_loss += loss.item()
+#             optimizer.step()
+#             # 🔹 Get target batch for contrastive loss
+
+#         if target_dataset is not None:
+#             unsup_loss_total = 0
+#             for _, tgt_batch in enumerate(tgt_loader):
+
+#                 x_tgt, _ = tgt_batch
+#                 x_tgt = x_tgt.to(device)
+
+
+#                 x1 = augment(x_tgt)
+#                 x2 = augment(x_tgt)
+#                 z1 = model.encoder(x1)
+#                 z2 = model.encoder(x2)
+#                 z1 = F.normalize(z1.view(z1.size(0), -1) + 1e-6, dim=1)
+#                 z2 = F.normalize(z2.view(z2.size(0), -1) + 1e-6, dim=1)
+
+#                 unsup_loss = nt_xent_loss(z1, z2) * 0.1
+#                 optimizer.zero_grad()
+#                 unsup_loss.backward()
+#                 optimizer.step()
+#                 unsup_loss_total += unsup_loss.item()
+
+#             print(f"[Epoch {epoch}] Classification Loss: {train_loss / len(trainloader):.4f} | Contrastive Loss (unsup): {unsup_loss_total / len(tgt_loader):.4f}")
+#         else:
+#             print(f"[Epoch {epoch}] Total Loss: {train_loss / len(trainloader):.4f}")
+
+#         if epoch % 5 == 0:
+#             test(testloader, model, verbose=verbose)
+    
+#     return model
 
 # def get_source_model_old(args, trainset, testset, n_class, mode, encoder=None, epochs=50, verbose=True):
 #     print("Start training source model")
@@ -304,7 +457,7 @@ def train_encoder_self_supervised(model, target_dataset, epochs=10, batch_size=1
     return encoder
 
 
-def run_goat(model_copy, source_model, src_trainset, tgt_trainset, all_sets, deg_idx,generated_domains, epochs=10, target = 60):
+def run_goat(model_copy, source_model, src_trainset, tgt_trainset, all_sets, deg_idx, generated_domains, epochs=10, target = 60):
     step_counter = 0
     # get the performance of direct adaptation from the source to target, st involves self-training on target
     # print("------------Direct adapt performance----------")
@@ -313,7 +466,7 @@ def run_goat(model_copy, source_model, src_trainset, tgt_trainset, all_sets, deg
     # Also self-train on unlabeled target 
     print("------------Self-train on pooled domains----------")
     direct_acc_all, st_acc_all = self_train(args, source_model, all_sets, epochs=epochs)
-    cache_dir = f"cache/target{target}/"
+    cache_dir = f"cache{args.ssl_weight}/target{target}/"
     # encode the source and target domains
     e_src_trainset, e_tgt_trainset = get_encoded_dataset(source_model.encoder, src_trainset, cache_path=os.path.join(cache_dir, "encoded_0.pt"), force_recompute=False), get_encoded_dataset(source_model.encoder, tgt_trainset, cache_path=os.path.join(cache_dir, f"encoded_{target}.pt"), force_recompute=False)
     pca_model = plot_encoded_domains(e_src_trainset, e_src_trainset, e_tgt_trainset, method = 'goat')
@@ -323,7 +476,7 @@ def run_goat(model_copy, source_model, src_trainset, tgt_trainset, all_sets, deg
     encoded_intersets = [e_src_trainset]
     for i, interset in enumerate(intersets):
         cache_path = os.path.join(cache_dir, f"encoded_{deg_idx[i]}.pt")
-        encoded_intersets.append(get_encoded_dataset(source_model.encoder, interset, cache_path=cache_path), force_recompute=True)
+        encoded_intersets.append(get_encoded_dataset(source_model.encoder, interset, cache_path=cache_path, force_recompute=False))
     encoded_intersets.append(e_tgt_trainset)
 
     # generate intermediate domains
@@ -332,30 +485,38 @@ def run_goat(model_copy, source_model, src_trainset, tgt_trainset, all_sets, deg
         all_domains = []
         all_y_transported = []
         for i in range(len(encoded_intersets)-1):
-            new_domains = generate_domains(generated_domains, encoded_intersets[i], encoded_intersets[i+1])[0]
-            new_y_transported = generate_domains(generated_domains, encoded_intersets[i], encoded_intersets[i+1])[1]
+            output = generate_domains(generated_domains, encoded_intersets[i], encoded_intersets[i+1])
+            new_domains = output[0]
             all_domains += new_domains
-            all_y_transported.append(new_y_transported)
+            for j in range(len(new_domains)):
+                # breakpoint()
+                plot_encoded_domains(encoded_intersets[i], new_domains[j], encoded_intersets[i+1],
+                                        title_src=f"Encoded {deg_idx[i-1] if i < len(deg_idx) else 'X'}",
+                                        title_inter=f"Generated {j+1}",
+                                        title_tgt=f"Encoded {deg_idx[i] if i < len(deg_idx) else 'X'}",
+                                        save_dir='plots/target{}/'.format(target),
+                                        method=f"goat_pair{i}_step{j}",
+                                        pca=pca_model)
             
         print(f"Generating {generated_domains} beteween each pair of the {len(intersets)} ground-truth domains...")
-        # Plotting all generated intermediate domains
-        print("Plotting all generated intermediate domains...")
-        domain_idx = 0
-        for i in range(len(encoded_intersets) - 1):
-            src_dom = encoded_intersets[i]
-            tgt_dom = encoded_intersets[i + 1]
-            for j in range(generated_domains):
-                gen_dom = all_domains[domain_idx]
-                plot_encoded_domains(src_dom, gen_dom, tgt_dom,
-                                     title_src=f"Encoded {deg_idx[i-1] if i < len(deg_idx) else 'X'}",
-                                     title_inter=f"Generated {j+1}",
-                                     title_tgt=f"Encoded {deg_idx[i] if i < len(deg_idx) else 'X'}",
-                                     save_dir='plots/target{}/'.format(target),
-                                     method=f"goat_pair{i}_step{j}",
-                                        pca=pca_model)
-                domain_idx += 1
-
-        _, generated_acc = self_train(args, source_model.mlp, all_domains, epochs=epochs)
+        # # Plotting all generated intermediate domains
+        # print("Plotting all generated intermediate domains...")
+        # domain_idx = 0
+        # for i in range(len(encoded_intersets) - 1):
+        #     src_dom = encoded_intersets[i]
+        #     tgt_dom = encoded_intersets[i + 1]
+        #     for j in range(generated_domains):
+        #         gen_dom = all_domains[domain_idx]
+        #         plot_encoded_domains(src_dom, gen_dom, tgt_dom,
+        #                              title_src=f"Encoded {deg_idx[i-1] if i < len(deg_idx) else 'X'}",
+        #                              title_inter=f"Generated {j+1}",
+        #                              title_tgt=f"Encoded {deg_idx[i] if i < len(deg_idx) else 'X'}",
+        #                              save_dir='plots/target{}/'.format(target),
+        #                              method=f"goat_pair{i}_step{j}",
+        #                                 pca=pca_model)
+        #         domain_idx += 1
+        # breakpoint()
+        _, generated_acc = self_train(args, source_model.mlp, all_domains, epochs=epochs, use_labels = args.use_labels)
         # plot all intermediate domains
             
     
@@ -379,7 +540,7 @@ def run_main_algo_oracle(model_copy, source_model, src_trainset, tgt_trainset, a
     # Also self-train on unlabeled target 
     print("------------Self-train on pooled domains----------")
     direct_acc_all, st_acc_all = self_train(args, source_model, all_sets, epochs=epochs)
-    cache_dir = f"cache/target{target}/"
+    cache_dir = f"cache{args.ssl_weight}/target{target}/"
     plot_dir = f"plots/target{target}/"
 
     os.makedirs(cache_dir, exist_ok=True)
@@ -408,19 +569,27 @@ def run_main_algo_oracle(model_copy, source_model, src_trainset, tgt_trainset, a
     generated_acc = 0
     if generated_domains > 0:
         all_domains = []
-
         synthetic_indices = []
         base_idx = len(domain_indices) - 1
         # ✅ Generate synthetic domains for adaptation
         for i in range(len(encoded_intersets) - 1):
-            output = generate_gauss_domains(
+            # output = generate_gauss_domains(
+            #     source_dataset=encoded_intersets[i],
+            #     target_dataset=encoded_intersets[i + 1],
+            #     n_wsteps=generated_domains,
+            #     device=device
+            # )
+            # generate pseudo labels for the target domain
+            tgt_pseudo_labels,_ = get_pseudo_labels(encoded_intersets[i + 1], source_model.mlp, device=device)
+            inter_domains = generate_domains_find_next(
                 source_dataset=encoded_intersets[i],
                 target_dataset=encoded_intersets[i + 1],
+                tgt_pseudo_labels=tgt_pseudo_labels,
                 n_wsteps=generated_domains,
                 device=device
             )
-            
-            all_domains += output[1]
+            all_domains.extend(inter_domains)
+
             # all_domains.extend(inter_domains)
             synthetic_indices.extend([base_idx + i + 1] * generated_domains)
         print("Plotting all generated intermediate domains...")
@@ -450,7 +619,7 @@ def run_main_algo_oracle(model_copy, source_model, src_trainset, tgt_trainset, a
 
 
 
-def run_main_algo(model_copy, source_model, src_trainset, tgt_trainset, all_sets, deg_idx, generated_domains, epochs=10, log_file="main_algo_log.csv", target = 60, stop_threshold = 0.1):
+def run_main_algo(model_copy, source_model, src_trainset, tgt_trainset, all_sets, deg_idx, generated_domains, epochs=10, log_file="main_algo_log.csv", target = 60, stop_threshold = 3):
     """
     Runs the main algorithm following the same structure as run_goat.
     """
@@ -466,8 +635,8 @@ def run_main_algo(model_copy, source_model, src_trainset, tgt_trainset, all_sets
     # Also self-train on unlabeled target 
     print("------------Self-train on pooled domains----------")
     direct_acc_all, st_acc_all = self_train(args, source_model, all_sets, epochs=epochs)
-    cache_dir = "cache/target{}/".format(target)
-    plot_dir = "plots/target{}/".format(target)
+    cache_dir = f"cache{args.ssl_weight}/target{target}/"
+    plot_dir = f"plots/target{target}/"
     os.makedirs(cache_dir, exist_ok=True)
     e_src_trainset, e_tgt_trainset = get_encoded_dataset(source_model.encoder, src_trainset, cache_path=os.path.join(cache_dir, "encoded_0.pt")), get_encoded_dataset(source_model.encoder, tgt_trainset, cache_path=os.path.join(cache_dir, f"encoded_{target}.pt"))
     pca_model = plot_encoded_domains(e_src_trainset, e_src_trainset, e_tgt_trainset, method = 'main_algo')
@@ -477,7 +646,7 @@ def run_main_algo(model_copy, source_model, src_trainset, tgt_trainset, all_sets
     # breakpoint()
     for i, interset in enumerate(intersets):
         cache_path = os.path.join(cache_dir, f"encoded_{deg_idx[i]}.pt")
-        encoded_intersets.append(get_encoded_dataset(source_model.encoder, interset, cache_path=cache_path, force_recompute=True))
+        encoded_intersets.append(get_encoded_dataset(source_model.encoder, interset, cache_path=cache_path, force_recompute=False))
     encoded_intersets.append(e_tgt_trainset)
 
     # breakpoint()
@@ -489,21 +658,49 @@ def run_main_algo(model_copy, source_model, src_trainset, tgt_trainset, all_sets
         synthetic_indices = []
         base_idx = len(domain_indices) - 1
         teacher = source_model.mlp
+        student = copy.deepcopy(teacher)
+        student = student.to(device)
         # ✅ Generate synthetic domains for adaptation
         dom_count = 1
         for i in range(len(encoded_intersets) - 1):
             w2_target = 99
             src_encoded = encoded_intersets[i]
             tgt_encoded = encoded_intersets[i + 1]
+            source_loader = DataLoader(encoded_intersets[i], batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+            tgt_loader = DataLoader(encoded_intersets[i + 1], batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+            tgt_pseudo_labels,_ = get_pseudo_labels(tgt_loader, teacher)
+            if i == 0:
+                src_pseudo_labels = encoded_intersets[i].targets
+            else:
+                breakpoint()
+                teacher_before = copy.deepcopy(teacher)
+                src_pseudo_labels,_ = get_pseudo_labels(source_loader, teacher)
+                def models_equal(model1, model2):
+                    for p1, p2 in zip(model1.parameters(), model2.parameters()):
+                        if not torch.equal(p1, p2):
+                            return False
+                    return True
+
+                print("Teacher was modified:", not models_equal(teacher, teacher_before))
+
+                src_encoded.targets = src_pseudo_labels
             # for step in range(generated_domains):
-            while w2_target > stop_threshold:
+            while w2_target > stop_threshold and dom_count <= generated_domains * 3:
                 # Generate one intermediate domain
-                w2_target, domain = generate_gauss_domains(
+                # w2_target, domain = generate_gauss_domains(
+                #     src_encoded,
+                #     tgt_encoded,
+                #     n_wsteps=1,
+                #     device=device,
+                # )  # pick the first step only
+                
+                domain, w2_target = generate_domains_find_next(
                     src_encoded,
+                    src_pseudo_labels,
                     tgt_encoded,
+                    tgt_pseudo_labels,
                     n_wsteps=1,
-                    device=device,
-                )  # pick the first step only
+                    device=device,)
                 domain = domain[0]
                 src_encoded = domain
                 # breakpoint()
@@ -522,7 +719,23 @@ def run_main_algo(model_copy, source_model, src_trainset, tgt_trainset, all_sets
 
                 all_domains.append(domain)
             # all_domains.extend(inter_domains)
+
             synthetic_indices.extend([base_idx + i + 1] * generated_domains)
+        
+        tgt_loader = DataLoader(encoded_intersets[-1], batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+        tgt_pseudo_labels,_ = get_pseudo_labels(tgt_loader, teacher)
+        tgt_pseudo_labeled = copy.deepcopy(encoded_intersets[-1])
+        tgt_pseudo_labeled.targets = tgt_pseudo_labels
+
+        st_acc, teacher = self_train_one_domain(
+            args,
+            teacher,
+            tgt_pseudo_labeled,
+            e_tgt_trainset,
+            epochs=epochs,
+            source_idx = dom_count,
+        )
+        dom_count += 1
 
         print("Plotting all generated intermediate domains...")
         domain_idx = 0
@@ -544,7 +757,9 @@ def run_main_algo(model_copy, source_model, src_trainset, tgt_trainset, all_sets
         # Train on synthetic domains and log
         domain_indices.extend(synthetic_indices)
         domain_types.extend(["synthetic"] * len(synthetic_indices))
-        _, generated_acc = self_train(args, source_model.mlp, all_domains, epochs=epochs, log_file="gradual_"+log_file)
+    else:
+        breakpoint()
+        _, generated_acc = self_train(args, source_model.mlp, all_domains, epochs=epochs)
         
 
     return 0, 0, 0, 0, generated_acc
@@ -560,12 +775,12 @@ def run_mnist_experiment(target, gt_domains, generated_domains):
     source_model = get_source_model(
         args,
         src_trainset,
-        src_trainset,
+        tgt_trainset,
         n_class=10,
         mode="mnist",
         encoder=encoder,
         epochs=5,
-        model_path=f"cache/target{target}/mnist_source_model_{target}.pth",
+        model_path=f"cache{args.ssl_weight}/target{target}/mnist_source_model_{target}.pth",
         target_dataset=tgt_trainset,
         force_recompute=False
     )
@@ -602,8 +817,8 @@ def run_mnist_experiment(target, gt_domains, generated_domains):
     all_sets.append(tgt_trainset)
     deg_idx.append(target)
     # breakpoint()
-    # _, _, _, _, main_algo_acc = run_main_algo_oracle(main_model_copy, source_model_main_algo, src_trainset, tgt_trainset, all_sets, deg_idx, generated_domains, epochs=5, target = target)
-    
+    _, _, _, _, main_algo_acc = run_main_algo(main_model_copy, source_model_main_algo, src_trainset, tgt_trainset, all_sets, deg_idx, generated_domains, epochs=5, target = target)
+    # _, _, _, _, main_algo_acc = run_main_algo(main_model_copy, source_model_main_algo, src_trainset, tgt_trainset, all_sets, deg_idx, generated_domains, epochs=5, target = target)
     # direct_acc, st_acc, direct_acc_all, st_acc_all, generated_acc = run_goat(goat_model_copy, source_model_goat, src_trainset, tgt_trainset, all_sets, deg_idx,generated_domains, epochs=5, target = target)
 
     # with open(f"logs/mnist_{target}_{gt_domains}_layer.txt", "a") as f:
@@ -681,8 +896,10 @@ def run_portraits_experiment(gt_domains, generated_domains):
 
     src_trainset = EncodeDataset(tr_x, tr_y.astype(int), transforms)
     tgt_trainset = EncodeDataset(ts_x, ts_y.astype(int), transforms)
-    source_model = get_source_model(args, src_trainset, src_trainset, 2, mode="portraits", encoder=encoder, epochs=20)
-    model_copy = copy.deepcopy(source_model)
+    source_model_goat = get_source_model(args, src_trainset, src_trainset, 2, mode="portraits", encoder=encoder, epochs=20, model_path=f"portraits/cache{args.ssl_weight}/source_model.pth", target_dataset=tgt_trainset, force_recompute=False)
+    source_model_main = copy.deepcopy(source_model_goat)
+    model_copy_goat = copy.deepcopy(source_model_goat)
+    model_copy_main = copy.deepcopy(source_model_main)
 
     def get_domains(n_domains):
         domain_set = []
@@ -696,7 +913,8 @@ def run_portraits_experiment(gt_domains, generated_domains):
     all_sets = get_domains(gt_domains)
     all_sets.append(tgt_trainset)
     
-    direct_acc, st_acc, direct_acc_all, st_acc_all, generated_acc = run_goat(model_copy, source_model, src_trainset, tgt_trainset, all_sets, generated_domains, epochs=5)
+    direct_acc, st_acc, direct_acc_all, st_acc_all, generated_acc = run_goat(model_copy_goat, source_model_goat, src_trainset, tgt_trainset, all_sets, 0,generated_domains, epochs=5)
+    direct_acc, st_acc, direct_acc_all, st_acc_all, generated_acc = run_main_algo(model_copy_main, source_model_main, src_trainset, tgt_trainset, all_sets, generated_domains, epochs=5)
 
     elapsed = round(time.time() - t, 2)
     with open(f"logs/portraits_exp_time.txt", "a") as f:
@@ -892,7 +1110,8 @@ if __name__ == '__main__':
     parser.add_argument("--lr", default=1e-4, type=float)
     parser.add_argument("--num-workers", default=2, type=int)
     parser.add_argument("--log-file", default="")
-    parser.add_argument("--lambda-unsup", default=0.5, type=float)
+    parser.add_argument("--ssl-weight", default=0.1, type=float)
+    parser.add_argument("--use-labels", action="store_true", help="Use translable")
     args = parser.parse_args()
 
     main(args)
