@@ -21,3 +21,4 @@ logs
 src*
 *.png
 plots/
+*cache*

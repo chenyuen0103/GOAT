@@ -156,8 +156,75 @@ def get_pseudo_labels(dataloader, model, confidence_q=0.1):
 #     return direct_acc, st_acc
 
 
+def self_train(args, source_model, datasets, epochs=10, use_labels=False):
+    steps = len(datasets)
+    teacher = source_model
+    targetset = datasets[-1]
+        
+    targetloader = DataLoader(targetset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    print("------------Direct adapt performance----------")
+    direct_acc = test(targetloader, teacher)
 
-def self_train(args, source_model, datasets, epochs=10):
+    # start self-training on intermediate domains
+    for i in range(steps):
+        print(f"--------Training on the {i}th domain--------")
+        trainset = datasets[i]
+        ogloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+        train_labs, train_idx = get_pseudo_labels(ogloader, teacher)
+
+
+
+        # Filter labels and indices if needed
+        if use_labels and i < steps - 1:
+            if hasattr(trainset, "targets"):
+                train_labs = np.array(trainset.targets)
+                # train_targets = np.array(trainset.targets)
+                # train_idx = np.array(train_idx)
+                # train_labs_full = np.array(train_labs)[train_idx]
+                # transported_subset = train_targets[train_idx]
+
+                # match_mask = transported_subset == train_labs_full
+                # train_idx = train_idx[match_mask]
+                # train_labs = train_labs_full[match_mask]
+            else:
+                raise ValueError("Transported labels not available in the dataset.")
+        else:
+            train_idx = np.array(train_idx)
+            train_labs = np.array(train_labs)[train_idx]
+
+        # Apply filtering to data
+        if torch.is_tensor(trainset.data):
+            data = trainset.data.cpu().detach().numpy()
+        else:
+            data = trainset.data
+
+        data = data[train_idx]  # ⬅️ aligned with filtered labels
+
+        trainset = EncodeDataset(data, train_labs, trainset.transform)
+        trainloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+
+        # initialize and train student model
+        student = copy.deepcopy(teacher)
+        optimizer = optim.Adam(student.parameters(), lr=args.lr, weight_decay=1e-4)
+
+        for i in range(1, epochs+1):
+            train(i, trainloader, student, optimizer)
+            if i % 5 == 0:
+                 test(targetloader, student)
+        print("------------Performance on the current domain----------")
+        test(trainloader, student)
+        # breakpoint()
+
+        # test on the target domain
+        print("------------Performance on the target domain----------")
+        st_acc = test(targetloader, student)
+
+        teacher = copy.deepcopy(student)
+    
+    return direct_acc, st_acc
+
+
+def self_train_og(args, source_model, datasets, epochs=10, use_labels=False):
     steps = len(datasets)
     teacher = source_model
     targetset = datasets[-1]
@@ -173,19 +240,25 @@ def self_train(args, source_model, datasets, epochs=10):
         ogloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
                 
         test(targetloader, teacher)
+        breakpoint()
         train_labs, train_idx = get_pseudo_labels(ogloader, teacher)
-        # breakpoint()
 
 
-        # If transported labels are available, enforce agreement
-        if hasattr(trainset, 'labels'):
-            transported = trainset.labels
-            agreement = (train_labs == transported)
-            agreed_idx = torch.tensor(train_idx)[agreement[train_idx]].tolist()
-            print(f"✅ Kept {len(agreed_idx)} samples with model-OT agreement out of {len(train_idx)}")
-            train_idx = agreed_idx  # filter based on agreement
-        else:
-            print("⚠️ No transported labels — using standard pseudo-labels.")
+
+        # If transported labels are available, and not the last domain
+        if use_labels and i < steps - 1:
+            if hasattr(trainset, "targets"):
+                # breakpoint()
+                train_targets = np.array(trainset.targets)
+                train_idx = np.array(train_idx)  # Ensure it's a NumPy array
+                train_labs = np.array(train_labs)
+                match_mask = train_targets == train_labs
+                keep_idx = [idx for idx in train_idx if match_mask[idx]]
+                train_idx = np.array(keep_idx)
+
+                print(f"Filtered trainset size: {len(train_labs)}")
+            else:
+                raise ValueError("Transported labels not available in the dataset.")
 
 
         if torch.is_tensor(trainset.data):
@@ -210,6 +283,7 @@ def self_train(args, source_model, datasets, epochs=10):
                  test(targetloader, student)
         print("------------Performance on the current domain----------")
         test(trainloader, student)
+        breakpoint()
 
         # test on the target domain
         print("------------Performance on the target domain----------")
@@ -241,6 +315,9 @@ def self_train_one_domain(args, teacher_model, trainset, targetset, epochs=10, s
     # Get pseudo-labels on current synthetic domain
     ogloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     train_labs, train_idx = get_pseudo_labels(ogloader, teacher_model)
+    if hasattr(trainset, "targets"):
+        # breakpoint()
+        train_labs = np.array(trainset.targets)
 
     # Convert trainset to EncodeDataset with pseudo-labels
     if torch.is_tensor(trainset.data):
@@ -265,5 +342,6 @@ def self_train_one_domain(args, teacher_model, trainset, targetset, epochs=10, s
             test(trainloader, student)
 
     st_acc = test(targetloader, student)  # Final accuracy on target
+    teacher = copy.deepcopy(student)
 
-    return st_acc, student
+    return st_acc, teacher

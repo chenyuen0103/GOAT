@@ -68,15 +68,32 @@ def train(epoch, train_loader, model, optimizer, lr_scheduler=None, vae=False, v
             loss = loss_function(recon_batch, data, mu, log_var)
         else:
             output = model(data)
+            if labels.min() < 0 or labels.max() >= output.shape[1]:
+                breakpoint()
+                print(f"[DEBUG] Invalid label detected. Label range: [{labels.min().item()}, {labels.max().item()}], Expected: [0, {output.shape[1] - 1}]")
+                print(f"[DEBUG] Sample invalid labels: {labels[:10]}")
+                print(f"[DEBUG] Output shape: {output.shape}")
+                import sys
+                sys.exit(1)  # or raise an Exception
+
             if len(x) == 2:
-                loss = F.cross_entropy(output, labels)
+                loss = F.cross_entropy(output, labels.long())
             elif len(x) == 3:
                 criterion = nn.CrossEntropyLoss(reduction='none')
                 loss = criterion(output, labels)
                 loss = (loss * weight).mean()
 
         loss.backward()
-        train_loss += loss.item()
+        try:
+            train_loss += loss.item()
+        except:
+            breakpoint()
+            print(f"[DEBUG] loss = {loss}")
+            print(f"[DEBUG] loss.item() = {loss.item()}")
+            print(f"[DEBUG] loss.shape = {loss.shape}")
+            print(f"[DEBUG] loss.mean() = {loss.mean()}")
+            print(f" loss.sum() = {loss.sum()}")
+
         optimizer.step()
 
         if lr_scheduler is not None:
@@ -113,8 +130,6 @@ def test(val_loader, model, vae=False, verbose=True):
                     test_loss += criterion(output, labels).item()
                 elif len(x) == 3:
                     criterion = nn.CrossEntropyLoss(reduction='none')
-                    print(f"[DEBUG] labels.min = {labels.min()}, labels.max = {labels.max()}")
-                    print(f"[DEBUG] output.shape = {output.shape}")
 
                     loss = criterion(output, labels.long())
                     test_loss += (loss * weight).mean().item()
