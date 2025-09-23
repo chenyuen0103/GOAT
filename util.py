@@ -49,7 +49,7 @@ def get_single_rotate(train, angle, dataset="mnist", encoder=None):
     if dataset == "mnist":
         # uncomment the following line if MNIST is not downloaded
         # dataset = datasets.MNIST(root="/data/mnist/", train=train, download=True, transform=transform)
-        dataset = datasets.MNIST(root="/data/common", train=train, download=False, transform=transform)
+        dataset = datasets.MNIST(root="/data/common/yuenchen", train=train, download=True, transform=transform)
 
     if encoder is not None:
         dataset = get_encoded_dataset(encoder, dataset)
@@ -72,7 +72,10 @@ def get_loaders(raw_trainset, raw_testset, batch_size):
 
 
 def get_encoded_dataset_old(encoder, dataset):
-    loader = DataLoader(dataset, batch_size=128, shuffle=True)
+    # Keep deterministic ordering so that encoded features line up with the
+    # original sample order (required for comparisons like pseudo-label
+    # accuracy or per-sample bookkeeping).
+    loader = DataLoader(dataset, batch_size=128, shuffle=False)
 
     latent, labels = [], []
     with torch.no_grad():
@@ -88,7 +91,7 @@ def get_encoded_dataset_old(encoder, dataset):
 
     return encoded_dataset
 
-def get_encoded_dataset(encoder, dataset, cache_path, force_recompute=False):
+def get_encoded_dataset(dataset = None, cache_path = None, encoder = None, force_recompute=False):
     """Returns the encoded dataset if cached; otherwise, computes and saves it."""
     # breakpoint()
     if cache_path and os.path.exists(cache_path) and not force_recompute:

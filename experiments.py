@@ -22,7 +22,9 @@ import pickle
 import csv
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
-
+# ===== K-MEANS++ BASELINE (drop-in) =====
+from sklearn.cluster import KMeans
+from scipy.optimize import linear_sum_assignment
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
@@ -256,7 +258,7 @@ def train_contrastive_ssl(model, tgt_loader, optimizer, augment_fn, device, ssl_
     return total_ssl_loss / len(tgt_loader)
 
 
-def get_source_model_old(args, trainset, testset, n_class, mode, encoder=None, epochs=50, augment_fn=None, target_dataset=None, ssl_weight = 0.1,verbose=True):
+def get_source_model_old(args, trainset, testset, n_class, mode, encoder=None, epochs=50, augment_fn=None, target_dataset=None, ssl_weight = 0.1,verbose=True, diet=True):
     print("🔧 Training source model...")
     model = Classifier(encoder, MLP(mode=mode, n_class=n_class, hidden=1024)).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -276,10 +278,16 @@ def get_source_model_old(args, trainset, testset, n_class, mode, encoder=None, e
 
     #     if epoch % 5 == 0:
     #         test(testloader, model, verbose=verbose)
-    for epoch in range(1, epochs + 1):
-        if tgt_loader and augment_fn:
-            sup_loss, ssl_loss = train_joint(model, trainloader, tgt_loader, optimizer, device, augment_fn, ssl_weight)
+
+    if diet:
+        train_encoder_diet(model, trainset, testset, optimizer, device)
+    else:
+        for epoch in range(1, epochs + 1):
+            if tgt_loader and augment_fn:
+                sup_loss, ssl_loss = train_supervised(model, trainloader, tgt_loader, optimizer, device, augment_fn, ssl_weight=ssl_weight)
             msg = f"[Epoch {epoch}] Supervised Loss: {sup_loss:.4f} | SSL Loss: {ssl_loss:.4f}"
+
+           
         else:
             sup_loss = train_supervised(model, trainloader, optimizer, device)
             msg = f"[Epoch {epoch}] Supervised Loss: {sup_loss:.4f}"
@@ -402,6 +410,105 @@ augment = nn.Sequential(
 
 
 
+
+# Ensure dataset returns unique indices
+class DatasetWithIndices(Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __getitem__(self, index):
+        x, _ = self.dataset[index]  # discard original label
+        return x, index  # use index as pseudo-label (DIET's principle)
+
+    def __len__(self):
+        return len(self.dataset)
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+import numpy as np
+
+def extract_features(encoder, dataset, device, batch_size=128):
+    encoder.eval()
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    features, labels = [], []
+
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(device)
+            z = encoder(x).view(x.size(0), -1)
+            features.append(z.cpu())
+            labels.append(y)
+
+    features = torch.cat(features).numpy()
+    labels = torch.cat(labels).numpy()
+    return features, labels
+
+def evaluate_linear_probe(encoder, trainset, testset, device, batch_size=128):
+    X_train, y_train = extract_features(encoder, trainset, device, batch_size)
+    X_test, y_test = extract_features(encoder, testset, device, batch_size)
+
+    clf = LogisticRegression(max_iter=1000, solver='lbfgs', multi_class='multinomial')
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+
+    acc = accuracy_score(y_test, y_pred)
+    return acc
+
+def train_encoder_diet(model, trainset, testset, optimizer=None, device='cuda', epochs=1000, batch_size=128, lr=1e-3, label_smoothing=0.8, weight_decay=1e-5, eval_interval=20):
+    print("🔁 DIET self-supervised training on target domain")
+
+    device = torch.device(device if torch.cuda.is_available() else "cpu")
+    encoder = model.encoder.to(device)
+    encoder.eval()
+
+    dummy_input = torch.randn(1, *trainset[0][0].shape).to(device)
+    with torch.no_grad():
+        dummy_output = encoder(dummy_input)
+    flattened_dim = dummy_output.view(1, -1).shape[1]
+
+    encoder.train()
+
+    num_classes = len(trainset)
+    W = nn.Linear(flattened_dim, num_classes, bias=False).to(device)
+    loss_fn = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
+    if optimizer is None:
+        optimizer = torch.optim.Adam(
+            list(encoder.parameters()) + list(W.parameters()),
+            lr=lr,
+            weight_decay=weight_decay
+        )
+
+    wrapped_dataset = DatasetWithIndices(trainset)
+    loader = DataLoader(wrapped_dataset, batch_size=batch_size, shuffle=True)
+
+    for epoch in range(epochs):
+        encoder.train()
+        W.train()
+        total_loss = 0
+
+        for x, idx in loader:
+            x, idx = x.to(device), idx.to(device)
+            z = encoder(x).view(x.size(0), -1)
+            logits = W(z)
+            loss = loss_fn(logits, idx)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(loader)
+        print(f"[DIET] Epoch {epoch+1}/{epochs}: Loss = {avg_loss:.4f}")
+
+        if testset and (epoch + 1) % eval_interval == 0:
+            acc = evaluate_linear_probe(encoder, trainset, testset, device, batch_size)
+            print(f"🔍 [Eval] Epoch {epoch+1}: Linear Probe Accuracy = {acc * 100:.2f}%")
+
+    return encoder
+
+
 def train_encoder_self_supervised(model, target_dataset, epochs=10, batch_size=128, lr=1e-3):
     print("🔁 Self-supervised training on target domain")
 
@@ -468,7 +575,7 @@ def run_goat(model_copy, source_model, src_trainset, tgt_trainset, all_sets, deg
     direct_acc_all, st_acc_all = self_train(args, source_model, all_sets, epochs=epochs)
     cache_dir = f"cache{args.ssl_weight}/target{target}/"
     # encode the source and target domains
-    e_src_trainset, e_tgt_trainset = get_encoded_dataset(source_model.encoder, src_trainset, cache_path=os.path.join(cache_dir, "encoded_0.pt"), force_recompute=False), get_encoded_dataset(source_model.encoder, tgt_trainset, cache_path=os.path.join(cache_dir, f"encoded_{target}.pt"), force_recompute=False)
+    e_src_trainset, e_tgt_trainset = get_encoded_dataset(src_trainset, cache_path=os.path.join(cache_dir, "encoded_0.pt"), encoder =source_model.encoder,  force_recompute=False), get_encoded_dataset(tgt_trainset, cache_path=os.path.join(cache_dir, f"encoded_{target}.pt"), encoder = source_model.encoder, force_recompute=False)
     pca_model = plot_encoded_domains(e_src_trainset, e_src_trainset, e_tgt_trainset, method = 'goat')
 
     # encode the intermediate ground-truth domains
@@ -476,7 +583,7 @@ def run_goat(model_copy, source_model, src_trainset, tgt_trainset, all_sets, deg
     encoded_intersets = [e_src_trainset]
     for i, interset in enumerate(intersets):
         cache_path = os.path.join(cache_dir, f"encoded_{deg_idx[i]}.pt")
-        encoded_intersets.append(get_encoded_dataset(source_model.encoder, interset, cache_path=cache_path, force_recompute=False))
+        encoded_intersets.append(get_encoded_dataset(interset, cache_path=cache_path, encoder =source_model.encoder, force_recompute=False))
     encoded_intersets.append(e_tgt_trainset)
 
     # generate intermediate domains
@@ -544,7 +651,7 @@ def run_main_algo_oracle(model_copy, source_model, src_trainset, tgt_trainset, a
     plot_dir = f"plots/target{target}/"
 
     os.makedirs(cache_dir, exist_ok=True)
-    e_src_trainset, e_tgt_trainset = get_encoded_dataset(source_model.encoder, src_trainset, cache_path=os.path.join(cache_dir, "encoded_0.pt"), force_recompute=False), get_encoded_dataset(source_model.encoder, tgt_trainset, cache_path=os.path.join(cache_dir, f"encoded_{target}.pt"), force_recompute=False)
+    e_src_trainset, e_tgt_trainset = get_encoded_dataset(src_trainset, cache_path=os.path.join(cache_dir, "encoded_0.pt"), encoder =source_model.encoder, force_recompute=False), get_encoded_dataset(tgt_trainset, cache_path=os.path.join(cache_dir, f"encoded_{target}.pt"),encoder =source_model.encoder,  force_recompute=False)
     # breakpoint()
     pca_model = plot_encoded_domains(e_src_trainset, e_src_trainset, e_tgt_trainset, save_dir = plot_dir, method = 'main_algo_oracle')
 
@@ -560,7 +667,7 @@ def run_main_algo_oracle(model_copy, source_model, src_trainset, tgt_trainset, a
     # breakpoint()
     for i, interset in enumerate(intersets):
         cache_path = os.path.join(cache_dir, f"encoded_{deg_idx[i]}.pt")
-        encoded_intersets.append(get_encoded_dataset(source_model.encoder, interset, cache_path=cache_path))
+        encoded_intersets.append(get_encoded_dataset( interset, cache_path=cache_path, encoder =source_model.encoder,))
     encoded_intersets.append(e_tgt_trainset)
 
     # breakpoint()
@@ -638,7 +745,7 @@ def run_main_algo(model_copy, source_model, src_trainset, tgt_trainset, all_sets
     cache_dir = f"cache{args.ssl_weight}/target{target}/"
     plot_dir = f"plots/target{target}/"
     os.makedirs(cache_dir, exist_ok=True)
-    e_src_trainset, e_tgt_trainset = get_encoded_dataset(source_model.encoder, src_trainset, cache_path=os.path.join(cache_dir, "encoded_0.pt")), get_encoded_dataset(source_model.encoder, tgt_trainset, cache_path=os.path.join(cache_dir, f"encoded_{target}.pt"))
+    e_src_trainset, e_tgt_trainset = get_encoded_dataset(src_trainset, cache_path=os.path.join(cache_dir, "encoded_0.pt"), encoder = source_model.encoder),get_encoded_dataset(tgt_trainset, cache_path=os.path.join(cache_dir, f"encoded_{target}.pt"),encoder =source_model.encoder)
     pca_model = plot_encoded_domains(e_src_trainset, e_src_trainset, e_tgt_trainset, method = 'main_algo')
     # Encode the intermediate ground-truth domains
     intersets = all_sets[:-1]
@@ -646,7 +753,7 @@ def run_main_algo(model_copy, source_model, src_trainset, tgt_trainset, all_sets
     # breakpoint()
     for i, interset in enumerate(intersets):
         cache_path = os.path.join(cache_dir, f"encoded_{deg_idx[i]}.pt")
-        encoded_intersets.append(get_encoded_dataset(source_model.encoder, interset, cache_path=cache_path, force_recompute=False))
+        encoded_intersets.append(get_encoded_dataset( interset, cache_path=cache_path, encoder =source_model.encoder, force_recompute=False))
     encoded_intersets.append(e_tgt_trainset)
 
     # breakpoint()
@@ -765,6 +872,106 @@ def run_main_algo(model_copy, source_model, src_trainset, tgt_trainset, all_sets
     return 0, 0, 0, 0, generated_acc
 
 
+# ===== K-MEANS++ BASELINE (drop-in) =====
+from sklearn.cluster import KMeans
+from scipy.optimize import linear_sum_assignment
+
+@torch.no_grad()
+def predict_source_labels(model, dataset, device, batch_size=256):
+    """Proxy labels on target from the SOURCE model (unsupervised wrt ground truth)."""
+    model.eval()
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    preds = []
+    for x, _ in loader:
+        x = x.to(device)
+        logit = model(x)
+        preds.append(logit.argmax(dim=1).cpu())
+    return torch.cat(preds).numpy()
+
+def hungarian_map_clusters_to_labels(cluster_ids, proxy_labels, n_classes):
+    """
+    Map cluster -> label by maximizing agreement with proxy_labels (from source model).
+    Returns mapped_labels (same length as cluster_ids) and the mapping dict.
+    """
+    C = np.zeros((n_classes, n_classes), dtype=int)  # [cluster, label]
+    for c in range(n_classes):
+        for y in range(n_classes):
+            C[c, y] = np.sum((cluster_ids == c) & (proxy_labels == y))
+
+    # maximize matches -> minimize negative counts
+    row_ind, col_ind = linear_sum_assignment(C.max() - C)
+    mapping = {row: col for row, col in zip(row_ind, col_ind)}
+    mapped = np.vectorize(mapping.get)(cluster_ids)
+    return mapped, mapping
+
+def nearest_centroid_predict(X, centroids):
+    # returns cluster index per row
+    # X: (N,d), centroids: (K,d)
+    d2 = ((X[:, None, :] - centroids[None, :, :])**2).sum(axis=2)
+    return d2.argmin(axis=1)
+
+
+def _to_2d_numpy(x, pool="flatten"):
+    """
+    x: torch.Tensor or np.ndarray with shape (N, …).
+    Returns np.ndarray of shape (N, D) suitable for sklearn.
+    pool:
+      - "flatten": flatten all non-batch dims
+      - "gap": global average pool over spatial dims, keeps channels (N, C)
+    """
+    t = torch.as_tensor(x)  # handles numpy, too
+    if t.ndim > 2:
+        if pool == "gap":
+            # average over all non-(N,C) dims
+            # common case: (N, C, H, W) → mean over H,W
+            reduce_dims = tuple(range(2, t.ndim))
+            t = t.mean(dim=reduce_dims)
+        else:
+            t = t.view(t.size(0), -1)
+    return t.detach().cpu().numpy()
+
+def run_kmeanspp_baseline(args, target_angle, n_classes=10, pool="gap", n_init=10):
+    # load cached encoded datasets
+    cache_dir = f"cache{args.ssl_weight}/target{target_angle}/"
+    e_src = torch.load(f"{cache_dir}/encoded_0.pt")
+    e_tgt = torch.load(f"{cache_dir}/encoded_{target_angle}.pt")
+
+    # features → 2D numpy
+    X_tr  = _to_2d_numpy(e_src.data, pool=pool)   # (N, D)
+    X_tgt = _to_2d_numpy(e_tgt.data, pool=pool)   # (N, D)
+
+    # (optional) get labels if you want to report true acc
+    y_tgt = e_tgt.targets.cpu().numpy() if torch.is_tensor(e_tgt.targets) else np.asarray(e_tgt.targets)
+
+    # k-means++ on target (or on source if you prefer)
+    km = KMeans(
+        n_clusters=n_classes,
+        init="k-means++",
+        n_init=n_init,
+        max_iter=300,
+        random_state=args.seed
+    )
+    cluster_ids = km.fit_predict(X_tgt)
+
+    # if you want a quick unsupervised accuracy proxy:
+    # map clusters → labels by majority vote (needs y_tgt only for reporting)
+    if y_tgt is not None:
+        mapping = {}
+        for c in range(n_classes):
+            mask = (cluster_ids == c)
+            if mask.any():
+                vals, cnts = np.unique(y_tgt[mask], return_counts=True)
+                mapping[c] = vals[cnts.argmax()]
+            else:
+                mapping[c] = 0
+        y_hat = np.vectorize(mapping.get)(cluster_ids)
+        from sklearn.metrics import accuracy_score
+        acc = accuracy_score(y_tgt, y_hat)
+        print(f"[KMeans++] pooled='{pool}'  acc={acc:.4f}")
+
+    return km, cluster_ids
+
+
 def run_mnist_experiment(target, gt_domains, generated_domains):
 
     src_trainset, tgt_trainset = get_single_rotate(False, 0), get_single_rotate(False, target)
@@ -780,7 +987,7 @@ def run_mnist_experiment(target, gt_domains, generated_domains):
         mode="mnist",
         encoder=encoder,
         epochs=5,
-        model_path=f"cache{args.ssl_weight}/target{target}/mnist_source_model_{target}.pth",
+        model_path=f"diet_source_models/target{target}/mnist_source_model_{target}.pth",
         target_dataset=tgt_trainset,
         force_recompute=False
     )
@@ -846,7 +1053,7 @@ def run_mnist_ablation(target, gt_domains, generated_domains):
     model_copy3 = copy.deepcopy(source_model)
     model_copy4 = copy.deepcopy(source_model)
 
-    e_src_trainset, e_tgt_trainset = get_encoded_dataset(source_model.encoder, src_trainset), get_encoded_dataset(source_model.encoder, tgt_trainset)
+    e_src_trainset, e_tgt_trainset = get_encoded_dataset(src_trainset,encoder=source_model.encoder), get_encoded_dataset(tgt_trainset, encoder =source_model.encoder)
     intersets = all_sets[:-1]
     encoded_intersets = [e_src_trainset]
     for i in intersets:
@@ -1092,6 +1299,7 @@ def log_generated_images_tensorboard(writer, images, epoch, tag='Generated Image
 
 def main(args):
     writer = init_tensorboard()
+    # run_kmeanspp_baseline(args, target_angle=args.rotation_angle, n_classes=10)
     print(args)
     if args.dataset == "mnist":
         if args.mnist_mode == "normal":

@@ -98,8 +98,8 @@ def pushforward_with_y(X_S, y_s, X_T, y_T, plan, t):
     return x_t, y_t, weights
 
 
-from geomstats.geometry.hypersphere import Hypersphere
-sphere = Hypersphere(dim=2)
+# from geomstats.geometry.hypersphere import Hypersphere
+# sphere = Hypersphere(dim=2)
 
 
 def pushforward_geo(X_S, X_T, plan, t):

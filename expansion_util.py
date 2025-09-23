@@ -12,6 +12,29 @@ import ot  # pip install POT
 import numpy as np
 import torch
 
+
+def gaussian_e_geodesic(mu_s: np.ndarray, Sigma_s: np.ndarray,
+                        mu_t: np.ndarray, Sigma_t: np.ndarray,
+                        t: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Interpolate class-conditional Gaussian via e-geodesic (linear in natural params)."""
+    Js = np.linalg.inv(Sigma_s); Jt = np.linalg.inv(Sigma_t)
+    eta1_s, eta2_s = Js @ mu_s, -0.5 * Js
+    eta1_t, eta2_t = Jt @ mu_t, -0.5 * Jt
+    eta1 = (1-t) * eta1_s + t * eta1_t
+    eta2 = (1-t) * eta2_s + t * eta2_t
+    J_interp = -2.0 * eta2
+    Sigma_interp = np.linalg.inv(J_interp)
+    mu_interp = Sigma_interp @ eta1
+    return mu_interp, Sigma_interp
+
+def sample_dataset(mu: np.ndarray, Sigma: np.ndarray,
+                      n: int, rng):
+    """Draw n samples from a 2-class Gaussian with shared covariance Sigma (d×d)."""
+    d = len(mu)
+    X = rng.multivariate_normal(mean=mu, cov=Sigma, size=n) if n else np.empty((0, d))
+    return X
+
+
 def compute_w2_distance_pot(X_src, X_tgt, p=2):
     """
     Compute Wasserstein-p distance between empirical distributions X_src and X_tgt using POT.
@@ -468,63 +491,6 @@ def generate_domains_find_next(
     return all_domains, w2_target
 
 
-# def estimate_class_conditional_gaussian_params(
-#     encoded_dataset,  # Assumes (latents, labels)
-#     cache_path=None,
-#     force_recompute=False,
-# ):
-#     """
-#     Computes one (mu, sigma) per class from a dataset of encoded latents.
-    
-#     Inputs:
-#         - encoded_dataset: Tuple (latents, labels), where:
-#             * latents: Tensor of shape (N, d) containing latent vectors
-#             * labels: Tensor of shape (N,) containing class labels
-    
-#     Output:
-#         - class_params: Dict[class_label -> (mu, Sigma)] (Gaussian parameters per class)
-#     """
-
-#     if cache_path is None:
-#         cache_path = "class_conditional_gaussians.pkl"
-
-#     # ✅ Load cached results if available
-#     if os.path.exists(cache_path) and not force_recompute:
-#         print(f"🔹 Loading class-conditional Gaussians from {cache_path}")
-#         with open(cache_path, "rb") as f:
-#             return pickle.load(f)
-
-#     # Unpack encoded dataset
-#     # breakpoint()
-#     latents, labels = encoded_dataset.data, encoded_dataset.targets  # latents: (N, d), labels: (N,)
-#     unique_classes = torch.unique(labels)
-
-#     class_params = {}
-
-#     # Compute class-conditional mean & covariance
-#     for c in unique_classes:
-#         latents_c = latents[labels == c]  # All latents for class c
-
-#         if latents_c.shape[0] > 1:
-#             mu_c = latents_c.mean(dim=0)  # shape: (d,)
-#             centered = latents_c - mu_c   # shape: (N, d)
-#             centered_flat = centered.view(centered.shape[0], -1)  # Shape [N, D]
-#             # breakpoint()
-#             sigma_c = (centered_flat.T @ centered_flat) / (centered_flat.shape[0] - 1)
-#             # sigma_c = (centered.T @ centered) / (latents_c.shape[0] - 1)  # shape: (d, d)
-#         else:
-#             mu_c = latents_c.mean(dim=0)
-#             sigma_c = torch.eye(latents_c.shape[1], device=latents_c.device, dtype=latents_c.dtype) * 1e-5  # Small regularization
-        
-#         class_params[c.item()] = (mu_c, sigma_c)
-
-#     # ✅ Cache results
-#     with open(cache_path, "wb") as f:
-#         pickle.dump(class_params, f)
-#     print(f"✅ Cached class-conditional Gaussians at {cache_path}")
-
-#     return class_params
-
 
 def estimate_class_conditional_gaussian_params(
     encoded_dataset,  # Assumes (latents, labels)
@@ -618,72 +584,6 @@ def make_positive_definite(Sigma, min_eig=1e-5):
     return eigvecs @ np.diag(eigvals) @ eigvecs.T
 
 
-# def wasserstein_step_full(
-#     mu_t, sigma_t,
-#     mu_T, sigma_T,
-#     delta=0.5,       # Maximum allowed W2 distance from old dist
-#     lr=0.01,
-#     max_iters=100,
-#     lambda_cov=0.1
-# ):
-#     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-#     # Move inputs to GPU
-#     mu_t = mu_t.to(dtype=torch.float16, device=device)
-#     sigma_t = sigma_t.to(dtype=torch.float16, device=device)
-#     mu_T = mu_T.to(dtype=torch.float16, device=device)
-#     sigma_T = sigma_T.to(dtype=torch.float16, device=device)
-
-#     # Cloning for gradient optimization
-#     v = mu_t.clone().detach().requires_grad_(True)
-#     sigma_v = sigma_t.clone().detach().requires_grad_(True)
-
-#     optimizer = torch.optim.Adam([v, sigma_v], lr=lr)
-#     eps = 1e-8
-
-#     # Iterative Wasserstein step
-#     for step in range(max_iters):
-#         optimizer.zero_grad()
-#         loss = w2_gaussian_dist(v, sigma_v, mu_T, sigma_T)
-#         loss.backward()
-#         optimizer.step()
-
-#     # Ensure positive definiteness
-#     with torch.no_grad():
-#         sigma_v_pd = sigma_v.detach() + eps * torch.eye(sigma_v.shape[0], device=device)
-#         sigma_v_pd = make_positive_definite(sigma_v_pd)
-#         final_mu = v.detach()
-#         final_sigma = sigma_v_pd
-
-#     # Compute Wasserstein distances
-#     w2_previous_final = w2_gaussian_dist(mu_t, sigma_t, final_mu, final_sigma)
-#     w2_target_final = w2_gaussian_dist(final_mu, final_sigma, mu_T, sigma_T)
-
-#     # Enforce W2 constraint
-    # if w2_previous_final.item() > delta:
-    #     alpha = min(1.0, delta / w2_previous_final.item())
-    #     final_mu_np, final_sigma_np = wasserstein_interpolation(
-    #         mu_t.cpu().numpy(), sigma_t.cpu().numpy(),  
-    #         final_mu.cpu().numpy(), final_sigma.cpu().numpy(),  
-    #         alpha
-    #     )
-
-#         final_mu = torch.tensor(final_mu_np, dtype=torch.float32, device=device)
-#         final_sigma = torch.tensor(final_sigma_np, dtype=torch.float32, device=device)
-
-#         # Recompute Wasserstein distances after projection
-#         w2_previous_final = w2_gaussian_dist(mu_t, sigma_t, final_mu, final_sigma)
-#         w2_target_final = w2_gaussian_dist(final_mu, final_sigma, mu_T, sigma_T)
-
-#     
-
-#     # Free GPU memory if tensors are not needed on GPU
-#     mu_t, sigma_t, mu_T, sigma_T = mu_t.cpu(), sigma_t.cpu(), mu_T.cpu(), sigma_T.cpu()
-#     final_sigma = final_sigma.cpu()
-
-#     return final_mu, final_sigma, w2_previous_final, w2_target_final
-
-import torch
 
 def w2_shorten(muA, SigmaA, muB, SigmaB, alpha, device="cuda"):
     """
@@ -722,70 +622,7 @@ def w2_shorten(muA, SigmaA, muB, SigmaB, alpha, device="cuda"):
     return mu_out, Sigma_out
 
 
-# def wasserstein_step_full(
-#     mu_t, sigma_t, mu_T, sigma_T,
-#     delta=0.5, lr=0.01, max_iters=100, lambda_cov=0.1, to_cpu=False
-# ):
-#     """
-#     Optimized Wasserstein step function for interpolating Gaussian distributions.
-#     Uses in-place operations, low-rank updates, and efficient matrix computations.
-#     Includes a progress bar for tracking optimization progress.
-#     """
-#     eps = 1e-8  # Numerical stability constant
 
-#     # Move inputs to device efficiently
-#     dtype = torch.float32
-#     mu_t, sigma_t, mu_T, sigma_T = map(lambda x: x.to(device, dtype=dtype, non_blocking=True),
-#                                        [mu_t, sigma_t, mu_T, sigma_T])
-
-#     # Initialize optimization variables
-#     v = mu_t.clone().detach().requires_grad_(True)
-#     sigma_v = sigma_t.clone().detach().requires_grad_(True)
-
-#     optimizer = torch.optim.Adam([v, sigma_v], lr=lr)
-
-#     # Initialize tqdm progress bar
-#     progress_bar = tqdm(range(max_iters), desc="Wasserstein Step", unit="iter")
-
-#     # Iterative Wasserstein step
-#     for step in progress_bar:
-#         optimizer.zero_grad()
-#         loss = w2_gaussian_implicit(v, sigma_v, mu_T, sigma_T)
-
-#         if loss.item() < delta:  # Early stopping if close enough
-#             progress_bar.set_description(f"Converged at step {step+1}")
-#             break
-
-#         loss.backward()
-#         optimizer.step()
-
-#         # Update progress bar with current loss
-#         progress_bar.set_postfix(loss=loss.item())
-
-#     progress_bar.close()
-
-#     # Ensure positive definiteness
-#     with torch.no_grad():
-#         # Add a small identity matrix for numerical stability
-#         sigma_v_pd = sigma_v + eps * torch.eye(sigma_v.shape[0], device=device, dtype=dtype)
-#         final_mu, final_sigma = v, sigma_v_pd
-
-#     # Compute Wasserstein distances
-#     w2_prev = w2_gaussian_implicit(mu_t, sigma_t, final_mu, final_sigma)
-
-#     # Enforce W2 constraint if needed
-#     if w2_prev.item() > delta:
-#         alpha = min(1.0, delta / w2_prev.item())
-#         final_mu, final_sigma = w2_shorten(final_mu, final_sigma, mu_T, sigma_T, alpha)
-
-#     # Move to CPU if required
-#     if to_cpu:
-#         final_mu, final_sigma = final_mu.cpu(), final_sigma.cpu()
-
-#     return final_mu, final_sigma, w2_prev
-
-import torch
-import time
 
 def w2_gaussian_low_rank(mu1, L1, mu2, L2):
     """
@@ -1074,71 +911,6 @@ def matrix_sqrt_cholesky(A, eps=1e-5):
     L = torch.linalg.cholesky(A_sym)
     return L.T
 
-# def w2_gaussian_dist(mu1, Sigma1, mu2, Sigma2):
-#     """
-#     2-Wasserstein distance between Gaussians N(mu1, Sigma1) and N(mu2, Sigma2),
-#     all in PyTorch.
-    
-#     Args:
-#       mu1, mu2: (d,) torch Tensors
-#       Sigma1, Sigma2: (d,d) torch Tensors (symmetric PSD)
-#     Returns:
-#       A torch.Tensor scalar representing the W2 distance (not squared).
-#     """
-#     # 1) Mean part
-#     mean_diff_sq = torch.norm(mu1 - mu2)**2
-    
-#     # 2) Covariance part
-#     sqrt_Sigma1 = matrix_sqrt_torch(Sigma1)
-#     inside = sqrt_Sigma1 @ Sigma2 @ sqrt_Sigma1
-#     sqrt_inside = matrix_sqrt_torch(inside)  # = (Sigma1^(1/2) Sigma2 Sigma1^(1/2))^(1/2)
-#     breakpoint()
-#     cov_term = torch.trace(Sigma1 + Sigma2 - 2.0 * sqrt_inside)
-    
-#     # 3) Combine
-#     w2_sq = mean_diff_sq + cov_term
-#     # Clamp to avoid tiny negative due to numerical noise
-#     w2_sq = torch.clamp(w2_sq, min=0.0)
-    
-#     return torch.sqrt(w2_sq)  # final distance
-
-
-# def w2_gaussian_dist(mu1, Sigma1, mu2, Sigma2, batch_size=512):
-#     """
-#     Compute the 2-Wasserstein distance between Gaussians N(mu1, Sigma1) and N(mu2, Sigma2)
-#     using batch processing to reduce memory usage.
-    
-#     Args:
-#       mu1, mu2: (d,) torch Tensors
-#       Sigma1, Sigma2: (d,d) torch Tensors
-#       batch_size: Number of rows/cols processed per batch (default: 512)
-    
-#     Returns:
-#       A torch.Tensor scalar representing the W2 distance.
-#     """
-#     d = Sigma1.shape[0]  # Dimension of covariance matrices
-
-#     # 1) Mean difference squared
-#     mean_diff_sq = torch.norm(mu1 - mu2) ** 2
-
-#     # 2) Batched computation for covariance term
-#     sqrt_Sigma1 = matrix_sqrt_torch(Sigma1)
-#     w2_cov_term = 0.0  # Initialize sum
-#     breakpoint()
-#     for i in range(0, d, batch_size):
-#         batch_end = min(i + batch_size, d)
-#         Sigma1_batch = sqrt_Sigma1[i:batch_end, :]
-#         Sigma2_batch = Sigma2[:, i:batch_end]
-    
-#         inside_batch = Sigma1_batch @ Sigma2_batch @ Sigma1_batch.T  # (batch_size, batch_size)
-#         sqrt_inside_batch = matrix_sqrt_torch(inside_batch)  # Compute sqrt for this batch
-#         w2_cov_term += torch.trace(Sigma1_batch + Sigma2_batch - 2.0 * sqrt_inside_batch)
-
-#     # 3) Final Wasserstein distance
-#     w2_sq = mean_diff_sq + w2_cov_term
-#     w2_sq = torch.clamp(w2_sq, min=0.0)  # Avoid numerical issues
-
-#     return torch.sqrt(w2_sq)
 
 
 def optimized_matrix_sqrt(A, method="cholesky", eps=1e-5):

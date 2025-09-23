@@ -124,6 +124,7 @@ def test(val_loader, model, vae=False, verbose=True):
                 recon, mu, log_var = model(data)
                 test_loss += loss_function(recon, data, mu, log_var).item()
             else:
+                
                 output = model(data)
                 if len(x) == 2:
                     criterion = nn.CrossEntropyLoss()
