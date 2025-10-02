@@ -5,14 +5,17 @@ import numpy as np
 import sklearn.preprocessing
 from scipy import ndimage
 import pandas as pd
+import os; os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 from tensorflow.keras.datasets import mnist
 
 
 class DomainDataset(Dataset):
-    def __init__(self, x, weight, targets = None, transform=None):
+    def __init__(self, x, weight, targets = None, targets_em = None, transform=None):
         self.data = x.cpu().detach()
         self.targets = -1 * torch.ones(len(self.data)).cpu().detach() if targets is None else targets.cpu().detach()
         self.targets = self.targets.long()
+        self.targets_em = -1 * torch.ones(len(self.data)).cpu().detach() if targets_em is None else targets_em.cpu().detach()
+        self.targets_em = self.targets_em.long()
         self.weight = weight
         self.transform = transform
 
@@ -29,6 +32,8 @@ class EncodeDataset(Dataset):
     def __init__(self, x, y, transform=None):
         self.data = x
         self.targets = y
+        self.targets_em = -1 * torch.ones(len(self.data)).cpu().detach()
+        self.targets_em = self.targets_em.long()
         self.transform = transform
 
     def __len__(self):

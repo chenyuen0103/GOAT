@@ -173,9 +173,9 @@ def generate_domains(n_inter, dataset_s, dataset_t, plan=None, entry_cutoff=0, c
         x, y ,weights = pushforward_with_y(xs, ys, xt, yt_hat, plan, i / (n_inter+1))
         y_tensor = torch.tensor(y, dtype=torch.long)
         if isinstance(x, np.ndarray):
-            all_domains.append(DomainDataset(torch.from_numpy(x).float(), weights, y_tensor))
+            all_domains.append(DomainDataset(torch.from_numpy(x).float(), weights, targets=y_tensor, targets_em=y_tensor))
         else:
-            all_domains.append(DomainDataset(x, weights, y_tensor))
+            all_domains.append(DomainDataset(x, weights, targets=y_tensor, targets_em=y_tensor))
 
     
     # generate_images.append(x)

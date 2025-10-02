@@ -24,3 +24,5 @@ plots/
 *cache*
 
 *.pth
+
+.vscode/*

@@ -68,20 +68,22 @@ def train(epoch, train_loader, model, optimizer, lr_scheduler=None, vae=False, v
             loss = loss_function(recon_batch, data, mu, log_var)
         else:
             output = model(data)
-            if labels.min() < 0 or labels.max() >= output.shape[1]:
-                breakpoint()
-                print(f"[DEBUG] Invalid label detected. Label range: [{labels.min().item()}, {labels.max().item()}], Expected: [0, {output.shape[1] - 1}]")
-                print(f"[DEBUG] Sample invalid labels: {labels[:10]}")
-                print(f"[DEBUG] Output shape: {output.shape}")
-                import sys
-                sys.exit(1)  # or raise an Exception
-
+            # Support soft targets (probabilities, N×C) as well as hard labels (N,)
             if len(x) == 2:
-                loss = F.cross_entropy(output, labels.long())
+                if labels.dim() == 2 and labels.dtype.is_floating_point:
+                    logp = F.log_softmax(output, dim=1)
+                    loss = (-(labels * logp).sum(dim=1)).mean()
+                else:
+                    loss = F.cross_entropy(output, labels.long())
             elif len(x) == 3:
-                criterion = nn.CrossEntropyLoss(reduction='none')
-                loss = criterion(output, labels)
-                loss = (loss * weight).mean()
+                if labels.dim() == 2 and labels.dtype.is_floating_point:
+                    logp = F.log_softmax(output, dim=1)
+                    loss = (-(labels * logp).sum(dim=1))
+                    loss = (loss * weight).mean()
+                else:
+                    criterion = nn.CrossEntropyLoss(reduction='none')
+                    loss = criterion(output, labels.long())
+                    loss = (loss * weight).mean()
 
         loss.backward()
         try:
@@ -261,4 +263,3 @@ def weighted_val(val_loader, model, vae=False, verbose=True):
 #     if not vae:
 #         test_accuracy = calculate_modal_val_accuracy(model, test_loader)
 #         return test_accuracy
-
