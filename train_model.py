@@ -106,50 +106,116 @@ def train(epoch, train_loader, model, optimizer, lr_scheduler=None, vae=False, v
     return train_loss
 
 
-def test(val_loader, model, vae=False, verbose=True):
+# def test(val_loader, model, vae=False, verbose=True):
+#     model.eval()
+#     test_loss = 0
+#     correct = 0.
+#     total = 0.
+
+#     with torch.no_grad():
+#         for x in val_loader:
+#             if len(x) == 2:
+#                 data, labels = x
+#             elif len(x) == 3:
+#                 data, labels, weight = x
+#                 weight = weight.to(device)
+#             data = data.to(device)
+#             labels = labels.to(device)
+
+#             if vae:
+#                 recon, mu, log_var = model(data)
+#                 test_loss += loss_function(recon, data, mu, log_var).item()
+#             else:
+                
+#                 output = model(data)
+#                 if len(x) == 2:
+#                     criterion = nn.CrossEntropyLoss()
+#                     test_loss += criterion(output, labels).item()
+#                 elif len(x) == 3:
+#                     criterion = nn.CrossEntropyLoss(reduction='none')
+
+#                     loss = criterion(output, labels.long())
+#                     test_loss += (loss * weight).mean().item()
+
+#                 predicted = output.argmax(dim=1)
+#                 total += labels.size(0)
+#                 correct += (predicted == labels).sum()
+
+#     test_loss /= len(val_loader.dataset)
+#     val_accuracy = 100 * correct / total
+#     val_accuracy = val_accuracy.item()
+#     if verbose:
+#         print('====> Test loss: {:.8f}'.format(test_loss))
+#         if not vae:
+#             print('====> Test Accuracy %.4f' % (val_accuracy))
+
+#     return test_loss, val_accuracy
+
+
+
+def test(val_loader, model, vae=False, verbose=True, return_preds=False):
     model.eval()
-    test_loss = 0
-    correct = 0.
-    total = 0.
+    test_loss = 0.0
+    correct = 0
+    total = 0
+
+    all_preds = []
+    all_labels = []
 
     with torch.no_grad():
-        for x in val_loader:
-            if len(x) == 2:
-                data, labels = x
-            elif len(x) == 3:
-                data, labels, weight = x
+        for batch in val_loader:
+            if len(batch) == 2:
+                data, labels = batch
+                weight = None
+            elif len(batch) == 3:
+                data, labels, weight = batch
                 weight = weight.to(device)
-            data = data.to(device)
+            else:
+                raise ValueError("Unexpected batch structure")
+
+            data   = data.to(device)
             labels = labels.to(device)
 
             if vae:
                 recon, mu, log_var = model(data)
                 test_loss += loss_function(recon, data, mu, log_var).item()
+                continue
+
+            output = model(data)
+
+            if weight is None:
+                criterion = nn.CrossEntropyLoss()
+                test_loss += criterion(output, labels).item()
             else:
-                
-                output = model(data)
-                if len(x) == 2:
-                    criterion = nn.CrossEntropyLoss()
-                    test_loss += criterion(output, labels).item()
-                elif len(x) == 3:
-                    criterion = nn.CrossEntropyLoss(reduction='none')
+                criterion = nn.CrossEntropyLoss(reduction='none')
+                loss = criterion(output, labels.long())
+                test_loss += (loss * weight).mean().item()
 
-                    loss = criterion(output, labels.long())
-                    test_loss += (loss * weight).mean().item()
+            preds = output.argmax(dim=1)
 
-                predicted = output.argmax(dim=1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum()
+            total   += labels.size(0)
+            correct += (preds == labels).sum().item()
 
+            all_preds.append(preds.detach().cpu())
+            all_labels.append(labels.detach().cpu())
+
+    # averages / metrics
     test_loss /= len(val_loader.dataset)
-    val_accuracy = 100 * correct / total
-    val_accuracy = val_accuracy.item()
-    if verbose:
-        print('====> Test loss: {:.8f}'.format(test_loss))
-        if not vae:
-            print('====> Test Accuracy %.4f' % (val_accuracy))
+    val_accuracy = 100.0 * correct / max(1, total)
 
-    return test_loss, val_accuracy
+    if verbose:
+        print(f'====> Test loss: {test_loss:.8f}')
+        if not vae:
+            print(f'====> Test Accuracy {val_accuracy:.4f}')
+    if not return_preds:
+        return test_loss, val_accuracy
+
+    # concatenate predictions and labels
+    y_pred = torch.cat(all_preds, 0) if all_preds else torch.tensor([])
+    y_true = torch.cat(all_labels, 0) if all_labels else torch.tensor([])
+
+    # Return predictions as tensors (CPU). Convert to numpy if you prefer.
+    return test_loss, val_accuracy, y_pred, y_true
 
 
 

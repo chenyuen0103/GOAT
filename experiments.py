@@ -127,18 +127,35 @@ def init_tensorboard(log_dir='logs/tensorboard'):
     writer = SummaryWriter(log_dir=log_dir)
     return writer
 
-def get_source_model(args, trainset, testset, n_class, mode, encoder=None, epochs=50, verbose=True, model_path="cache{args.ssl_weight}/source_model.pth", target_dataset = None, ssl_weight = 0.5, force_recompute=False):
-
+def get_source_model(args, trainset, testset, n_class, mode, encoder=None, epochs=50, verbose=True, model_path="cache{args.ssl_weight}/source_model.pth", target_dataset=None, ssl_weight=0.5, force_recompute=False):
+    """Load or train a source model. Robustly handles checkpoints saved as either:
+    - raw state_dict, or
+    - a dict containing {"state_dict": ..., "meta": ...}.
+    """
     model = Classifier(encoder, MLP(mode=mode, n_class=n_class, hidden=1024)).to(device)
     if os.path.exists(model_path) and not force_recompute:
         print(f"✅ Loading cached trained model from {model_path}")
-        model.load_state_dict(torch.load(model_path))
-        return model
+        try:
+            ckpt = torch.load(model_path, map_location=device)
+            state = ckpt.get("state_dict", ckpt)
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            if verbose:
+                if missing:
+                    print(f"[Load] missing keys: {missing}")
+                if unexpected:
+                    print(f"[Load] unexpected keys: {unexpected}")
+            return model
+        except Exception as e:
+            print(f"[Load] Failed to load checkpoint: {e}. Re-training...")
 
-    model = get_source_model_old(args, trainset, testset, n_class, mode, encoder, epochs=epochs, augment_fn=augment,target_dataset=target_dataset, ssl_weight=args.ssl_weight, verbose=verbose)
+    model = get_source_model_old(
+        args, trainset, testset, n_class, mode, encoder,
+        epochs=epochs, augment_fn=augment, target_dataset=target_dataset,
+        ssl_weight=args.ssl_weight, verbose=verbose
+    )
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
-    torch.save(model.state_dict(), model_path)  # ✅ Save model for future runs
-    
+    # Save with meta for forward-compatibility
+    torch.save({"state_dict": model.state_dict(), "meta": {"arch": type(model).__name__}}, model_path)
     return model
 
 
@@ -574,8 +591,14 @@ def run_goat(model_copy, source_model, src_trainset, tgt_trainset, all_sets, deg
     print("------------Self-train on pooled domains----------")
     direct_acc_all, st_acc_all = self_train(args, source_model, all_sets, epochs=epochs)
     cache_dir = f"cache{args.ssl_weight}/target{target}/"
-    # encode the source and target domains
-    e_src_trainset, e_tgt_trainset = get_encoded_dataset(src_trainset, cache_path=os.path.join(cache_dir, "encoded_0.pt"), encoder =source_model.encoder,  force_recompute=False), get_encoded_dataset(tgt_trainset, cache_path=os.path.join(cache_dir, f"encoded_{target}.pt"), encoder = source_model.encoder, force_recompute=False)
+    # encode the source and target domains with compressor if available
+    feat_encoder = nn.Sequential(
+        source_model.encoder,
+        nn.Flatten(start_dim=1),
+        getattr(source_model, 'compressor', nn.Identity())
+    )
+    e_src_trainset = get_encoded_dataset(src_trainset, cache_path=os.path.join(cache_dir, "encoded_0.pt"), encoder=feat_encoder, force_recompute=False)
+    e_tgt_trainset = get_encoded_dataset(tgt_trainset, cache_path=os.path.join(cache_dir, f"encoded_{target}.pt"), encoder=feat_encoder, force_recompute=False)
     pca_model = plot_encoded_domains(e_src_trainset, e_src_trainset, e_tgt_trainset, method = 'goat')
 
     # encode the intermediate ground-truth domains
@@ -583,7 +606,7 @@ def run_goat(model_copy, source_model, src_trainset, tgt_trainset, all_sets, deg
     encoded_intersets = [e_src_trainset]
     for i, interset in enumerate(intersets):
         cache_path = os.path.join(cache_dir, f"encoded_{deg_idx[i]}.pt")
-        encoded_intersets.append(get_encoded_dataset(interset, cache_path=cache_path, encoder =source_model.encoder, force_recompute=False))
+        encoded_intersets.append(get_encoded_dataset(interset, cache_path=cache_path, encoder=feat_encoder, force_recompute=False))
     encoded_intersets.append(e_tgt_trainset)
 
     # generate intermediate domains
@@ -745,7 +768,13 @@ def run_main_algo(model_copy, source_model, src_trainset, tgt_trainset, all_sets
     cache_dir = f"cache{args.ssl_weight}/target{target}/"
     plot_dir = f"plots/target{target}/"
     os.makedirs(cache_dir, exist_ok=True)
-    e_src_trainset, e_tgt_trainset = get_encoded_dataset(src_trainset, cache_path=os.path.join(cache_dir, "encoded_0.pt"), encoder = source_model.encoder),get_encoded_dataset(tgt_trainset, cache_path=os.path.join(cache_dir, f"encoded_{target}.pt"),encoder =source_model.encoder)
+    feat_encoder = nn.Sequential(
+        source_model.encoder,
+        nn.Flatten(start_dim=1),
+        getattr(source_model, 'compressor', nn.Identity())
+    )
+    e_src_trainset = get_encoded_dataset(src_trainset, cache_path=os.path.join(cache_dir, "encoded_0.pt"), encoder=feat_encoder)
+    e_tgt_trainset = get_encoded_dataset(tgt_trainset, cache_path=os.path.join(cache_dir, f"encoded_{target}.pt"), encoder=feat_encoder)
     pca_model = plot_encoded_domains(e_src_trainset, e_src_trainset, e_tgt_trainset, method = 'main_algo')
     # Encode the intermediate ground-truth domains
     intersets = all_sets[:-1]
@@ -753,7 +782,7 @@ def run_main_algo(model_copy, source_model, src_trainset, tgt_trainset, all_sets
     # breakpoint()
     for i, interset in enumerate(intersets):
         cache_path = os.path.join(cache_dir, f"encoded_{deg_idx[i]}.pt")
-        encoded_intersets.append(get_encoded_dataset( interset, cache_path=cache_path, encoder =source_model.encoder, force_recompute=False))
+        encoded_intersets.append(get_encoded_dataset(interset, cache_path=cache_path, encoder=feat_encoder, force_recompute=False))
     encoded_intersets.append(e_tgt_trainset)
 
     # breakpoint()
@@ -1121,9 +1150,18 @@ def run_portraits_experiment(gt_domains, generated_domains):
 
     all_sets = get_domains(gt_domains)
     all_sets.append(tgt_trainset)
-    
-    direct_acc, st_acc, direct_acc_all, st_acc_all, generated_acc = run_goat(model_copy_goat, source_model_goat, src_trainset, tgt_trainset, all_sets, 0,generated_domains, epochs=5)
-    direct_acc, st_acc, direct_acc_all, st_acc_all, generated_acc = run_main_algo(model_copy_main, source_model_main, src_trainset, tgt_trainset, all_sets, generated_domains, epochs=5)
+
+    # Portraits has no degree; use sequential domain IDs for caching/plots
+    deg_idx = list(range(len(all_sets) - 1))
+
+    direct_acc, st_acc, direct_acc_all, st_acc_all, generated_acc = run_goat(
+        model_copy_goat, source_model_goat, src_trainset, tgt_trainset, all_sets, deg_idx,
+        generated_domains, epochs=5
+    )
+    direct_acc, st_acc, direct_acc_all, st_acc_all, generated_acc = run_main_algo(
+        model_copy_main, source_model_main, src_trainset, tgt_trainset, all_sets, deg_idx,
+        generated_domains, epochs=5
+    )
 
     elapsed = round(time.time() - t, 2)
     os.makedirs("logs", exist_ok=True)

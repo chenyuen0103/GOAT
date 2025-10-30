@@ -11,6 +11,7 @@ device = "cuda:0" if torch.cuda.is_available() else "cpu"
 import ot  # pip install POT
 import numpy as np
 import torch
+from typing import Tuple
 
 
 def gaussian_e_geodesic(mu_s: np.ndarray, Sigma_s: np.ndarray,

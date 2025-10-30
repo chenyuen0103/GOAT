@@ -26,3 +26,8 @@ plots/
 *.pth
 
 .vscode/*
+
+*.csv
+
+*.data
+plots_old/

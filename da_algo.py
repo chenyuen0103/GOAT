@@ -333,56 +333,477 @@ def self_train_label(args, source_model, datasets, epochs=10):
 #     return direct_acc, st_acc
 
 
-def self_train(
-    args,
+# def self_train(args,
+#     source_model,
+#     datasets,
+#     epochs: int = 10,
+#     label_source: str = "pseudo",
+#     use_labels: bool = False,
+#     *,
+#     return_stats: bool = False,
+#     cov_type: str = "diag",   # "diag" | "full"
+#     reg: float = 1e-6,
+#     ddof: int = 0,
+# ):
+#     """Self-training that holds out the last dataset for evaluation.
+
+#     Args:
+#         args: Train/eval args with `batch_size`, `num_workers`, `lr`.
+#         source_model: Teacher model to copy the student from.
+#         datasets: List of datasets; last one is the target domain.
+#         epochs: Number of train epochs per domain.
+#         label_source: "pseudo_label" to use `get_pseudo_labels`, or
+#                       "em_label" to use dataset-provided `targets_em`.
+#         use_labels: Optional filtering when `label_source == "pseudo_label"`.
+#                     If the dataset has `.targets`, keep only matching pseudo-labels.
+#     """
+#     if label_source not in {"pseudo", "em", "soft_em"}:
+#         raise ValueError("label_source must be one of {'pseudo','em','soft_em'}")
+#     # steps = max(len(datasets) - 1, 0)
+#     steps = len(datasets)
+#     teacher = copy.deepcopy(source_model).to(device)
+#     targetset = datasets[-1]
+
+#     targetloader = DataLoader(targetset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+#     print("------------Direct adapt performance----------")
+#     direct_loss, direct_acc = test(targetloader, teacher)
+#     train_acc_by_domain = []  # include direct adapt as "0th" domain
+#     test_acc_by_domain = [direct_acc]
+#     # === optional stats containers ===
+#     if return_stats:
+#         def _to_np(x):
+#             return x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
+
+#         # Natural-parameter helpers
+#         def _eta_diag_from_mu_var_np(mu_kd: np.ndarray, var_kd: np.ndarray, eps: float = 1e-12):
+#             var = np.clip(var_kd, eps, None)
+#             prec = 1.0 / var
+#             eta1 = prec * mu_kd
+#             eta2d = -0.5 * prec
+#             return eta1, eta2d
+
+#         def _eta_full_from_Sigma_np(mu_kd: np.ndarray, Sig_kdd: np.ndarray, eps: float = 1e-12):
+#             K, d = mu_kd.shape
+#             e1  = np.full((K, d), np.nan, dtype=np.float64)
+#             e2d = np.full((K, d), np.nan, dtype=np.float64)
+#             for k in range(K):
+#                 S = Sig_kdd[k]
+#                 if not np.isfinite(S).all():
+#                     continue
+#                 S = 0.5 * (S + S.T)
+#                 w, V = np.linalg.eigh(S)
+#                 w = np.clip(w, eps, None)
+#                 Lam = (V * (1.0 / w)) @ V.T
+#                 e1[k]  = Lam @ mu_kd[k]
+#                 e2d[k] = -0.5 * np.diag(Lam)
+#             return e1, e2d
+
+#         steps_list, mu_list, var_list, counts_list, pi_list = [], [], [], [], []
+#         Sigma_list = [] if cov_type == "full" else None
+#         eta1_list, eta2d_list = [], []
+
+#         # helper to append one domain's stats (+ natural params)
+#         def _append_stats_from_dataset(D, hard_labels: torch.Tensor):
+#             X = D.tensors[0] if isinstance(D, TensorDataset) else (
+#                 D.data if torch.is_tensor(D.data) else torch.as_tensor(D.data)
+#             )
+#             X = X.detach().cpu()
+#             y = hard_labels.detach().cpu().long()
+#             K_here = int(y.max().item()) + 1 if y.numel() > 0 else 0
+#             if K_here <= 0:
+#                 return
+
+#             if cov_type == "diag":
+#                 mu_kd, var_kd, cnt_k = class_stats_diag(X, y, K_here)
+#                 mu_np  = _to_np(mu_kd)
+#                 var_np = _to_np(var_kd)
+#                 mu_list.append(mu_np)
+#                 var_list.append(var_np)
+#                 counts_np = _to_np(cnt_k).astype(np.int64)
+#                 counts_list.append(counts_np)
+#                 # natural params
+#                 e1, e2d = _eta_diag_from_mu_var_np(mu_np, var_np)
+#                 eta1_list.append(e1)
+#                 eta2d_list.append(e2d)
+
+#             else:  # full
+#                 mu_kd, Sig_kdd, cnt_k = class_stats_full(X, y, K_here, reg=reg, ddof=ddof)
+#                 mu_np   = _to_np(mu_kd)
+#                 Sig_np  = _to_np(Sig_kdd)
+#                 var_np  = _to_np(torch.stack([torch.diag(Sig_kdd[k]) for k in range(K_here)], dim=0))
+#                 mu_list.append(mu_np)
+#                 var_list.append(var_np)
+#                 Sigma_list.append(Sig_np)
+                
+#                 counts_np = _to_np(cnt_k).astype(np.int64)
+#                 counts_list.append(counts_np)
+#                 # natural params
+#                 e1, e2d = _eta_full_from_Sigma_np(mu_np, Sig_np)
+#                 eta1_list.append(e1)
+#                 eta2d_list.append(e2d)
+#             breakpoint()
+#             total = float(counts_np.sum())
+#             pi_list.append(counts_np.astype(np.float64) / max(1.0, total))
+
+#     for i in range(steps):
+#         # breakpoint()
+#         t_step = float(i+1) / max(steps, 1)
+#         print(f"--------Training on the {i}th domain--------")
+#         trainset = datasets[i]
+#         # Choose label source per request
+#         if label_source == "em":
+#             labels_attr = getattr(trainset, "targets_em", None)
+#             if labels_attr is None and isinstance(trainset, TensorDataset) and len(trainset.tensors) > 1:
+#                 labels_attr = trainset.tensors[1]
+#             if labels_attr is None:
+#                 print(f"[self_train] Skipping domain {i}: no targets_em available for em_label training.")
+#                 train_acc_by_domain.append(None)
+#                 test_acc_by_domain.append(None)
+#                 continue
+
+#             labels_tensor = torch.as_tensor(labels_attr, dtype=torch.long).cpu()
+#             idx_tensor = torch.arange(labels_tensor.size(0), dtype=torch.long)
+#         elif label_source == "soft_em":
+#             soft_attr = getattr(trainset, "soft_targets_em", None)
+#             if soft_attr is not None:
+#                 labels_tensor = torch.as_tensor(soft_attr, dtype=torch.float32).cpu()
+#                 idx_tensor = torch.arange(labels_tensor.size(0), dtype=torch.long)
+#             else:
+#                 hard_attr = getattr(trainset, "targets_em", None)
+#                 if hard_attr is None and isinstance(trainset, TensorDataset) and len(trainset.tensors) > 1:
+#                     hard_attr = trainset.tensors[1]
+#                 if hard_attr is None:
+#                     print(f"[self_train] Skipping domain {i}: no (soft) targets_em available for soft_em training.")
+#                     train_acc_by_domain.append(None)
+#                     test_acc_by_domain.append(None)
+#                     continue
+#                 hard_tensor = torch.as_tensor(hard_attr, dtype=torch.long).cpu()
+#                 K_soft = int(hard_tensor.max().item()) + 1 if hard_tensor.numel() > 0 else 0
+#                 if K_soft <= 0:
+#                     print(f"[self_train] Skipping domain {i}: invalid targets_em for soft_em.")
+#                     train_acc_by_domain.append(None)
+#                     test_acc_by_domain.append(None)
+#                     continue
+#                 labels_tensor = F.one_hot(hard_tensor, num_classes=K_soft).to(torch.float32)
+#                 idx_tensor = torch.arange(labels_tensor.size(0), dtype=torch.long)
+#         else:  # label_source == "pseudo_label"
+#             ogloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+#             pseudo_labels, pseudo_indices = get_pseudo_labels(ogloader, teacher)
+#             if len(pseudo_indices) == 0:
+#                 print("[self_train] Skipping domain: no high-confidence pseudo-labels.")
+#                 train_acc_by_domain.append(None)
+#                 test_acc_by_domain.append(None)
+#                 continue
+#             train_idx = np.asarray(pseudo_indices, dtype=int)
+#             labels_tensor = pseudo_labels.cpu()[train_idx].long()
+#             idx_tensor = torch.from_numpy(train_idx).long()
+#             # Optional filtering if true labels exist
+#             if use_labels and hasattr(trainset, "targets"):
+#                 targets_np = np.asarray(trainset.targets)
+#                 mask = targets_np[idx_tensor.numpy()] == labels_tensor.numpy()
+#                 idx_tensor = idx_tensor[mask]
+#                 labels_tensor = labels_tensor[mask]
+#                 if idx_tensor.numel() == 0:
+#                     print("[self_train] Skipping domain after label filtering (use_labels).")
+#                     train_acc_by_domain.append(None)
+#                     test_acc_by_domain.append(None)
+#                     continue
+            
+#         if isinstance(trainset, TensorDataset):
+#             data_tensor = trainset.tensors[0]
+#             if label_source == "soft_em" and labels_tensor.dim() == 2:
+#                 pseudo_dataset = TensorDataset(
+#                     data_tensor.index_select(0, idx_tensor).float(),
+#                     labels_tensor.index_select(0, idx_tensor).clone(),
+#                 )
+#             else:
+#                 pseudo_dataset = TensorDataset(
+#                     data_tensor.index_select(0, idx_tensor).float(),
+#                     labels_tensor.clone(),
+#                 )
+#         else:
+#             data_attr = getattr(trainset, "data", None)
+#             if data_attr is None:
+#                 raise TypeError("trainset must expose .data or be a TensorDataset when features are fixed.")
+
+#             transform = getattr(trainset, "transform", None)
+#             idx_numpy = idx_tensor.cpu().numpy()
+
+#             if torch.is_tensor(data_attr):
+#                 data_tensor = data_attr.detach().cpu()
+#                 if transform is None:
+#                     selected = data_tensor.index_select(0, idx_tensor)
+#                     if label_source == "soft_em" and labels_tensor.dim() == 2:
+#                         pseudo_dataset = EncodeDataset(
+#                             selected,
+#                             labels_tensor.index_select(0, idx_tensor).clone(),
+#                             None,
+#                         )
+#                     else:
+#                         pseudo_dataset = EncodeDataset(
+#                             selected,
+#                             labels_tensor.clone(),
+#                             None,
+#                         )
+#                 else:
+#                     selected = data_tensor.numpy()[idx_numpy]
+#                     if label_source == "soft_em" and labels_tensor.dim() == 2:
+#                         pseudo_dataset = EncodeDataset(
+#                             selected,
+#                             labels_tensor.index_select(0, idx_tensor).clone(),
+#                             transform,
+#                         )
+#                     else:
+#                         pseudo_dataset = EncodeDataset(
+#                             selected,
+#                             labels_tensor.clone(),
+#                             transform,
+#                         )
+#             else:
+#                 data_np = np.asarray(data_attr)
+#                 selected = data_np[idx_numpy]
+#                 if label_source == "soft_em" and labels_tensor.dim() == 2:
+#                     pseudo_dataset = EncodeDataset(
+#                         selected,
+#                         labels_tensor.index_select(0, idx_tensor).clone(),
+#                         transform,
+#                     )
+#                 else:
+#                     pseudo_dataset = EncodeDataset(
+#                         selected,
+#                         labels_tensor.clone(),
+#                         transform,
+#                     )
+#         if return_stats:
+#             if label_source == "soft_em" and pseudo_dataset.tensors[1].dim() == 2:
+#                 hard_for_stats = pseudo_dataset.tensors[1].argmax(dim=1)
+#             else:
+#                 hard_for_stats = (pseudo_dataset.tensors[1]
+#                                   if isinstance(pseudo_dataset, TensorDataset)
+#                                   else torch.as_tensor(pseudo_dataset.targets)).long()
+#             steps_list.append(t_step)
+#             _append_stats_from_dataset(pseudo_dataset, hard_for_stats)
+
+#         trainloader = DataLoader(pseudo_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
+
+#         # initialize and train student model
+#         student = copy.deepcopy(teacher).to(device)
+#         optimizer = optim.Adam(student.parameters(), lr=args.lr, weight_decay=1e-4)
+
+#         for j in range(1, epochs+1):
+#             train(j, trainloader, student, optimizer)
+#             if j % 5 == 0:
+#                  test(targetloader, student)
+#         print(f"------------Performance on the {i}/{steps}th domain----------")
+#         # test(trainloader, student)
+#         _, train_acc = test(trainloader, student)
+#         train_acc_by_domain.append(train_acc)
+
+#         # test on the target domain
+#         print(f"------------Performance on the target domain after training on {i}/{steps}th domain----------")
+#         st_loss, st_acc = test(targetloader, student)
+#         test_acc_by_domain.append(st_acc)
+#         teacher = copy.deepcopy(student)
+
+#     # ----- final domain stats for the held-out target (optional) -----
+#     if return_stats:
+#         # if label_source == "em":
+#         #     tgt_labels = getattr(targetset, "targets_em", None)
+#         #     if tgt_labels is None:
+#         #         ogloader_t = DataLoader(targetset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+#         #         pseudo_labels_t, _ = get_pseudo_labels(ogloader_t, teacher)
+#         #         tgt_labels = pseudo_labels_t.cpu()
+#         #     hard_tgt = torch.as_tensor(tgt_labels).long()
+#         # elif label_source == "soft_em" and getattr(targetset, "soft_targets_em", None) is not None:
+#         #     hard_tgt = torch.as_tensor(targetset.soft_targets_em).argmax(dim=1).long()
+#         # else:
+#         #     ogloader_t = DataLoader(targetset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+#         #     pseudo_labels_t, _ = get_pseudo_labels(ogloader_t, teacher)
+#         #     hard_tgt = pseudo_labels_t.cpu().long()
+
+#         # if isinstance(targetset, TensorDataset):
+#         #     D_t = TensorDataset(targetset.tensors[0].detach().cpu(), hard_tgt)
+#         # else:
+#         #     X_t = targetset.data if torch.is_tensor(targetset.data) else torch.as_tensor(targetset.data)
+#         #     D_t = TensorDataset(X_t.detach().cpu(), hard_tgt)
+
+#         # steps_list.append(1.0)
+#         # _append_stats_from_dataset(D_t, hard_tgt)
+
+#         # Build domain_params, adding natural params
+#         domain_params = {
+#             "K": int(mu_list[-1].shape[0]) if len(mu_list) > 0 else 0,
+#             "d": int(mu_list[-1].shape[1]) if len(mu_list) > 0 else 0,
+#             "cov_type": cov_type,
+#             "steps":  np.asarray(steps_list, dtype=np.float64),
+#             "mu":     np.asarray(mu_list,  dtype=np.float64),        # (S,K,d)
+#             "var":    np.asarray(var_list, dtype=np.float64),        # (S,K,d)
+#             "counts": np.asarray(counts_list, dtype=np.int64),       # (S,K)
+#             "pi":     np.asarray([c / max(1, int(c.sum())) for c in counts_list], dtype=np.float64),
+#             "present_source": (counts_list[0]  > 0) if counts_list else np.array([], dtype=bool),
+#             "present_target": (counts_list[-1] > 0) if counts_list else np.array([], dtype=bool),
+#             # NEW:
+#             "eta1":      np.asarray(eta1_list,  dtype=np.float64),   # (S,K,d)
+#             "eta2_diag": np.asarray(eta2d_list, dtype=np.float64),   # (S,K,d)
+#         }
+#         if cov_type == "full":
+#             domain_params["Sigma"] = np.asarray(Sigma_list, dtype=np.float64)  # (S,K,d,d)
+#         # breakpoint() 
+#         return direct_acc, st_acc, train_acc_by_domain, test_acc_by_domain, domain_params
+#     return direct_acc, st_acc, train_acc_by_domain, test_acc_by_domain
+
+
+def self_train(args,
     source_model,
     datasets,
     epochs: int = 10,
     label_source: str = "pseudo",
     use_labels: bool = False,
+    *,
+    return_stats: bool = False,
+    cov_type: str = "diag",   # "diag" | "full"
+    reg: float = 1e-6,
+    ddof: int = 0,
 ):
-    """Self-training that holds out the last dataset for evaluation.
-
-    Args:
-        args: Train/eval args with `batch_size`, `num_workers`, `lr`.
-        source_model: Teacher model to copy the student from.
-        datasets: List of datasets; last one is the target domain.
-        epochs: Number of train epochs per domain.
-        label_source: "pseudo_label" to use `get_pseudo_labels`, or
-                      "em_label" to use dataset-provided `targets_em`.
-        use_labels: Optional filtering when `label_source == "pseudo_label"`.
-                    If the dataset has `.targets`, keep only matching pseudo-labels.
-    """
     if label_source not in {"pseudo", "em", "soft_em"}:
         raise ValueError("label_source must be one of {'pseudo','em','soft_em'}")
-    # steps = max(len(datasets) - 1, 0)
+
     steps = len(datasets)
     teacher = copy.deepcopy(source_model).to(device)
     targetset = datasets[-1]
 
     targetloader = DataLoader(targetset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     print("------------Direct adapt performance----------")
-    direct_loss, direct_acc = test(targetloader, teacher)
-    train_acc_by_domain = []  # include direct adapt as "0th" domain
+    _, direct_acc = test(targetloader, teacher)
+    train_acc_by_domain = []
     test_acc_by_domain = [direct_acc]
-    # test_acc_by_domain = []
-    # start self-training on training domains
+
+    # ===== optional stats containers =====
+    if return_stats:
+        def _to_np(x):
+            return x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
+
+        # Natural-parameter helpers
+        def _eta_diag_from_mu_var_np(mu_kd: np.ndarray, var_kd: np.ndarray, eps: float = 1e-12):
+            var = np.clip(var_kd, eps, None)
+            prec = 1.0 / var
+            eta1 = prec * mu_kd
+            eta2d = -0.5 * prec
+            return eta1, eta2d
+
+        def _eta_full_from_Sigma_np(mu_kd: np.ndarray, Sig_kdd: np.ndarray, eps: float = 1e-12):
+            K, d = mu_kd.shape
+            e1  = np.full((K, d), np.nan, dtype=np.float64)
+            e2d = np.full((K, d), np.nan, dtype=np.float64)
+            for k in range(K):
+                S = Sig_kdd[k]
+                if not np.isfinite(S).all():
+                    continue
+                S = 0.5 * (S + S.T)
+                w, V = np.linalg.eigh(S)
+                w = np.clip(w, eps, None)
+                Lam = (V * (1.0 / w)) @ V.T
+                e1[k]  = Lam @ mu_kd[k]
+                e2d[k] = -0.5 * np.diag(Lam)
+            return e1, e2d
+
+        steps_list, mu_list, var_list, counts_list, pi_list = [], [], [], [], []
+        Sigma_list = [] if cov_type == "full" else None
+        eta1_list, eta2d_list = [], []
+
+        # Determine a global number of classes K that stays fixed across steps
+        K_global = None
+        try:
+            if hasattr(targetset, "targets_em") and targetset.targets_em is not None:
+                t_em = torch.as_tensor(targetset.targets_em)
+                if t_em.numel() > 0:
+                    K_global = int(t_em.max().item()) + 1
+            if K_global is None and hasattr(targetset, "targets") and targetset.targets is not None:
+                t_gt = torch.as_tensor(targetset.targets)
+                if t_gt.numel() > 0:
+                    K_global = int(t_gt.max().item()) + 1
+        except Exception:
+            K_global = None
+
+        def _append_stats_from_dataset(D, hard_labels: torch.Tensor, t_step: float):
+            """
+            Append stats for the dataset actually used for training at this step.
+            Labels are made contiguous (0..K-1); counts and pi are computed directly.
+            """
+            # X
+            X = (D.tensors[0] if isinstance(D, TensorDataset)
+                 else (D.data if torch.is_tensor(getattr(D, "data", None))
+                       else torch.as_tensor(getattr(D, "data"))))
+            X = X.detach().cpu()
+
+            # Hard labels (already filtered to what you trained on)
+            y = hard_labels.detach().cpu().long()
+            if y.numel() == 0:
+                return
+
+            # Use a fixed global K across steps to keep shapes stackable
+            if K_global is not None:
+                K_use = K_global
+            else:
+                K_use = int(y.max().item()) + 1
+
+            # Counts and priors directly from labels you trained on, padded to K_use
+            counts_np = np.bincount(y.numpy(), minlength=K_use).astype(np.int64)
+            pi_np = counts_np.astype(np.float64) / max(1.0, float(counts_np.sum()))
+
+            # Class stats (means/vars/cov) with normalized labels
+            if cov_type == "diag":
+                mu_kd, var_kd, _priors = class_stats_diag(X, y, K_use)
+                mu_np  = _to_np(mu_kd)
+                var_np = _to_np(var_kd)
+
+                mu_list.append(mu_np)
+                var_list.append(var_np)
+                counts_list.append(counts_np)
+                pi_list.append(pi_np)
+
+                # natural params
+                e1, e2d = _eta_diag_from_mu_var_np(mu_np, var_np)
+                eta1_list.append(e1)
+                eta2d_list.append(e2d)
+
+            else:  # full
+                mu_kd, Sig_kdd, _priors = class_stats_full(X, y, K_use, reg=reg, ddof=ddof)
+                mu_np  = _to_np(mu_kd)
+                Sig_np = _to_np(Sig_kdd)
+                var_np = np.stack([np.diag(Sig_np[k]) for k in range(K_use)], axis=0)
+
+                mu_list.append(mu_np)
+                var_list.append(var_np)
+                Sigma_list.append(Sig_np)
+                counts_list.append(counts_np)
+                pi_list.append(pi_np)
+
+                # natural params from full Σ
+                e1, e2d = _eta_full_from_Sigma_np(mu_np, Sig_np)
+                eta1_list.append(e1)
+                eta2d_list.append(e2d)
+
+            steps_list.append(float(t_step))
+
+    # ===== training loop =====
     for i in range(steps):
+        t_step = float(i + 1) / max(steps, 1)  # normalized position of this training domain in the provided list
         print(f"--------Training on the {i}th domain--------")
         trainset = datasets[i]
-        # Choose label source per request
+        test(targetloader, teacher)
+        # ---- choose label source ----
         if label_source == "em":
             labels_attr = getattr(trainset, "targets_em", None)
             if labels_attr is None and isinstance(trainset, TensorDataset) and len(trainset.tensors) > 1:
                 labels_attr = trainset.tensors[1]
             if labels_attr is None:
                 print(f"[self_train] Skipping domain {i}: no targets_em available for em_label training.")
-                train_acc_by_domain.append(None)
-                test_acc_by_domain.append(None)
+                train_acc_by_domain.append(None); test_acc_by_domain.append(None)
                 continue
-
             labels_tensor = torch.as_tensor(labels_attr, dtype=torch.long).cpu()
             idx_tensor = torch.arange(labels_tensor.size(0), dtype=torch.long)
+
         elif label_source == "soft_em":
             soft_attr = getattr(trainset, "soft_targets_em", None)
             if soft_attr is not None:
@@ -394,30 +815,30 @@ def self_train(
                     hard_attr = trainset.tensors[1]
                 if hard_attr is None:
                     print(f"[self_train] Skipping domain {i}: no (soft) targets_em available for soft_em training.")
-                    train_acc_by_domain.append(None)
-                    test_acc_by_domain.append(None)
+                    train_acc_by_domain.append(None); test_acc_by_domain.append(None)
                     continue
                 hard_tensor = torch.as_tensor(hard_attr, dtype=torch.long).cpu()
                 K_soft = int(hard_tensor.max().item()) + 1 if hard_tensor.numel() > 0 else 0
                 if K_soft <= 0:
                     print(f"[self_train] Skipping domain {i}: invalid targets_em for soft_em.")
-                    train_acc_by_domain.append(None)
-                    test_acc_by_domain.append(None)
+                    train_acc_by_domain.append(None); test_acc_by_domain.append(None)
                     continue
                 labels_tensor = F.one_hot(hard_tensor, num_classes=K_soft).to(torch.float32)
                 idx_tensor = torch.arange(labels_tensor.size(0), dtype=torch.long)
-        else:  # label_source == "pseudo_label"
+        else:  # 'pseudo'
             ogloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-            pseudo_labels, pseudo_indices = get_pseudo_labels(ogloader, teacher)
+            pseudo_labels, pseudo_indices = get_pseudo_labels(ogloader, teacher, confidence_q=1)
+            # breakpoint()
+            if i < steps - 1:
+                datasets[i].targets = pseudo_labels.cpu().numpy()
             if len(pseudo_indices) == 0:
                 print("[self_train] Skipping domain: no high-confidence pseudo-labels.")
-                train_acc_by_domain.append(None)
-                test_acc_by_domain.append(None)
+                train_acc_by_domain.append(None); test_acc_by_domain.append(None)
                 continue
             train_idx = np.asarray(pseudo_indices, dtype=int)
             labels_tensor = pseudo_labels.cpu()[train_idx].long()
             idx_tensor = torch.from_numpy(train_idx).long()
-            # Optional filtering if true labels exist
+
             if use_labels and hasattr(trainset, "targets"):
                 targets_np = np.asarray(trainset.targets)
                 mask = targets_np[idx_tensor.numpy()] == labels_tensor.numpy()
@@ -425,10 +846,10 @@ def self_train(
                 labels_tensor = labels_tensor[mask]
                 if idx_tensor.numel() == 0:
                     print("[self_train] Skipping domain after label filtering (use_labels).")
-                    train_acc_by_domain.append(None)
-                    test_acc_by_domain.append(None)
+                    train_acc_by_domain.append(None); test_acc_by_domain.append(None)
                     continue
-            
+
+        # ---- build the training dataset for this domain ----
         if isinstance(trainset, TensorDataset):
             data_tensor = trainset.tensors[0]
             if label_source == "soft_em" and labels_tensor.dim() == 2:
@@ -445,7 +866,6 @@ def self_train(
             data_attr = getattr(trainset, "data", None)
             if data_attr is None:
                 raise TypeError("trainset must expose .data or be a TensorDataset when features are fixed.")
-
             transform = getattr(trainset, "transform", None)
             idx_numpy = idx_tensor.cpu().numpy()
 
@@ -454,71 +874,77 @@ def self_train(
                 if transform is None:
                     selected = data_tensor.index_select(0, idx_tensor)
                     if label_source == "soft_em" and labels_tensor.dim() == 2:
-                        pseudo_dataset = EncodeDataset(
-                            selected,
-                            labels_tensor.index_select(0, idx_tensor).clone(),
-                            None,
-                        )
+                        pseudo_dataset = EncodeDataset(selected, labels_tensor.index_select(0, idx_tensor).clone(), None)
                     else:
-                        pseudo_dataset = EncodeDataset(
-                            selected,
-                            labels_tensor.clone(),
-                            None,
-                        )
+                        pseudo_dataset = EncodeDataset(selected, labels_tensor.clone(), None)
                 else:
                     selected = data_tensor.numpy()[idx_numpy]
                     if label_source == "soft_em" and labels_tensor.dim() == 2:
-                        pseudo_dataset = EncodeDataset(
-                            selected,
-                            labels_tensor.index_select(0, idx_tensor).clone(),
-                            transform,
-                        )
+                        pseudo_dataset = EncodeDataset(selected, labels_tensor.index_select(0, idx_tensor).clone(), transform)
                     else:
-                        pseudo_dataset = EncodeDataset(
-                            selected,
-                            labels_tensor.clone(),
-                            transform,
-                        )
+                        pseudo_dataset = EncodeDataset(selected, labels_tensor.clone(), transform)
             else:
                 data_np = np.asarray(data_attr)
                 selected = data_np[idx_numpy]
                 if label_source == "soft_em" and labels_tensor.dim() == 2:
-                    pseudo_dataset = EncodeDataset(
-                        selected,
-                        labels_tensor.index_select(0, idx_tensor).clone(),
-                        transform,
-                    )
+                    pseudo_dataset = EncodeDataset(selected, labels_tensor.index_select(0, idx_tensor).clone(), transform)
                 else:
-                    pseudo_dataset = EncodeDataset(
-                        selected,
-                        labels_tensor.clone(),
-                        transform,
-                    )
+                    pseudo_dataset = EncodeDataset(selected, labels_tensor.clone(), transform)
 
-        trainloader = DataLoader(pseudo_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
+        # ---- stats from the dataset actually used here ----
+        if return_stats:
+            if label_source == "soft_em" and (isinstance(pseudo_dataset, TensorDataset) and pseudo_dataset.tensors[1].dim() == 2):
+                hard_for_stats = pseudo_dataset.tensors[1].argmax(dim=1)
+            else:
+                hard_for_stats = (pseudo_dataset.tensors[1]
+                                  if isinstance(pseudo_dataset, TensorDataset)
+                                  else torch.as_tensor(pseudo_dataset.targets)).long()
+            _append_stats_from_dataset(pseudo_dataset, hard_for_stats, t_step)
 
-        # initialize and train student model
+        # ---- train student ----
+        trainloader = DataLoader(pseudo_dataset, batch_size=args.batch_size, shuffle=True,
+                                 num_workers=args.num_workers, drop_last=True)
         student = copy.deepcopy(teacher).to(device)
         optimizer = optim.Adam(student.parameters(), lr=args.lr, weight_decay=1e-4)
 
         for j in range(1, epochs+1):
             train(j, trainloader, student, optimizer)
             if j % 5 == 0:
-                 test(targetloader, student)
+                test(targetloader, student)
+
         print(f"------------Performance on the {i}/{steps}th domain----------")
-        # test(trainloader, student)
         _, train_acc = test(trainloader, student)
         train_acc_by_domain.append(train_acc)
 
-        # test on the target domain
         print(f"------------Performance on the target domain after training on {i}/{steps}th domain----------")
-        st_loss, st_acc = test(targetloader, student)
+        _, st_acc, y_pred, y_true = test(targetloader, student, return_preds=True)
         test_acc_by_domain.append(st_acc)
         teacher = copy.deepcopy(student)
-    # if steps > 0:
-    #     st_loss, st_acc = test(targetloader, teacher)
+    # last_predictions = pseudo_labels if label_source == "pseudo" else labels_tensor
+    last_predictions = y_pred
+    # if len(datasets) > 1:
+    #     breakpoint()
+    # ===== build domain_params from what we actually appended =====
+    if return_stats:
+        domain_params = {
+            "K": int(mu_list[-1].shape[0]) if len(mu_list) > 0 else 0,
+            "d": int(mu_list[-1].shape[1]) if len(mu_list) > 0 else 0,
+            "cov_type": cov_type,
+            "steps":  np.asarray(steps_list, dtype=np.float64),        # (S,)
+            "mu":     np.asarray(mu_list,  dtype=np.float64),          # (S,K,d)
+            "var":    np.asarray(var_list, dtype=np.float64),          # (S,K,d)
+            "counts": np.asarray(counts_list, dtype=np.int64),         # (S,K)
+            "pi":     np.asarray(pi_list,    dtype=np.float64),        # (S,K) — directly stored
+            "present_source": (np.asarray(counts_list[0])  > 0) if counts_list else np.array([], dtype=bool),
+            "present_target": (np.asarray(counts_list[-1]) > 0) if counts_list else np.array([], dtype=bool),
+            "eta1":      np.asarray(eta1_list,  dtype=np.float64),     # (S,K,d)
+            "eta2_diag": np.asarray(eta2d_list, dtype=np.float64),     # (S,K,d)
+        }
+        if cov_type == "full":
+            domain_params["Sigma"] = np.asarray(Sigma_list, dtype=np.float64)  # (S,K,d,d)
+        return direct_acc, st_acc, train_acc_by_domain, test_acc_by_domain, domain_params, last_predictions
 
-    return direct_acc, st_acc, train_acc_by_domain, test_acc_by_domain
+    return direct_acc, st_acc, train_acc_by_domain, test_acc_by_domain, last_predictions
 
 
 def self_train_og(args, source_model, datasets, epochs=10):
@@ -535,7 +961,7 @@ def self_train_og(args, source_model, datasets, epochs=10):
         print(f"--------Training on the {i}th domain--------")
         trainset = datasets[i]
         ogloader = DataLoader(trainset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-                
+        
         _loss, _acc = test(targetloader, teacher)
         train_labs, train_idx = get_pseudo_labels(ogloader, teacher)
 

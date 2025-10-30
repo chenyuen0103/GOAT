@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-angles=(45 60 90)
-# angles=(15)
-label_sources=(em pseudo)
-em_matches=(pseudo prototypes)
+angles=(60)
+angles=(45 90 30 60)
+label_sources=(pseudo em)
+em_matches=(prototypes pseudo)
 
 for a in "${angles[@]}"; do
   for ls in "${label_sources[@]}"; do
