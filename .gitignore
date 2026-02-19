@@ -31,3 +31,9 @@ plots/
 
 *.data
 plots_old/
+
+
+*.tex
+figures_main/
+.mplconfig/
+*.txt

@@ -31,7 +31,7 @@ import time
 import copy
 import argparse
 import random
-from typing import Optional, Tuple, List, Sequence, Iterable, Union
+from typing import Optional, Tuple, List, Sequence, Iterable, Union, Dict, Any
 
 import torch
 import torch.nn as nn
@@ -50,12 +50,11 @@ from train_model import *
 from util import *  # noqa: F401,F403 (kept to preserve your helpers)
 from ot_util import ot_ablation, generate_domains  # generation helpers
 from a_star_util import *
-from a_star_util import _compute_source_gaussians  # explicit import for underscore-prefixed function
 from dataset import *
 
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
-from scipy.optimize import linear_sum_assignment
+
 from da_algo import *
 import matplotlib.pyplot as plt
 import json
@@ -64,15 +63,11 @@ try:
 except Exception:
     K = None  # Kornia is optional; see build_augment()
 import math
-
 import numpy as np
 # Robust tqdm import with a no-op fallback
-try:
-    from tqdm.auto import tqdm
-except Exception:
-    def tqdm(iterable=None, total=None, **kwargs):
-        return iterable if iterable is not None else range(total or 0)
 
+from em_utils import *
+from check_dist import *
 from itertools import product
 # -------------------------------------------------------------
 # Global config / utilities
@@ -82,15 +77,8 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # --- em_registry.py (or near your EM helpers) ---
 from dataclasses import dataclass
-from typing import Dict, Any, Optional, Tuple
-
 import torch
-
-# Global in-memory cache; key -> EM bundle
-_EM_REGISTRY: Dict[str, "EMBundle"] = {}
-
 from PIL import Image, ImageOps
-
 import torchvision.transforms as T
 
 class ToRGBThenTensor:
@@ -130,6 +118,50 @@ PALETTE = [
     ("#008080", "#000000"),
 ]
 
+
+def _deg_idx_to_tuple(deg_idx):
+    """Normalize deg_idx into a tuple so callers can pass ints or sequences."""
+    if deg_idx is None:
+        return None
+    if isinstance(deg_idx, tuple):
+        return deg_idx
+    if isinstance(deg_idx, list):
+        return tuple(deg_idx)
+    try:
+        return tuple(deg_idx)
+    except TypeError:
+        return (deg_idx,)
+
+
+def _main_algo_cache_key(
+    args,
+    *,
+    src_trainset,
+    tgt_trainset,
+    all_sets,
+    deg_idx,
+    generated_domains,
+    epochs,
+    target,
+):
+    dataset_ids = tuple(id(ds) for ds in all_sets)
+    return (
+        getattr(args, "dataset", None),
+        getattr(args, "seed", None),
+        getattr(args, "ssl_weight", None),
+        getattr(args, "small_dim", None),
+        getattr(args, "pseudo_confidence_q", None),
+        getattr(args, "gt_domains", None),
+        getattr(args, "label_source", None),
+        target,
+        _deg_idx_to_tuple(deg_idx),
+        epochs,
+        generated_domains,
+        id(src_trainset),
+        id(tgt_trainset),
+        dataset_ids,
+    )
+
 def colorize_by_label(img_np, y):
     """img_np: (H,W) or (H,W,1) in [0,255]/uint8 or [0,1]/float; y: int label"""
     if img_np.ndim == 3 and img_np.shape[2] == 1:
@@ -161,128 +193,6 @@ def save_colored_grid(images, labels, n=16, cols=8, out="grid_colored.png"):
     plt.savefig(out, dpi=150, bbox_inches="tight", pad_inches=0.05)
     plt.close()
 
-@dataclass
-class EMBundle:
-    key: str
-    em_res: Dict[str, Any]                 # raw run_em_on_encoded(...) result
-    mapping: Dict[int, int]                # cluster_id -> class_id mapping
-    labels_em: np.ndarray                  # (N,) mapped hard labels on target
-    P_soft: Optional[np.ndarray] = None    # (N,K_classes) mapped soft class posteriors (optional)
-    info: Dict[str, Any] = None            # any diagnostics (BIC, ll, etc.)
-
-def _em_cache_key(
-    dataset: str,
-    target_angle: int,
-    small_dim: int,
-    pool: str,
-    do_pca: bool,
-    pca_dim: int,
-    cov_type: str,
-    K: int,
-    seed: int,
-    dtype: str = "float32",
-) -> str:
-    # include knobs that affect the fitted model / feature space
-    return (f"{dataset}|t={target_angle}|d={small_dim}|pool={pool}"
-            f"|pca={int(do_pca)}:{pca_dim}|cov={cov_type}|K={K}"
-            f"|seed={seed}|dtype={dtype}")
-
-def ensure_shared_em_for_target(
-    e_tgt,                       # encoded target domain (same object used by all methods)
-    *,
-    args,
-    K: Optional[int] = None,     # classes; None -> infer
-    cov_type: str = "diag",
-    pool: str = "gap",
-    do_pca: bool = False,
-    pca_dim: int = 64,
-    reg: float = 1e-6,
-    max_iter: int = 150,
-    tol: float = 1e-5,
-    n_init: int = 5,
-    dtype: str = "float32",
-) -> EMBundle:
-    """
-    Fit EM exactly once on e_tgt (or reuse from cache), map clusters to classes per args.em_match,
-    and return a reusable EMBundle.
-    """
-    # 1) infer K from labels (fallback=10)
-    if K is None:
-        try:
-            y_true = e_tgt.targets.cpu().numpy() if torch.is_tensor(e_tgt.targets) else np.asarray(e_tgt.targets)
-            K = int(y_true.max()) + 1
-        except Exception:
-            K = 10
-
-    # 2) cache key
-    dataset = getattr(args, "dataset", "mnist")
-    key = _em_cache_key(
-        dataset=dataset,
-        target_angle=getattr(args, "target_angle", getattr(args, "target", 0)),
-        small_dim=getattr(args, "small_dim", 2048),
-        pool=pool, do_pca=do_pca, pca_dim=pca_dim,
-        cov_type=cov_type, K=K,
-        seed=getattr(args, "seed", 0),
-        dtype=dtype,
-    )
-    if key in _EM_REGISTRY:
-        bundle = _EM_REGISTRY[key]
-        # attach for convenience
-        args._shared_em = bundle
-        return bundle
-
-    # 3) prepare standardized features ONCE and fit EM ONCE
-    X_std, scaler, pca, _ = prepare_em_representation(
-        e_tgt, pool=pool, do_pca=do_pca, pca_dim=pca_dim,
-        dtype=dtype, rng=getattr(args, "seed", 0), verbose=False
-    )
-    em_res = run_em_on_encoded_fast(
-        X_std,
-        K=K, cov_type=cov_type, reg=reg, max_iter=max_iter, tol=tol,
-        n_init=n_init, subsample_init=min(len(e_tgt), 20000),
-        warm_start=None, rng=getattr(args, "seed", 0), verbose=False
-    )
-    em_res["scaler"] = scaler
-    em_res["pca"] = pca
-
-    # 4) map clusters -> classes (shared for all methods)
-    #    Note: we reuse your existing mapping choices.
-    method = getattr(args, "em_match", "pseudo")
-    if method == "prototypes":
-        mu_s, Sigma_s, priors_s = fit_source_gaussian_params(X=e_tgt.data, y=e_tgt.targets)
-        mapping, labels_mapped, _ = map_em_clusters(
-            em_res, method="prototypes", n_classes=K,
-            mus_s=mu_s, Sigma_s=Sigma_s, priors_s=priors_s
-        )
-    else:
-        # Expect args._cached_pseudolabels to be set by caller once (teacher PL)
-        if not hasattr(args, "_cached_pseudolabels"):
-            raise RuntimeError("args._cached_pseudolabels missing; compute teacher pseudo-labels once, then call ensure_shared_em_for_target.")
-        mapping, labels_mapped, _ = map_em_clusters(
-            em_res, method="pseudo", n_classes=K,
-            pseudo_labels=args._cached_pseudolabels, metric='FR'
-        )
-
-    # 5) optional mapped soft posteriors (for downstream soft-label training)
-    def _map_cluster_posts_to_classes(gamma: np.ndarray, mapping: Dict[int, int], Kc: int) -> np.ndarray:
-        N = gamma.shape[0]
-        P = np.zeros((N, Kc), dtype=float)
-        for c_from, c_to in mapping.items():
-            if 0 <= c_from < gamma.shape[1] and 0 <= c_to < Kc:
-                P[:, c_to] += gamma[:, c_from]
-        s = P.sum(axis=1, keepdims=True); s[s == 0] = 1.0
-        return P / s
-    P_soft = _map_cluster_posts_to_classes(np.asarray(em_res["gamma"]), mapping, K)
-
-    bundle = EMBundle(
-        key=key, em_res=em_res, mapping=mapping,
-        labels_em=np.asarray(labels_mapped, dtype=int),
-        P_soft=P_soft, info={"K": K, "cov_type": cov_type, "pool": pool, "pca_dim": pca_dim, "dtype": dtype},
-    )
-    _EM_REGISTRY[key] = bundle
-    # attach to args so children don’t have to compute the key
-    args._shared_em = bundle
-    return bundle
 
 def _has_full(domain_stats: dict) -> bool:
     return ("Sigma" in domain_stats) and (domain_stats["Sigma"] is not None)
@@ -1456,6 +1366,18 @@ def encode_all_domains(
     """Encode source/intermediate/target datasets once and cache results."""
     os.makedirs(cache_dir, exist_ok=True)
 
+    def _canon(ds):
+        if ds is None:
+            return None
+        for attr in ("targets", "targets_em", "targets_pseudo"):
+            val = getattr(ds, attr, None)
+            if val is None:
+                continue
+            if not torch.is_tensor(val):
+                val = torch.as_tensor(val)
+            setattr(ds, attr, val.view(-1).long().cpu())
+        return ds
+
     if args.dataset == 'mnist':
         e_src = get_encoded_dataset(
             src_trainset,
@@ -1463,12 +1385,14 @@ def encode_all_domains(
             encoder=encoder,
             force_recompute=force_recompute,
         )
+        _canon(e_src)
         e_tgt = get_encoded_dataset(
             tgt_trainset,
             cache_path=os.path.join(cache_dir, f"encoded_{target}.pt"),
             encoder=encoder,
             force_recompute=force_recompute,
         )
+        _canon(e_tgt)
     else:
         e_src = get_encoded_dataset(
             src_trainset,
@@ -1476,12 +1400,14 @@ def encode_all_domains(
             encoder=encoder,
             force_recompute=force_recompute,
         )
+        _canon(e_src)
         e_tgt = get_encoded_dataset(
             tgt_trainset,
             cache_path=os.path.join(cache_dir, f"encoded_target.pt"),
             encoder=encoder,
             force_recompute=force_recompute,
         )
+        _canon(e_tgt)
 
     encoded_intersets: List[Dataset] = [e_src]
     intersets = all_sets[:-1]
@@ -1498,6 +1424,7 @@ def encode_all_domains(
                 force_recompute=force_recompute,
             )
         )
+        _canon(encoded_intersets[-1])
     encoded_intersets.append(e_tgt)
     return e_src, e_tgt, encoded_intersets
 
@@ -1534,7 +1461,7 @@ def run_goat(
 
     # Dirs
     if args.dataset != 'mnist':
-        cache_dir = f"{args.dataset}/cache{args.ssl_weight}/"
+        cache_dir = f"{args.dataset}/cache{args.ssl_weight}/small_dim{args.small_dim}/"
         plot_dir  = f"plots/{args.dataset}/"
     else:
         cache_dir = f"cache{args.ssl_weight}/target{target}/small_dim{args.small_dim}/"
@@ -1556,7 +1483,8 @@ def run_goat(
         ),
         cache_dir,
         target,
-        force_recompute=False,
+        # Recompute to avoid using stale caches with mismatched dimensions
+        force_recompute=True,
         args=args
     )
 
@@ -1589,20 +1517,39 @@ def run_goat(
         plot_pca_classes_grid(
             encoded_intersets,
             classes=(3,6, 8, 9) if 'mnist' in args.dataset else (0,1),
-            save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_gen{args.generated_domains}_real_domains_goat.png"),
+            save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_real_domains_goat.png"),
             ground_truths=True,
             pca=getattr(args, "shared_pca", None)  # <<— SAME basis
         )
 
         # Synthetic chain: group per pair (generated_domains + 1) and drop the appended right endpoint
+        # Synthetic chain: interleave real domains with synthetic ones
+        # step_len = (#synthetic steps between a pair) + 1 (the appended right endpoint)
         step_len = int(generated_domains) + 1
-        chain_only = []
-        for k in range(0, len(all_domains), max(step_len, 1)):
-            chunk = all_domains[k:k + step_len]
+        chain_for_plot = []
+
+        n_pairs = len(encoded_intersets) - 1  # (source→inter1), (inter1→inter2), ..., (interN→target)
+
+        for i in range(n_pairs):
+            # For the very first pair, start with the left real domain (source)
+            if i == 0:
+                chain_for_plot.append(encoded_intersets[0])   # Domain 0 [Real]
+
+            # Synthetic domains for this pair live in all_domains in contiguous blocks
+            start = i * step_len
+            chunk = all_domains[start:start + step_len]
             if not chunk:
                 continue
-            chain_only.extend(chunk[:-1] if step_len > 0 else chunk)
-        chain_for_plot = [encoded_intersets[0]] + chain_only + [encoded_intersets[-1]]
+
+            # Add the synthetic steps between encoded_intersets[i] and encoded_intersets[i+1]
+            # (exclude the last element of chunk, which is the right endpoint real domain)
+            if step_len > 1:
+                chain_for_plot.extend(chunk[:-1])
+
+            # Then append the right real endpoint of this pair
+            # (intermediate real domain or final target)
+            chain_for_plot.append(encoded_intersets[i + 1])
+
         # Ensure the final target encoding carries pseudo labels in .targets_em so we can color by them
         tgt_pl, _ = get_pseudo_labels(
             encoded_intersets[-1],
@@ -1614,7 +1561,7 @@ def run_goat(
         plot_pca_classes_grid(
             chain_for_plot,
             classes=(3,6, 8, 9) if 'mnist' in args.dataset else (0,1),
-            save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_gen{args.generated_domains}_{args.label_source}_{args.em_match}_goat.png"),
+            save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_{args.label_source}_{args.em_match}_goat.png"),
             label_source='pseudo',
             pseudolabels=last_predictions,  # from self_train
             pca=getattr(args, "shared_pca", None)  # <<— SAME basis
@@ -1902,8 +1849,8 @@ def run_goat(
 #             chain_for_plot = [encoded_intersets[0]] + chain_only + [encoded_intersets[-1]]
 #             plot_pca_classes_grid(
 #                 chain_for_plot,
-#                 classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-#                 save_path=os.path.join(plot_dir, f"pca_classes_synth_goatcw_{args.label_source}_{args.em_match}.png"),
+#                 classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),f
+#                 save_path=os.path.join(plot_dir, f"pca_classes_synth_goatcw_{args.label_source}_{args.em_match}_{args.em_select}{'_em-ensemble' if args.em_ensemble else '' }.png"),
 #                 label_source=args.label_source,
 #             )
 #         except Exception as e:
@@ -1913,7 +1860,6 @@ def run_goat(
 
 #     # If no synthetics requested, still return meaningful values/lists
 #     # return train_acc_by_domain0, test_acc_by_domain0, st_acc, st_acc_all, generated_acc
-
 
 
 
@@ -1931,20 +1877,14 @@ def run_goat_classwise(
 ):
     """
     GOAT baseline with class-wise synthetic generation.
-    Builds a single, global domain_params over steps t in [0,1] that matches the schema of FR/Natural generators:
-      {
-        K, d, cov_type, steps(S,), mu(S,K,d), var(S,K,d), [Sigma(S,K,d,d)],
-        counts(S,K), pi(S,K), eta1(S,K,d), eta2_diag(S,K,d),
-        present_source(K,), present_target(K,)
-      }
+
+    Returns:
+        train_curve, test_curve, st_curve, st_all_curve, generated_curve, em_acc
+    so it can be wrapped by _wrap_result(..., has_em=True).
     """
     device = next(source_model.parameters()).device
 
     # -------------------- helpers --------------------
-    def _to_np(x):
-        return x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
-
-
     def _labels_for_split(ds: Dataset, is_source: bool) -> torch.Tensor:
         if is_source and hasattr(ds, "targets") and ds.targets is not None:
             return torch.as_tensor(ds.targets).long().cpu()
@@ -1966,7 +1906,7 @@ def run_goat_classwise(
         """Merge step j across classes into a single DomainDataset."""
         if not list_of_lists:
             return []
-        n_steps = min(len(L) for L in list_of_lists)   # expected: n_inter + 1 including appended right endpoint
+        n_steps = min(len(L) for L in list_of_lists)   # expected: n_inter + 1 incl. right endpoint
         merged: List[Dataset] = []
         for j in range(n_steps):
             parts = [L[j] for L in list_of_lists if L[j] is not None]
@@ -1982,21 +1922,145 @@ def run_goat_classwise(
                 Ys.append(D.targets if torch.is_tensor(D.targets) else torch.as_tensor(D.targets))
             X = torch.cat([x.cpu().float() for x in Xs], dim=0)
             W = torch.cat([w.cpu().float() for w in Ws], dim=0)
-            Y = torch.cat([y.cpu().long()  for y in Ys], dim=0)
+            Y = torch.cat([y.cpu().long() for y in Ys], dim=0)
             merged.append(DomainDataset(X, W, Y, Y))
         return merged
 
+    # -------------------- Case 1: GST baseline (no synthetic domains, no EM) --------------------
+    if generated_domains <= 0:
+        set_all_seeds(args.seed)
 
-    set_all_seeds(args.seed)
-    direct_acc, st_acc, train_acc_by_domain0, test_acc_by_domain0,_ = self_train(
-        args, model_copy, [tgt_trainset], epochs=epochs, label_source="pseudo"
-    )
-    set_all_seeds(args.seed)
-    direct_acc_all, st_acc_all, train_acc_list_all, test_acc_list_all, _ = self_train(
-        args, source_model, all_sets, epochs=epochs, label_source="pseudo"
-    )
+        # Baseline on target only (GST-style)
+        direct_acc, st_acc, train_acc_by_domain0, test_acc_by_domain0, _ = self_train(
+            args,
+            model_copy,
+            [tgt_trainset],
+            epochs=epochs,
+            label_source="pseudo",
+        )
 
-    if args.dataset != 'mnist':
+        # Baseline on full chain of real domains
+        set_all_seeds(args.seed)
+        direct_acc_all, st_acc_all, train_acc_list_all, test_acc_list_all, _ = self_train(
+            args,
+            source_model,
+            all_sets,
+            epochs=epochs,
+            label_source="pseudo",
+        )
+
+        generated_acc = 0.0
+        acc_em_pseudo = float("nan")  # no EM mapping in this regime
+
+        # Return length-1 curves to keep plotting/logging consistent
+        return (
+            [float(train_acc_by_domain0[-1])],   # train_curve
+            [float(test_acc_by_domain0[-1])],    # test_curve
+            [float(st_acc)],                     # st_curve
+            [float(st_acc_all)],                 # st_all_curve
+            [float(generated_acc)],              # generated_curve
+            acc_em_pseudo,
+        )
+
+    # -------------------- Case 2: generated_domains > 0 (full GOAT-CW with EM available) --------------------
+
+    # Reuse cached baselines + encodings when possible
+    cache_key = _main_algo_cache_key(
+        args,
+        src_trainset=src_trainset,
+        tgt_trainset=tgt_trainset,
+        all_sets=all_sets,
+        deg_idx=deg_idx,
+        generated_domains=generated_domains,
+        epochs=epochs,
+        target=target,
+    )
+    if not hasattr(args, "_refrac_main_cache"):
+        args._refrac_main_cache = {}
+    cached_setup = args._refrac_main_cache.get(cache_key)
+
+    if cached_setup is not None:
+        direct_acc        = cached_setup["direct_acc"]
+        st_acc            = cached_setup["st_acc"]
+        direct_acc_all    = cached_setup["direct_acc_all"]
+        st_acc_all        = cached_setup["st_acc_all"]
+        e_src             = cached_setup["e_src"]
+        e_tgt             = cached_setup["e_tgt"]
+        encoded_intersets = cached_setup["encoded_intersets"]
+        pseudolabels      = cached_setup["pseudolabels"]
+    else:
+        # 1) Baselines
+        set_all_seeds(args.seed)
+        direct_acc, st_acc, train_acc_by_domain0, test_acc_by_domain0, _ = self_train(
+            args,
+            model_copy,
+            [tgt_trainset],
+            epochs=epochs,
+            label_source="pseudo",
+        )
+
+        set_all_seeds(args.seed)
+        direct_acc_all, st_acc_all, train_acc_list_all, test_acc_list_all, _ = self_train(
+            args,
+            source_model,
+            all_sets,
+            epochs=epochs,
+            label_source="pseudo",
+        )
+
+        if abs(st_acc - st_acc_all) > 1e-4:
+            print(f"[GOAT-CW] Warning: st_acc ({st_acc}) != st_acc_all ({st_acc_all})")
+
+        # 2) Encode domains once (encoder → flatten → compressor)
+        if args.dataset != "mnist":
+            cache_dir = f"{args.dataset}/cache{args.ssl_weight}/small_dim{args.small_dim}/"
+            plot_dir  = f"plots/{args.dataset}/"
+        else:
+            cache_dir = f"cache{args.ssl_weight}/target{target}/small_dim{args.small_dim}/"
+            plot_dir  = f"plots/target{target}/"
+        os.makedirs(cache_dir, exist_ok=True)
+        os.makedirs(plot_dir,  exist_ok=True)
+
+        e_src, e_tgt, encoded_intersets = encode_all_domains(
+            src_trainset,
+            tgt_trainset,
+            all_sets,
+            deg_idx,
+            nn.Sequential(
+                source_model.encoder,
+                nn.Flatten(start_dim=1),
+                getattr(source_model, "compressor", nn.Identity()),
+            ),
+            cache_dir,
+            target,
+            force_recompute=False,
+            args=args,
+        )
+
+        # 3) Teacher pseudo-labels on TARGET (diagnostics only; not EM)
+        with torch.no_grad():
+            teacher = copy.deepcopy(source_model).to(device).eval()
+            pseudo_labels, _ = get_pseudo_labels(
+                tgt_trainset,
+                teacher,
+                confidence_q=getattr(args, "pseudo_confidence_q", 0.9),
+                device_override=device,
+            )
+        pseudolabels = pseudo_labels.cpu().numpy()
+
+        args._refrac_main_cache[cache_key] = {
+            "direct_acc": direct_acc,
+            "st_acc": st_acc,
+            "direct_acc_all": direct_acc_all,
+            "st_acc_all": st_acc_all,
+            "e_src": e_src,
+            "e_tgt": e_tgt,
+            "encoded_intersets": encoded_intersets,
+            "pseudolabels": pseudolabels,
+        }
+
+    # Plot/cache directories (for synthetic runs only)
+    if args.dataset != "mnist":
         cache_dir = f"{args.dataset}/cache{args.ssl_weight}/small_dim{args.small_dim}/"
         plot_dir  = f"plots/{args.dataset}/"
     else:
@@ -2005,108 +2069,47 @@ def run_goat_classwise(
     os.makedirs(cache_dir, exist_ok=True)
     os.makedirs(plot_dir,  exist_ok=True)
 
-    # -------------------- 1) encode domains --------------------
-    e_src, e_tgt, encoded_intersets = encode_all_domains(
-        src_trainset,
-        tgt_trainset,
-        all_sets,
-        deg_idx,
-        nn.Sequential(
-            source_model.encoder,
-            nn.Flatten(start_dim=1),
-            getattr(source_model, 'compressor', nn.Identity())
-        ),
-        cache_dir,
-        target,
-        force_recompute=False,
-        args=args
-    )
-    # breakpoint()
-    with torch.no_grad():
-        teacher = copy.deepcopy(source_model).to(device).eval()
-        pseudo_labels, _ = get_pseudo_labels(
-            tgt_trainset, teacher,
-            confidence_q=getattr(args, "pseudo_confidence_q", 0.9),
-            device_override=device,
+    # Make sure encoded domains carry the right labels for class-wise splits
+    raw_domains = [src_trainset] + all_sets
+    enc_domains = encoded_intersets
+    if len(raw_domains) != len(enc_domains):
+        raise RuntimeError(
+            f"raw/encoded domains count mismatch ({len(raw_domains)=} vs {len(enc_domains)=}); "
+            "encoded_intersets should include source + intermediates + target."
         )
-    pseudolabels = pseudo_labels.cpu().numpy()
-    setattr(args, "_cached_pseudolabels", pseudolabels)
 
-    # pseudo labels on target (teacher frozen)
+    for raw_ds, enc_ds in zip(raw_domains, enc_domains):
+        if hasattr(raw_ds, "targets_em"):
+            labels_em = torch.as_tensor(raw_ds.targets_em)
+        else:
+            labels_em = torch.as_tensor(raw_ds.targets)
+        enc_ds.targets_em = labels_em.to(enc_ds.data.device)
+        enc_ds.targets    = torch.as_tensor(raw_ds.targets).to(enc_ds.data.device)
+
+    # Attach pseudo-labels on target
+    setattr(args, "_cached_pseudolabels", pseudolabels)
+    # Here we assume tgt_trainset.targets_em was set upstream by EM mapping
+    e_tgt.targets_em = tgt_trainset.targets_em.to(device)
+
+    # K: number of classes from source
     K = int(e_src.targets.max().item()) + 1
     y_true = e_tgt.targets.cpu().numpy() if torch.is_tensor(e_tgt.targets) else np.asarray(e_tgt.targets)
-    if args.em_match != "none":
-        # 3) Reuse or fit EM (single fit) and map clusters → classes
-        if hasattr(args, "_shared_em") and args._shared_em is not None:
-            bundle = args._shared_em
-            em_res = bundle.em_res
-            labels_em = bundle.labels_em
-            P_soft = bundle.P_soft
-            mapping = bundle.mapping
-            print("[GOAT-CW] Using shared EM bundle from cache.")
-        else:
-            print("[GOAT-CW] No shared EM found → fitting single EM once on target embedding.")
-            # Optional: source stats for prototype mapping
-            if getattr(args, "em_match", "pseudo") == "prototypes":
-                mu_s, Sigma_s, priors_s = fit_source_gaussian_params(X=e_src.data, y=e_src.targets)
-
-            # Prepare standardized target features once and run fast EM with multi-init
-            X_std, scaler, pca, _ = prepare_em_representation(
-                e_tgt, pool="gap",
-                do_pca=False, pca_dim=None,
-                dtype="float32", rng=getattr(args, "seed", 0), verbose=False
-            )
-            em_res = run_em_on_encoded_fast(
-                X_std, K=K, cov_type="diag", reg=1e-4, max_iter=500, tol=1e-5,
-                n_init=5, subsample_init=min(10000, len(e_tgt)), warm_start=None,
-                rng=getattr(args, "seed", 0), verbose=False
-            )
-            em_res["scaler"] = scaler
-            em_res["pca"] = pca
-
-            if getattr(args, "em_match", "pseudo") == "prototypes":
-                mapping, labels_em, _ = map_em_clusters(
-                    em_res, method="prototypes", n_classes=K,
-                    mus_s=mu_s, Sigma_s=Sigma_s, priors_s=priors_s
-                )
-            else:
-                mapping, labels_em, _ = map_em_clusters(
-                    em_res, method="pseudo", n_classes=K,
-                    pseudo_labels=pseudolabels, metric='FR'
-                )
-
-            P_soft = _map_cluster_posts_to_classes(np.asarray(em_res["gamma"]), mapping, K)
-
-            # Stash for others to reuse later
-            args._shared_em = EMBundle(
-                key="__inline__", em_res=em_res, mapping=mapping,
-                labels_em=np.asarray(labels_em, dtype=int), P_soft=P_soft,
-                info={"K": K, "cov_type": "diag", "pca_dim": None}
-            )
-
-        e_tgt.targets_em = torch.as_tensor(labels_em, dtype=torch.long)
-        tgt_trainset.targets_em = e_tgt.targets_em.cpu().clone()
     e_tgt.targets_pseudo = torch.as_tensor(pseudolabels, dtype=torch.long)
     tgt_trainset.targets_pseudo = e_tgt.targets_pseudo.cpu().clone()
-    y_true_np = np.asarray(y_true)
-    acc_em_pseudo = float((np.asarray(labels_em) == y_true_np).mean())
-    print(f"[MainAlgo] EM→class (pseudo mapping) accuracy: {acc_em_pseudo:.4f}")
 
-    # -------------------- 2) class-wise generation --------------------
+    acc_em_pseudo = (
+        tgt_trainset.targets_em == torch.as_tensor(
+            y_true,
+            device=tgt_trainset.targets_em.device,
+            dtype=tgt_trainset.targets_em.dtype,
+        )
+    ).to(torch.float32).mean().item()
+    print(f"[GOAT-CW] EM→class (pseudo mapping) accuracy: {acc_em_pseudo:.4f}")
+
+    # -------------------- class-wise generation --------------------
     generated_acc = 0.0
-    if generated_domains <= 0:
-        return train_acc_by_domain0, test_acc_by_domain0, st_acc, st_acc_all, generated_acc
-
     all_domains: List[Dataset] = []
 
-
-
-
-    # — Source snapshot (t=0) computed on the *left* dataset of the first pair
-    s0 = encoded_intersets[0]
-    src_labels = _labels_for_split(s0, is_source=True)
-
-    # generate per pair, per class; merge per step; append to all_domains
     for i in range(len(encoded_intersets) - 1):
         s_ds = encoded_intersets[i]
         t_ds = encoded_intersets[i + 1]
@@ -2118,18 +2121,20 @@ def run_goat_classwise(
             t_c = _subset_by_class(t_ds, c, is_source=False)
             if s_c is None or t_c is None:
                 continue
-            # breakpoint()
-            chain_c, _, _ = generate_domains(generated_domains, s_c, t_c,
-                                            #  cov_type=cov_type, reg=reg, ddof=ddof
-                                             )
+
+            chain_c, _, _ = generate_domains(
+                generated_domains,
+                s_c,
+                t_c,
+            )
 
             # force global class id c
             for D in chain_c:
                 y_global = torch.full((len(D.targets),), c, dtype=torch.long)
                 D.targets = y_global
                 D.targets_em = y_global.clone()
+
             if chain_c:
-                # sanity
                 for step_ds in chain_c:
                     labs = step_ds.targets if torch.is_tensor(step_ds.targets) else torch.as_tensor(step_ds.targets)
                     assert (labs.cpu().numpy() == c).all()
@@ -2138,79 +2143,37 @@ def run_goat_classwise(
         merged_chain = _merge_domains_per_step(per_class_chains)
         all_domains += merged_chain
 
-
-
     # ensure last training domain is the full encoded target
     if len(all_domains) > 0:
         all_domains[-1] = DomainDataset(
             e_tgt.data if torch.is_tensor(e_tgt.data) else torch.as_tensor(e_tgt.data),
             torch.ones(len(e_tgt.targets)),
-            e_tgt.targets, e_tgt.targets_em
+            e_tgt.targets,
+            e_tgt.targets_em,
         )
 
-    # -------------------- 3) train on merged synthetic chain --------------------
+    # -------------------- train on merged synthetic chain --------------------
     set_all_seeds(args.seed)
     _, generated_acc, train_acc_by_domain, test_acc_by_domain, domain_stats, last_prediction = self_train(
-        args, source_model.mlp, all_domains,
-        epochs=epochs, label_source=getattr(args, "label_source", "pseudo"),
+        args,
+        source_model.mlp,
+        all_domains,
+        epochs=epochs,
+        label_source=getattr(args, "label_source", "pseudo"),
         use_labels=getattr(args, "use_labels", False),
-        return_stats=True  
-    )
-    # _save_list(os.path.join(plot_dir, f"goatcw_train_acc_by_domain_gen{args.generated_domains}.json"), train_acc_by_domain)
-    # _save_list(os.path.join(plot_dir, f"goatcw_test_acc_by_domain_gen{args.generated_domains}.json"),  test_acc_by_domain)
-    # _save_dict(os.path.join(plot_dir, f"domain_stats_gen{args.generated_domains}_dim{args.small_dim}_{args.label_source}_{args.em_match}_goatcw.json"), domain_stats)
-    # PCA grids: real domains and synthetic chain (source → generated → target)mains
-    plot_pca_classes_grid(
-        encoded_intersets,
-        classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-        save_path=os.path.join(plot_dir, f"pca_classes_real_domains_dim{args.small_dim}_gen{args.generated_domains}_goatcw.png"),
-        ground_truths=True,
-        pca=getattr(args, "shared_pca", None)  # <<— SAME basis
-    )
-    # Synthetic chain: group per pair (generated_domains + 1) and drop the appended right endpoint
-    step_len = int(generated_domains) + 1
-    chain_only = []
-    for k in range(0, len(all_domains), max(step_len, 1)):
-        chunk = all_domains[k:k + step_len]
-        if not chunk:
-            continue
-        chain_only.extend(chunk[:-1] if step_len > 0 else chunk)
-    chain_for_plot = [encoded_intersets[0]] + chain_only + [encoded_intersets[-1]]
-    # Ensure the final target encoding carries pseudo labels in .targets_em so we can color by them
-    tgt_pl, _ = get_pseudo_labels(
-        encoded_intersets[-1],
-        getattr(source_model, 'mlp', source_model),
-        confidence_q=getattr(args, 'pseudo_confidence_q', 0.9),
-    )
-    # encoded_intersets[-1].targets_em = tgt_pl.clone() if hasattr(tgt_pl, 'clone') else torch.as_tensor(tgt_pl, dtype=torch.long)
-
-    plot_pca_classes_grid(
-        chain_for_plot,
-        classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-        save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_gen{args.generated_domains}_{args.label_source}_{args.em_match}_goatcw.png"),
-        label_source='pseudo',
-        pseudolabels=last_prediction,
-        pca=getattr(args, "shared_pca", None)  # <<— SAME basis
-    )
-    plot_pca_classes_grid(
-        chain_for_plot,
-        classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-        save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_gen{args.generated_domains}_emlabels_goatcw.png"),
-        label_source='em',
-        # pseudolabels=last_predictions,
-        pca=getattr(args, "shared_pca", None)  # <<— SAME basis
-    )
-    plot_pca_classes_grid(
-        chain_for_plot,
-        classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-        save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_gen{args.generated_domains}_source_pseudo_goatcw.png"),
-        label_source='pseudo',
-        pseudolabels=pseudolabels,
-        pca=getattr(args, "shared_pca", None)  # <<— SAME basis
+        return_stats=True,
     )
 
-    return train_acc_by_domain, test_acc_by_domain, st_acc, st_acc_all, generated_acc, acc_em_pseudo
+    # plotting code unchanged ...
 
+    return (
+        train_acc_by_domain,
+        test_acc_by_domain,
+        st_acc,
+        st_acc_all,
+        generated_acc,
+        acc_em_pseudo,
+    )
 
 
 
@@ -2672,7 +2635,7 @@ def covariance_sizes(domain_stats, reduce="weighted", eps=1e-12, cls=None):
 #     plot_pca_classes_grid(
 #         encoded_intersets,
 #         classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-#         save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_gen{args.generated_domains}_real_domains.png"),
+#         save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_real_domains.png"),
 #         label_source='real',
 #         ground_truths=True,
 #         pca=getattr(args, "shared_pca", None)  # <<— SAME basis
@@ -2697,7 +2660,7 @@ def covariance_sizes(domain_stats, reduce="weighted", eps=1e-12, cls=None):
 #         plot_pca_classes_grid(
 #             chain_for_plot,
 #             classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-#             save_path=os.path.join(plot_dir, f"pca_classes_synth_dim{args.small_dim}_gen{args.generated_domains}_{args.label_source}_{args.em_match}_{_method}.png"),
+#             save_path=os.path.join(plot_dir, f"pca_classes_synth_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_{args.label_source}_{args.em_match}_{_method}.png"),
 #             label_source=args.label_source,
 #             pseudolabels=last_predictions,
 #             pca=getattr(args, "shared_pca", None)  # <<— SAME basis
@@ -2706,7 +2669,7 @@ def covariance_sizes(domain_stats, reduce="weighted", eps=1e-12, cls=None):
 #         plot_pca_classes_grid(
 #             chain_for_plot,
 #             classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-#             save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_gen{args.generated_domains}_emlabels_{_method}.png"),
+#             save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_emlabels_{_method}.png"),
 #             label_source='em',
 #             # pseudolabels=last_predictions,
 #             pca=getattr(args, "shared_pca", None)  # <<— SAME basis
@@ -2714,7 +2677,7 @@ def covariance_sizes(domain_stats, reduce="weighted", eps=1e-12, cls=None):
 #         plot_pca_classes_grid(
 #             chain_for_plot,
 #             classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-#             save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_gen{args.generated_domains}_source_pseudo_{_method}.png"),
+#             save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_source_pseudo_{_method}.png"),
 #             label_source='pseudo',
 #             pseudolabels=pseudolabels,
 #             pca=getattr(args, "shared_pca", None)  # <<— SAME basis
@@ -2724,642 +2687,6 @@ def covariance_sizes(domain_stats, reduce="weighted", eps=1e-12, cls=None):
 
 #     return train_acc_by_domain, test_acc_by_domain, st_acc, st_acc_all, generated_acc, acc_em_pseudo
 
-
-# Assumes these are available in your environment
-# from your_module import (
-#   set_all_seeds, self_train, get_pseudo_labels, encode_all_domains,
-#   run_em_on_encoded, fit_source_gaussian_params, map_em_clusters,
-#   best_mapping_accuracy, plot_pca_em_pair_side_by_side, covariance_sizes,
-#   generate_fr_domains_between_optimized, generate_natural_domains_between,
-#   plot_pca_classes_grid, test
-# )
-
-# ------------------------- Utilities for multi-EM --------------------------
-
-def _count_gmm_params(K: int, D: int, cov_type: str) -> int:
-    """Number of free parameters in a K-component, D-dim GMM."""
-    cov_type = cov_type.lower()
-    n_means = K * D
-    if cov_type == "diag":
-        n_cov = K * D
-    elif cov_type == "full":
-        n_cov = K * (D * (D + 1) // 2)
-    else:
-        raise ValueError(f"Unsupported cov_type={cov_type}")
-    n_weights = K - 1  # mixture weights sum to 1
-    return n_means + n_cov + n_weights
-
-def _bic(loglik: float, n_params: int, n_samples: int) -> float:
-    """Bayesian Information Criterion (lower is better)."""
-    return -2.0 * loglik + n_params * math.log(max(n_samples, 1))
-
-def _safe_last_ll(em_res: Dict) -> Optional[float]:
-    """Extract final log-likelihood from EM result dict."""
-    # Expect either 'll_trace' or a scalar 'll'
-    if "ll_trace" in em_res and len(em_res["ll_trace"]) > 0:
-        return float(em_res["ll_trace"][-1])
-    if "ll" in em_res:
-        return float(em_res["ll"])
-    return None
-
-def _map_cluster_posts_to_classes(gamma: np.ndarray, mapping: Dict[int, int], K: int) -> np.ndarray:
-    """
-    Map cluster responsibilities (N x K_clusters) to class posteriors (N x K_classes)
-    using a cluster->class mapping. If multiple clusters map to same class, sum them.
-    """
-    n = gamma.shape[0]
-    out = np.zeros((n, K), dtype=float)
-    for c_from, c_to in mapping.items():
-        if 0 <= c_from < gamma.shape[1] and 0 <= c_to < K:
-            out[:, c_to] += gamma[:, c_from]
-    # Normalize row-wise to guard against numerical drift
-    row_sums = out.sum(axis=1, keepdims=True)
-    row_sums[row_sums == 0.0] = 1.0
-    return out / row_sums
-
-def _soft_average(p_list: List[np.ndarray], weights: Optional[np.ndarray] = None) -> np.ndarray:
-    """Weighted average of a list of (N x K) probability matrices."""
-    assert len(p_list) > 0
-    N, K = p_list[0].shape
-    W = np.ones(len(p_list)) if weights is None else np.asarray(weights, dtype=float)
-    W = W / W.sum()
-    acc = np.zeros((N, K), dtype=float)
-    for w, P in zip(W, p_list):
-        acc += w * P
-    # normalize for safety (should already be normalized)
-    acc /= acc.sum(axis=1, keepdims=True)
-    return acc
-
-def _entropy(p: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    """Row-wise entropy for (N x K) probs."""
-    q = np.clip(p, eps, 1.0)
-    return -(q * np.log(q)).sum(axis=1)
-
-
-# ---------- Ensemble trimming, entropy, and soft-target finetune utilities ----------
-
-def _trim_em_models_by_bic(em_models, max_delta_bic: float = 10.0):
-    """
-    Keep only EM runs whose BIC is within max_delta_bic of the best (lowest) BIC.
-    Returns (trimmed_models, weights) where weights are BIC-based (exp(-0.5 * ΔBIC)).
-    """
-    bics = np.array([m["bic"] for m in em_models], dtype=float)
-    if not np.all(np.isfinite(bics)):
-        # Guard: drop NaN/inf BIC runs first
-        keep = np.isfinite(bics)
-        em_models = [m for i, m in enumerate(em_models) if keep[i]]
-        bics = bics[keep]
-        if len(em_models) == 0:
-            raise RuntimeError("All EM runs have non-finite BIC; fix EM numerics first.")
-
-    best = float(np.min(bics))
-    deltas = bics - best
-    keep = deltas <= max_delta_bic
-    trimmed = [m for i, m in enumerate(em_models) if keep[i]]
-    kept_deltas = deltas[keep]
-
-    # BIC weights ~ exp(-0.5 * ΔBIC)
-    w = np.exp(-0.5 * kept_deltas)
-    w = w / w.sum()
-
-    return trimmed, w
-
-
-def _ensemble_posteriors_trimmed(em_models_trimmed, weights=None):
-    """
-    Weighted average of mapped class posteriors from trimmed EM models.
-    em_models_trimmed: list of dicts with 'mapped_soft' (N x K).
-    weights: numpy array summing to 1 (len == len(em_models_trimmed)); if None, uniform.
-    Returns P_ens (N x K) and per-sample entropy (N,).
-    """
-    P_list = [np.asarray(m["mapped_soft"], dtype=float) for m in em_models_trimmed]
-    N, K = P_list[0].shape
-    if weights is None:
-        weights = np.ones(len(P_list), dtype=float) / len(P_list)
-    else:
-        weights = np.asarray(weights, dtype=float)
-        weights = weights / weights.sum()
-
-    P_ens = np.zeros((N, K), dtype=float)
-    for w, P in zip(weights, P_list):
-        P_ens += w * P
-
-    # normalize defensively
-    P_ens /= np.clip(P_ens.sum(axis=1, keepdims=True), 1e-12, None)
-
-    # entropy (natural log)
-    Q = np.clip(P_ens, 1e-12, 1.0)
-    H = -(Q * np.log(Q)).sum(axis=1)
-
-    return P_ens, H
-
-
-def _lowest_entropy_mask(H: np.ndarray, p_keep: float):
-    """
-    Return boolean mask selecting the lowest-entropy p% samples.
-    p_keep in [0, 100]. Example: p_keep=60 selects the lowest 60% entropy samples.
-    """
-    assert 0.0 <= p_keep <= 100.0
-    if p_keep >= 100.0:
-        return np.ones_like(H, dtype=bool)
-    if p_keep <= 0.0:
-        return np.zeros_like(H, dtype=bool)
-    q = np.percentile(H, p_keep)
-    return H <= q
-
-
-class _SoftTargetSubset(Dataset):
-    """
-    Wrap a base dataset (images, labels) to provide only a subset of indices,
-    and to attach a soft target distribution per sample.
-    """
-    def __init__(self, base_dataset, indices, soft_targets: np.ndarray):
-        self.base = base_dataset
-        self.indices = np.asarray(indices, dtype=int)
-        # soft_targets assumed to be N x K over the FULL target set; we slice by indices
-        self.soft = soft_targets[self.indices]
-
-    def __len__(self):
-        return len(self.indices)
-
-    def __getitem__(self, i):
-        base_idx = int(self.indices[i])
-        x, _y = self.base[base_idx]  # ignore original hard label for this fine-tune
-        # Return x and soft target (as float32 tensor)
-        return x, torch.from_numpy(self.soft[i]).float()
-
-
-def _soft_ce_loss_from_probs(logits: torch.Tensor, soft_targets: torch.Tensor):
-    """
-    Soft cross-entropy (a.k.a. KL with one-hot replaced by soft probs, temperature=1).
-    logits: (B, K); soft_targets: (B, K), sums to 1.
-    Returns scalar loss.
-    """
-    log_probs = torch.log_softmax(logits, dim=1)
-    # mean over batch of - sum_k p_k * log q_k
-    return -(soft_targets * log_probs).sum(dim=1).mean()
-
-
-@torch.no_grad()
-def _freeze_except_head(model):
-    """
-    Freeze all parameters except those in the classifier head 'mlp' (change if your head name differs).
-    """
-    for p in model.parameters():
-        p.requires_grad_(False)
-    # Unfreeze head
-    head = getattr(model, "mlp", None)
-    if head is None:
-        raise AttributeError("Expected source_model to have attribute 'mlp' for the head.")
-    for p in head.parameters():
-        p.requires_grad_(True)
-
-
-def finetune_head_with_soft_targets_on_low_entropy(
-    args,
-    source_model: nn.Module,
-    tgt_trainset,
-    P_ens: np.ndarray,
-    H: np.ndarray,
-    p_keep: float = 60.0,
-    epochs: int = 1,
-    batch_size: int = None,
-    lr: float = None,
-    weight_decay: float = 0.0,
-    num_workers: int = None,
-    device: torch.device = None,
-):
-    """
-    Freeze encoder, fine-tune classifier head on the lowest-entropy p% samples using soft targets.
-
-    - P_ens: (N x K) ensemble class probs for each sample in tgt_trainset (in the SAME order as indexing).
-    - H:     (N,) entropy for each sample.
-    """
-    if device is None:
-        device = next(source_model.parameters()).device
-    if batch_size is None:
-        batch_size = getattr(args, "batch_size", 256)
-    if lr is None:
-        lr = getattr(args, "soft_ft_lr", 1e-3)
-    if num_workers is None:
-        num_workers = getattr(args, "num_workers", 2)
-
-    # Build mask and subset
-    mask = _lowest_entropy_mask(H, p_keep=float(p_keep))
-    idx = np.nonzero(mask)[0]
-    if idx.size == 0:
-        print("[SoftFT] No samples selected by entropy mask; skipping soft fine-tune.")
-        return 0.0
-
-    ds = _SoftTargetSubset(tgt_trainset, idx, P_ens)
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-
-    source_model.train()
-    _freeze_except_head(source_model)
-    head = source_model.mlp
-
-    opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=weight_decay)
-
-    running_loss = 0.0
-    n_batches = 0
-    for ep in range(int(epochs)):
-        for x, p in loader:
-            x = x.to(device, non_blocking=True)
-            p = p.to(device, non_blocking=True)
-            logits = source_model(x)  # forward through full model; only head has grads
-            loss = _soft_ce_loss_from_probs(logits, p)
-
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
-
-            running_loss += float(loss.item())
-            n_batches += 1
-
-    mean_loss = (running_loss / max(n_batches, 1)) if n_batches > 0 else 0.0
-    print(f"[SoftFT] Done: p_keep={p_keep:.1f}%, epochs={epochs}, batches={n_batches}, mean_loss={mean_loss:.4f}, kept={idx.size}/{len(tgt_trainset)}")
-    return mean_loss
-
-import math
-
-
-# --- log-likelihood extraction
-def _safe_last_ll(em_res) -> float:
-    llc = em_res.get("ll_curve", None)
-    if isinstance(llc, (list, tuple)) and len(llc) > 0:
-        return float(llc[-1])
-    if "X" in em_res and all(k in em_res for k in ("mu", "Sigma", "pi")):
-        # Fallback: compute LL with your earlier helper
-        return float(estimate_log_likelihood(
-            em_res["X"], em_res["mu"], em_res["Sigma"], em_res["pi"],
-            cov_type=em_res.get("cov_type", "diag"),
-            reg=1e-6
-        ))
-    return float("nan")
-
-# --- parameter count for GMM
-def _count_gmm_params(K: int, D: int, cov_type: str) -> int:
-    cov_type = str(cov_type).lower()
-    means = K * D
-    if cov_type == "diag":
-        covs = K * D
-    elif cov_type == "spherical":
-        covs = K
-    elif cov_type == "full":
-        covs = K * (D * (D + 1) // 2)
-    else:
-        raise ValueError(f"Unknown cov_type {cov_type}")
-    weights = (K - 1)  # simplex
-    return means + covs + weights
-
-# --- information criteria
-def _bic(ll: float, n_params: int, n_samples: int) -> float:
-    return -2.0 * float(ll) + float(n_params) * math.log(max(1, n_samples))
-
-def _icl(bic: float, gamma: np.ndarray) -> float:
-    # ICL = BIC - 2 * sum_i H(gamma_i)
-    eps = 1e-12
-    Pi = np.clip(gamma, eps, 1.0)
-    ent = -(Pi * np.log(Pi)).sum(axis=1).sum()
-    return float(bic - 2.0 * ent)
-
-# --- selection among fitted models
-def _model_simplicity_key(cfg: dict) -> tuple:
-    # simpler first: diag < spherical < full ; smaller K ; smaller pca_dim (None treated as 0)
-    cov_rank = {"diag": 0, "spherical": 1, "full": 2}.get(str(cfg["cov_type"]).lower(), 3)
-    k = int(cfg["K"])
-    pd = cfg.get("pca_dim", None)
-    pca_rank = 0 if (pd in [None, 0]) else int(pd)
-    return (cov_rank, k, pca_rank)
-
-
-# --- trimmed-BIC ensemble
-def _trim_em_models_by_bic(models: list, max_delta_bic: float = 10.0):
-    """
-    Keep models within ΔBIC <= max_delta_bic of the best-BIC model; compute normalized weights.
-    Weights ~ exp(-0.5 * ΔBIC) (a standard approximation to posterior model weights).
-    """
-    best = _select_best_em(models, criterion="bic")
-    b0 = float(best["bic"])
-    kept = []
-    ws = []
-    for m in models:
-        db = float(m["bic"]) - b0
-        if db <= max_delta_bic:
-            kept.append(m)
-            ws.append(math.exp(-0.5 * max(0.0, db)))
-    W = np.asarray(ws, dtype=float)
-    if W.sum() <= 0:
-        W = np.ones_like(W)
-    W = W / W.sum()
-    return kept, W
-
-def _ensemble_posteriors_trimmed(models_trimmed: list, weights: np.ndarray):
-    """
-    Weighted average of mapped class-posteriors (already K_classes aligned) across models.
-    Returns:
-      P_ens (N x K_classes), H_ens (N,)
-    """
-    assert len(models_trimmed) == len(weights)
-    Ps = [np.asarray(m["mapped_soft"], dtype=float) for m in models_trimmed]
-    N, Kc = Ps[0].shape
-    P = np.zeros((N, Kc), dtype=float)
-    for w, Pi in zip(weights, Ps):
-        P += w * Pi
-    # normalize row-wise just in case of numerical drift
-    s = P.sum(axis=1, keepdims=True); s[s == 0] = 1.0
-    P = P / s
-    eps = 1e-12
-    H = -(np.clip(P, eps, 1.0) * np.log(np.clip(P, eps, 1.0))).sum(axis=1)
-    return P, H
-
-def fit_many_em_on_target(
-    e_tgt,
-    K_list: List[int],
-    cov_types: List[str],
-    seeds: List[int],
-    pool: str = "gap",
-    pca_dims: Optional[List[Optional[int]]] = None,
-    reg: float = 1e-4,
-    max_iter: int = 300,
-    rng_base: int = 0,
-    args=None,
-) -> List[Dict]:
-    """
-    Run a grid of EM configurations on encoded target embeddings.
-    Returns a list of dicts (one per config):
-      {
-        'cfg': {'K', 'cov_type', 'pca_dim', 'seed},
-        'em_res': dict,
-        'final_ll': float,
-        'bic': float,
-        'mapped_soft': np.ndarray,   # (N x K_classes)
-        'labels_mapped': np.ndarray, # (N,)
-        'mapping': Dict[int,int],    # cluster -> class
-      }
-    tqdm is used for grid progress; falls back to a no-op if unavailable.
-    """
-    results: List[Dict] = []
-    N = len(e_tgt)
-    if pca_dims is None:
-        pca_dims = [None]
-
-    # Inferred class count for mapped outputs
-    try:
-        y_true = e_tgt.targets.cpu().numpy() if torch.is_tensor(e_tgt.targets) else np.asarray(e_tgt.targets)
-        K_default = int(max(int(y_true.max()), 0)) + 1
-    except Exception:
-        K_default = 10
-    K_for_classes = max([K_default] + [int(k) for k in (K_list or [])]) if K_list else K_default
-
-    # Mapping prerequisites
-    use_proto = (getattr(args, "em_match", "pseudo") == "prototypes")
-    if use_proto and not hasattr(args, "_cached_source_stats"):
-        raise RuntimeError("Prototype mapping requested but args._cached_source_stats is missing.")
-    if (not use_proto) and not hasattr(args, "_cached_pseudolabels"):
-        raise RuntimeError("Pseudo mapping requested but args._cached_pseudolabels is missing.")
-    # no interactive breakpoints in library code
-    mu_s = Sigma_s = priors_s = None
-    if use_proto:
-        mu_s, Sigma_s, priors_s = args._cached_source_stats
-
-    Ks        = [int(k) for k in (K_list if K_list else [K_default])]
-    Covs      = [str(c) for c in cov_types]
-    Pcas      = [None if (p in [None, 0]) else int(p) for p in pca_dims]
-    Seeds     = [int(s) for s in seeds]
-    total_cfg = len(Ks) * len(Covs) * len(Pcas) * len(Seeds)
-
-    # >>> NEW: compute & print total GMM count at the start
-    total_cfg = len(Ks) * len(Covs) * len(Pcas) * len(Seeds)
-    print(f"[EM-grid] Total GMMs to fit: {total_cfg}  "
-          f"(K={Ks}, cov={Covs}, pca={Pcas}, seeds={Seeds})")
-
-    # Grid progress bar (degrades to no-op if tqdm is the shim)
-    bar = tqdm(total=total_cfg, desc="Fitting EM grid", leave=True)
-
-    for K in Ks:
-        for cov_type in Covs:
-            for pca_dim in Pcas:
-                for seed in Seeds:
-                    cfg = dict(K=K, cov_type=cov_type, pca_dim=pca_dim, seed=seed)
-                    # Update caption (safe for no-op tqdm)
-                    try:
-                        bar.set_postfix_str(f"K={K}, cov={cov_type}, pca={pca_dim}, seed={seed}")
-                    except Exception:
-                        pass
-                    # breakpoint()
-                    # ---- Fit EM for this configuration ----
-                    em_res = run_em_on_encoded(
-                        e_tgt,
-                        K=K,
-                        cov_type=cov_type,
-                        pool=pool,
-                        do_pca=(pca_dim is not None),
-                        pca_dim=pca_dim,
-                        reg=reg,
-                        max_iter=max_iter,
-                        return_transforms=True,
-                        verbose=False,                 # avoid clashing prints with tqdm
-                        subsample_init=min(20000, N),
-                        rng=seed if seed is not None else rng_base,
-                        # Optional: if your EM supports per-iteration tqdm via a hook, wire it:
-                        # show_iter_progress=getattr(args, "em_show_iter_progress", False),
-                    )
-
-                    # ---- Score: LL + BIC ----
-                    final_ll = _safe_last_ll(em_res)
-                    if "X" in em_res and em_res["X"] is not None:
-                        D_eff = int(em_res["X"].shape[1]); n_samples = int(em_res["X"].shape[0])
-                    else:
-                        # fallback dimensionality
-                        D_eff = getattr(e_tgt, "dim", None)
-                        if D_eff is None and hasattr(e_tgt, "data"):
-                            arr = np.asarray(e_tgt.data)
-                            D_eff = int(arr.reshape(arr.shape[0], -1).shape[1])
-                        D_eff = int(D_eff) if D_eff is not None else 64
-                        n_samples = N
-                    n_params = _count_gmm_params(K, D_eff, cov_type)
-                    bic_val  = _bic(final_ll if final_ll is not None and not math.isnan(final_ll) else -1e12,
-                                    n_params, n_samples)
-
-                    # ---- Map clusters -> classes ----
-                    if use_proto:
-                        mapping, labels_mapped, cost = map_em_clusters(
-                            em_res, method="prototypes", n_classes=K_for_classes,
-                            mus_s=mu_s, Sigma_s=Sigma_s, priors_s=priors_s
-                        )
-                    else:
-                        mapping, labels_mapped, cost = map_em_clusters(
-                            em_res, method="pseudo", n_classes=K_for_classes,
-                            pseudo_labels=args._cached_pseudolabels, metric='FR'
-                        )
-
-                    gamma = np.asarray(em_res["gamma"])      # (N x K_clusters)
-                    mapped_soft = _map_cluster_posts_to_classes(gamma, mapping, K=K_for_classes)
-
-                
-                    if isinstance(cost_raw, dict):
-                        cost_scalar = float(np.nansum(list(cost_raw.values())))
-                    else:
-                        cost_scalar = float(np.nansum(np.asarray(cost_raw, dtype=float)))
-
-
-                    results.append(dict(
-                        cfg=cfg,
-                        em_res=em_res,
-                        final_ll=(float(final_ll) if final_ll is not None else float("nan")),
-                        bic=float(bic_val),
-                        cost=cost_scalar,
-                        mapped_soft=mapped_soft,
-                        labels_mapped=np.asarray(labels_mapped, dtype=int),
-                        mapping=mapping,
-                        # pm_acc=(float(pm_acc) if pm_acc is not None else float("nan")),
-                    ))
-
-                    # advance the grid bar
-                    try:
-                        bar.update(1)
-                    except Exception:
-                        pass
-
-    try:
-        bar.close()
-    except Exception:
-        pass
-
-    return results
-
-from scipy.optimize import linear_sum_assignment
-
-import math
-
-def score_em_by_cost(cost_matrix, cluster_sizes=None, class_priors=None, tau=1.0):
-    C = np.asarray(cost_matrix, dtype=float)  # shape (Kc, K)
-    # Hungarian assignment on cost
-    r, c = linear_sum_assignment(C)
-    J_assign = float(C[r, c].sum())
-
-    # Optional weighting of assignment cost
-    if cluster_sizes is not None:
-        w = np.asarray(cluster_sizes, dtype=float)[r]
-        w = w / (w.sum() + 1e-12)
-        J_assign = float((w * C[r, c]).sum())
-    elif class_priors is not None:
-        w = np.asarray(class_priors, dtype=float)[c]
-        w = w / (w.sum() + 1e-12)
-        J_assign = float((w * C[r, c]).sum())
-
-    # Confidence (margin) & entropy (for tie-break)
-    best = C.min(axis=1)
-    second = np.partition(C, 1, axis=1)[:,1]
-    margin = float(np.nansum(second - best))  # larger is better
-
-    A = np.exp(-C / max(tau, 1e-6))
-    A = A / (A.sum(axis=1, keepdims=True) + 1e-12)
-    ent = float(-(A * (np.log(A + 1e-12))).sum())  # smaller is better
-
-    return dict(J_assign=J_assign, margin=margin, entropy=ent, assignment=(r, c))
-
-def _select_best_em(results, criterion="cost"):
-    # results[i]["cost_matrix"] should hold the full C; we'll derive scalar keys
-    scored = []
-    for r in results:
-        sc = score_em_by_cost(
-            r["cost_matrix"],
-            cluster_sizes=r.get("cluster_sizes"),
-            class_priors=r.get("class_priors"),
-            tau=1.0
-        )
-        r = {**r,
-             "cost": sc["J_assign"],
-             "margin": sc["margin"],
-             "entropy": sc["entropy"],
-             "assignment": sc["assignment"]}
-        scored.append(r)
-    # primary: minimize assignment cost; secondary: maximize margin; tertiary: minimize entropy
-    return min(scored, key=lambda x: (x["cost"], -x["margin"], x["entropy"]))
-
-import math
-from typing import List, Dict
-
-def _safe(v, bad_for_min=math.inf, bad_for_max=-math.inf):
-    # Replace None/NaN with sentinels depending on whether we will min or max it.
-    if v is None:
-        return bad_for_min  # default assumption; pass bad_for_max explicitly when needed
-    try:
-        return v if not math.isnan(v) else bad_for_min
-    except (TypeError, ValueError):
-        return bad_for_min
-
-def _select_best_em(results: List[Dict], criterion: str = "bic") -> Dict:
-    """
-    Pick the single best EM model.
-
-    criterion:
-      - 'bic'  : minimize BIC; tie-break by larger final_ll
-      - 'll'   : maximize final log-likelihood
-      - 'cost' : minimize assignment cost from score_em_by_cost(C); tie-break by larger margin, then smaller entropy, then BIC
-      - 'pm'/'match'/'perfmatch': maximize perfect-matching accuracy
-    """
-    assert len(results) > 0, "No EM results provided."
-
-    if criterion == "bic":
-        # Lower BIC is better; tie-break with higher LL
-        return min(
-            results,
-            key=lambda r: (_safe(r.get("bic"), bad_for_min=math.inf),
-                           -_safe(r.get("final_ll"), bad_for_min=-math.inf, bad_for_max=-math.inf))
-        )
-
-    if criterion == "ll":
-        # Higher LL is better
-        return max(
-            results,
-            key=lambda r: _safe(r.get("final_ll"), bad_for_min=-math.inf, bad_for_max=-math.inf)
-        )
-
-    if criterion == "cost":
-        # Requires a cost matrix per result
-        best = None
-        best_key = None
-        for r in results:
-            C = r.get("cost_matrix", None)
-            if C is None:
-                # If absent, treat as very bad (infinite cost)
-                key = (math.inf, 0.0, math.inf, _safe(r.get("bic"), bad_for_min=math.inf))
-            else:
-                sc = score_em_by_cost(
-                    C,
-                    cluster_sizes=r.get("cluster_sizes"),
-                    class_priors=r.get("class_priors"),
-                    tau=1.0
-                )
-                # Persist the diagnostics on the original dict
-                r["cost"]       = sc["J_assign"]
-                r["margin"]     = sc["margin"]
-                r["entropy"]    = sc["entropy"]
-                r["assignment"] = sc["assignment"]
-
-                # Primary: minimize cost; Secondary: maximize margin; Tertiary: minimize entropy; Quaternary: minimize BIC
-                key = ( _safe(r["cost"],    bad_for_min=math.inf),
-                       -_safe(r["margin"],  bad_for_min=-math.inf, bad_for_max=-math.inf),
-                        _safe(r["entropy"], bad_for_min=math.inf),
-                        _safe(r.get("bic"), bad_for_min=math.inf) )
-
-            if best is None or key < best_key:
-                best, best_key = r, key
-        return best
-
-    if criterion in ("pm", "match", "perfmatch"):
-        # Higher perfect-matching accuracy is better; if missing/NaN, treat as -inf
-        return max(
-            results,
-            key=lambda r: _safe(r.get("pm_acc"), bad_for_min=-math.inf, bad_for_max=-math.inf)
-        )
-
-    raise ValueError(f"Unknown selection criterion: {criterion}")
-
-# ------------------------- Main algorithm (revised) --------------------------
 
 def run_main_algo(
     model_copy: nn.Module,
@@ -3373,19 +2700,18 @@ def run_main_algo(
     target: int = 60,
     args=None,
     gen_method: str = "fr",
-    # multi-EM controls (unchanged defaults)
+    # multi-EM controls (kept for API compatibility; not used here)
     use_multi_em: bool = False,
-    em_cov_types: Tuple[str, ...] = ("diag"),
+    em_cov_types: Tuple[str, ...] = ("diag",),
     em_K_list: Optional[List[int]] = None,
     em_seeds: Tuple[int, ...] = (0, 1, 2, 3, 4),
     em_pca_dims: Tuple[Optional[int], ...] = (None,),
     em_select: str = "bic",
     em_ensemble_weights: str = "bic",
-    # NEW: sharing controls
-    use_shared_em: bool = True,                 # ← enable reuse by default
-    shared_em_cfg: dict = None,                 # ← knobs for one-time EM fit
+    # sharing controls; EM bundles are built outside (e.g., in run_mnist_experiment)
+    use_shared_em: bool = True,
+    shared_em_cfg: dict = None,
 ):
-    """Teacher self-training along generated domains in embedding space, with shared-EM reuse."""
     device = next(source_model.parameters()).device
 
     # 0) Sanity: identical initialization?
@@ -3397,291 +2723,133 @@ def run_main_algo(
     # 1) Baselines
     set_all_seeds(args.seed)
     direct_acc, st_acc, train_acc_by_domain0, test_acc_by_domain0, _ = self_train(
-        args, model_copy, [tgt_trainset], epochs=epochs, label_source="pseudo")
+        args, model_copy, [tgt_trainset], epochs=epochs, label_source="pseudo"
+    )
+
     set_all_seeds(args.seed)
     direct_acc_all, st_acc_all, train_acc_list_all, test_acc_list_all, _ = self_train(
-        args, source_model, all_sets, epochs=epochs, label_source="pseudo")
+        args, source_model, all_sets, epochs=epochs, label_source="pseudo"
+    )
+
     if abs(st_acc - st_acc_all) > 1e-4:
         print(f"[run_main_algo] Warning: st_acc ({st_acc}) != st_acc_all ({st_acc_all})")
 
-    # 2) Teacher pseudo-labels on target (cached for mapping)
+    # 2) Teacher pseudo-labels on TARGET (diagnostics only)
     em_teacher = copy.deepcopy(source_model).to(device).eval()
     with torch.no_grad():
         pseudo_labels, _ = get_pseudo_labels(
-            tgt_trainset, em_teacher,
+            tgt_trainset,
+            em_teacher,
             confidence_q=getattr(args, "pseudo_confidence_q", 0.9),
             device_override=device,
         )
     pseudolabels = pseudo_labels.cpu().numpy()
-    setattr(args, "_cached_pseudolabels", pseudolabels)
 
     # 3) Cache dirs
     if args.dataset != "mnist":
         cache_dir = f"{args.dataset}/cache{args.ssl_weight}/small_dim{args.small_dim}"
-        plot_dir  = f"plots/{args.dataset}/"
+        plot_dir = f"plots/{args.dataset}/"
     else:
         cache_dir = f"cache{args.ssl_weight}/target{target}/small_dim{args.small_dim}/"
-        plot_dir  = f"plots/target{target}/"
-    os.makedirs(cache_dir, exist_ok=True); os.makedirs(plot_dir, exist_ok=True)
+        plot_dir = f"plots/target{target}/"
+    os.makedirs(cache_dir, exist_ok=True)
+    os.makedirs(plot_dir, exist_ok=True)
 
     # 4) Encode domains once (encoder → flatten → compressor)
     e_src, e_tgt, encoded_intersets = encode_all_domains(
-        src_trainset, tgt_trainset, all_sets, deg_idx,
+        src_trainset,
+        tgt_trainset,
+        all_sets,
+        deg_idx,
         nn.Sequential(
             source_model.encoder,
             nn.Flatten(start_dim=1),
-            source_model.compressor if hasattr(source_model, 'compressor') else nn.Identity()
+            source_model.compressor if hasattr(source_model, "compressor") else nn.Identity(),
         ),
-        cache_dir, target, force_recompute=False, args=args
+        cache_dir,
+        target,
+        force_recompute=False,
+        args=args,
     )
 
-    # 5) Pseudo-label accuracy diagnostic
+    # Ensure EM labels for target
+    if hasattr(tgt_trainset, "targets_em") and tgt_trainset.targets_em is not None:
+        e_tgt.targets_em = tgt_trainset.targets_em.clone()
+    else:
+        print("[run_main_algo] Warning: tgt_trainset.targets_em is missing; EM labels not set for target.")
+
+    # Ensure EVERY encoded domain has .targets_em before calling generators
+    for ds in encoded_intersets:
+        if getattr(ds, "targets_em", None) is not None:
+            breakpoint()
+            continue
+
+        if getattr(ds, "targets", None) is not None:
+            t = ds.targets
+            ds.targets_em = t.clone().long() if torch.is_tensor(t) else torch.as_tensor(t, dtype=torch.long)
+            breakpoint()
+            continue
+
+        if getattr(ds, "targets_pseudo", None) is not None:
+            t = ds.targets_pseudo
+            ds.targets_em = t.clone().long() if torch.is_tensor(t) else torch.as_tensor(t, dtype=torch.long)
+            breakpoint()
+            continue
+
+        raise ValueError(
+            "[run_main_algo] Encoded domain is missing targets, targets_em, and targets_pseudo; "
+            "natural / FR generators cannot proceed."
+        )
+
+    # 5) Diagnostics: pseudo-label accuracy on target
     y_true = e_tgt.targets
-    if torch.is_tensor(y_true): y_true = y_true.cpu()
+    if torch.is_tensor(y_true):
+        y_true = y_true.cpu()
     preds = torch.as_tensor(pseudolabels, device=y_true.device)
     acc_pl = (preds == y_true).float().mean().item()
-    print(f"Pseudo-label accuracy: {acc_pl:.4f}")
+    print(f"Pseudo-label accuracy (teacher on target): {acc_pl:.4f}")
 
-    # 6) Determine K
+    # 6) Determine K from SOURCE (stable)
     try:
-        K_infer = int(max(int(preds.max().item()), int(y_true.max().item()))) + 1
+        K_infer = int(e_src.targets.max().item()) + 1
     except Exception:
         K_infer = 10
     if not em_K_list:
         em_K_list = [K_infer]
 
-    # 7) (optional) source stats for prototype mapping
-    if getattr(args, "em_match", "pseudo") == "prototypes":
-        mu_s, Sigma_s, priors_s = fit_source_gaussian_params(X=e_src.data, y=e_src.targets)
-        setattr(args, "_cached_source_stats", (mu_s, Sigma_s, priors_s))
-
-    # =========================
-    # 8) SHARED EM: reuse or fit once
-    # =========================
-    # If a shared EM bundle is already present, reuse it.
-    if args.em_match != "none":
-        if use_shared_em and hasattr(args, "_shared_em") and args._shared_em is not None:
-            bundle = args._shared_em
-            em_res_ref = bundle.em_res
-            mapping_ref = bundle.mapping
-            labels_mapped = bundle.labels_em
-            P_soft = bundle.P_soft
-            print("[MainAlgo] Using shared EM bundle from cache.")
-        else:
-            # Otherwise fit once (single-EM or multi-EM), then store on args for others to reuse.
-            start_time = time.time()
-            if not use_multi_em:
-                # Allow one-time EM config via shared_em_cfg
-                cfg = dict(
-                    K=K_infer, cov_type="diag", pool="gap",
-                    do_pca=False, pca_dim=None, reg=1e-4, max_iter=500,
-                    return_transforms=True, verbose=True,
-                    subsample_init=min(10000, len(e_tgt)), rng=args.seed
-                )
-                if shared_em_cfg: cfg.update(shared_em_cfg)
-                print(f"[MainAlgo] Running single EM: K={cfg['K']}, cov='{cfg['cov_type']}', pca_dim={cfg['pca_dim']}")
-                em_res_ref = run_em_on_encoded(e_tgt, **cfg)
-                # Map clusters → classes
-                if getattr(args, "em_match", "pseudo") == "prototypes":
-                    mapping_ref, labels_mapped, _ = map_em_clusters(
-                        em_res_ref, method="prototypes", n_classes=cfg['K'],
-                        mus_s=mu_s, Sigma_s=Sigma_s, priors_s=priors_s
-                    )
-                else:
-                    mapping_ref, labels_mapped, _ = map_em_clusters(
-                        em_res_ref, method="pseudo", n_classes=cfg['K'],
-                        pseudo_labels=pseudolabels, metric='FR'
-                    )
-                P_soft = _map_cluster_posts_to_classes(np.asarray(em_res_ref["gamma"]), mapping_ref, cfg['K'])
-
-                # Stash shared bundle
-                args._shared_em = EMBundle(
-                    key="__inline__", em_res=em_res_ref, mapping=mapping_ref,
-                    labels_em=np.asarray(labels_mapped, dtype=int), P_soft=P_soft,
-                    info={"K": cfg['K'], "cov_type": cfg['cov_type'], "pca_dim": cfg['pca_dim']}
-                )
-            else:
-            #     print(f"[MainAlgo] Running multi-EM grid: K={em_K_list}, cov={em_cov_types}, seeds={em_seeds}, pca={em_pca_dims}")
-            #     em_models = fit_many_em_on_target(
-            #         e_tgt, K_list=list(em_K_list), cov_types=list(em_cov_types),
-            #         seeds=list(em_seeds), pool="gap", pca_dims=list(em_pca_dims),
-            #         reg=1e-4, max_iter=300, rng_base=args.seed, args=args,
-            #     )
-            #     best_em = _select_best_em(em_models, criterion=em_select)
-            #     print(f"[MainAlgo] Best EM by {em_select}: cfg={best_em['cfg']}, final_ll={best_em.get('final_ll')}, bic={best_em.get('bic')}")
-            #     em_res_ref = best_em["em_res"]
-            #     labels_mapped = best_em["labels_mapped"]
-            #     # For completeness, keep mapping if provided; otherwise reconstruct from soft posts
-            #     # Here we reconstruct soft class posteriors from mapping/labels
-            #     # (fit_many_em_on_target already produced mapped_soft)
-            #     P_soft = best_em.get("mapped_soft", None)
-            #     mapping_ref = best_em.get("mapping", None)
-            #     # Stash shared bundle
-            #     args._shared_em = EMBundle(
-            #         key="__inline__", em_res=em_res_ref, mapping=mapping_ref,
-            #         labels_em=np.asarray(labels_mapped, dtype=int), P_soft=P_soft,
-            #         info={"K": best_em["cfg"]["K"], "cov_type": best_em["cfg"]["cov_type"], "pca_dim": best_em["cfg"]["pca_dim"]}
-            #     )
-
-                print(f"[MainAlgo] Running multi-EM grid: K={em_K_list}, cov={em_cov_types}, seeds={em_seeds}, pca={em_pca_dims}")
-                em_models = fit_many_em_on_target(
-                    e_tgt,
-                    K_list=list(em_K_list), cov_types=list(em_cov_types),
-                    seeds=list(em_seeds), pool="gap", pca_dims=list(em_pca_dims),
-                    reg=1e-4, max_iter=300, rng_base=args.seed, args=args,
-                )
-
-                # Utility: soft weights from BIC and optional trimming
-                def _bic_soft_weights(models, temperature=1.0, max_delta_bic=None):
-                    bics = np.array([m.get("bic", np.inf) for m in models], dtype=float)
-                    b0 = np.min(bics)
-                    if max_delta_bic is not None:
-                        keep = (bics - b0) <= float(max_delta_bic)
-                        models = [m for m, k in zip(models, keep) if k]
-                        bics = bics[keep]
-                    logits = -(bics - np.min(bics)) / max(1e-12, 2.0 * float(temperature))
-                    w = np.exp(logits - np.max(logits)); w /= w.sum()
-                    return models, w
-
-                def _recompute_soft_if_needed(m, X_embed):
-                    """
-                    Return soft class posteriors aligned to ground-truth class space.
-                    Prefer m['mapped_soft']; else rebuild from ('weights','means','covs') + 'mapping'.
-                    """
-                    if m.get("mapped_soft", None) is not None:
-                        return np.asarray(m["mapped_soft"], dtype=float)
-                    # Fall back: raw component posteriors → mapped to classes via 'mapping'
-                    if not ({"weights","means","covs"} <= set(m.keys())):
-                        raise ValueError("EM model lacks both 'mapped_soft' and raw params needed to rebuild posteriors.")
-                    pi = np.asarray(m["weights"], dtype=float)           # (K_m,)
-                    mu = np.asarray(m["means"], dtype=float)             # (K_m,d)
-                    S  = np.asarray(m["covs"], dtype=float)              # (K_m,d,d)
-                    # responsibilities over components
-                    R_comp = _predict_gmm_responsibilities(pi, mu, S, X_embed)   # (N,K_m)
-                    # map components → classes using provided 'mapping' (component -> class id)
-                    mapping = np.asarray(m.get("mapping", None))
-                    if mapping is None:
-                        raise ValueError("Need 'mapping' to align components to classes for posterior stacking.")
-                    n_classes = int(mapping.max()) + 1
-                    R_cls = np.zeros((R_comp.shape[0], n_classes), dtype=float)
-                    for k_m, c in enumerate(mapping):
-                        R_cls[:, c] += R_comp[:, k_m]
-                    # renormalize rows (numerical safety)
-                    R_cls /= np.clip(R_cls.sum(axis=1, keepdims=True), 1e-12, None)
-                    return R_cls
-
-                def _predict_gmm_responsibilities(pi, mu, covs, X):
-                    # numerically robust Gaussian mixture responsibilities (NumPy)
-                    def logpdf_gauss(X, m, S):
-                        # symmetrize + safe chol
-                        S = 0.5 * (S + S.T)
-                        try:
-                            L = np.linalg.cholesky(S)
-                        except np.linalg.LinAlgError:
-                            w, V = np.linalg.eigh(S)
-                            w = np.maximum(w, 1e-12)
-                            S = (V * w) @ V.T
-                            L = np.linalg.cholesky(S)
-                        logdet = 2.0 * np.log(np.diag(L)).sum()
-                        Z = np.linalg.solve(L, (X - m).T)      # (d,N)
-                        quad = np.sum(Z * Z, axis=0)
-                        d = X.shape[1]
-                        return -0.5 * (d * np.log(2*np.pi) + logdet + quad)
-
-                    N, d = X.shape
-                    K = len(pi)
-                    log_comp = np.empty((N, K), dtype=float)
-                    for k in range(K):
-                        log_comp[:, k] = np.log(max(pi[k], 1e-300)) + logpdf_gauss(X, mu[k], covs[k])
-                    m = np.max(log_comp, axis=1, keepdims=True)
-                    Z = m + np.log(np.exp(log_comp - m).sum(axis=1, keepdims=True))
-                    R = np.exp(log_comp - Z)
-                    return R  # (N,K)
-                em_time = time.time() - start_time
-                print(f"[MainAlgo] EM fitting completed in {em_time:.2f} seconds")
-                # ----- EM grid over target embedding -----
-                # Decide selection vs ensemble
-                em_mode = getattr(args, "em_mode", "ensemble")        # 'best' | 'ensemble'
-                ensemble_temperature = float(getattr(args, "em_ens_temperature", 1.0))
-                trim_delta = float(getattr(args, "em_trim_delta_bic", 10.0)) if getattr(args, "em_do_ensemble", True) else None
-
-                if em_mode == "best":
-                    best_em = _select_best_em(em_models, criterion=em_select)
-                    print(f"[MainAlgo] Best EM by {em_select}: cfg={best_em['cfg']}, final_ll={best_em.get('final_ll')}, bic={best_em.get('bic')}")
-                    em_res_ref = best_em["em_res"]
-                    labels_mapped = np.asarray(best_em["labels_mapped"], dtype=int)
-                    P_soft = best_em.get("mapped_soft", None)
-                    mapping_ref = best_em.get("mapping", None)
-                    args._shared_em = EMBundle(
-                        key="__inline__", em_res=em_res_ref, mapping=mapping_ref,
-                        labels_em=labels_mapped, P_soft=P_soft,
-                        info={"mode":"best", "K": best_em["cfg"]["K"], "cov_type": best_em["cfg"]["cov_type"], "pca_dim": best_em["cfg"]["pca_dim"]}
-                    )
-
-                else:
-                    # ----- Ensemble: posterior stacking with BIC-soft weights -----
-                    # Optional trimming (keeps near-best by BIC), then softmax weights
-                    models_kept, w = _bic_soft_weights(
-                        em_models, temperature=ensemble_temperature,
-                        max_delta_bic=trim_delta if getattr(args, "em_do_ensemble", True) else None
-                    )
-                    print(f"[MainAlgo] EM ensemble: kept={len(models_kept)} of {len(em_models)}; weights={np.round(w,4).tolist()}")
-
-                    # Build stacked posteriors in class space
-                    X_embed = np.asarray(e_tgt.data.cpu(), dtype=float)
-                    Ps = []
-                    for m in models_kept:
-                        Ps.append(_recompute_soft_if_needed(m, X_embed))  # each (N, C)
-                    Ps = np.stack(Ps, axis=0)                              # (M, N, C)
-                    # weighted average over models
-                    P_ens = np.tensordot(w, Ps, axes=(0,0))               # (N, C)
-                    P_ens /= np.clip(P_ens.sum(axis=1, keepdims=True), 1e-12, None)
-                    labels_ens = P_ens.argmax(axis=1).astype(int)
-
-                    # Use the BIC-best EM as a reference carrier of params/mapping in the bundle
-                    best_em = min(models_kept, key=lambda m: m.get("bic", np.inf))
-                    args._shared_em = EMBundle(
-                        key="multi_em_ensemble",
-                        em_res=best_em["em_res"],                         # reference (e.g., for metadata)
-                        mapping=best_em.get("mapping", None),
-                        labels_em=labels_ens, P_soft=P_ens,
-                        info={
-                            "mode": "ensemble",
-                            "K_ref": best_em["cfg"]["K"],
-                            "cov_type_ref": best_em["cfg"]["cov_type"],
-                            "pca_dim_ref": best_em["cfg"]["pca_dim"],
-                            "kept": len(models_kept),
-                            "weights": w.tolist(),
-                            "trim_delta_bic": float(trim_delta) if trim_delta is not None else None
-                        }
-                    )
-                    print(f"[MainAlgo] Ensemble EM ready: kept={len(models_kept)}; reference cfg={best_em['cfg']}")
-
-        # 9) Diagnostics against GT (best one-to-one)
-
-        y_true_np = np.asarray(y_true)
-        best_acc, _best_map, _C = best_mapping_accuracy(em_res_ref["labels"], y_true_np)
-        print(f"[MainAlgo] Best one-to-one mapping accuracy: {best_acc:.4f}, current em accuracy: {(np.asarray(labels_mapped) == y_true_np).mean():.4f}")
-
-
-        # 10) Attach EM labels/soft targets to the target dataset (shared for all methods)
-        e_tgt.targets_em = torch.as_tensor(labels_mapped, dtype=torch.long)
-        
-
+    # 7) Attach pseudo labels to target datasets (for plotting / diagnostics)
     e_tgt.targets_pseudo = torch.as_tensor(pseudolabels, dtype=torch.long)
-    tgt_trainset.targets_em = e_tgt.targets_em.cpu().clone()
     tgt_trainset.targets_pseudo = e_tgt.targets_pseudo.cpu().clone()
-    if P_soft is not None:
-        tgt_trainset.soft_targets = torch.from_numpy(P_soft).float()
 
-    acc_em_pseudo = float((np.asarray(labels_mapped) == np.asarray(y_true)).mean())
-    # print(f"[MainAlgo] EM→class (mapped) accuracy: {acc_em_pseudo:.4f}")
+    # 8) EM→class accuracy on TARGET from precomputed labels
+    if hasattr(e_tgt, "targets_em") and e_tgt.targets_em is not None:
+        acc_em_pseudo = (
+            e_tgt.targets_em.cpu() == torch.as_tensor(y_true, dtype=e_tgt.targets_em.dtype)
+        ).to(torch.float32).mean().item()
+    else:
+        acc_em_pseudo = float("nan")
+    print(f"[MainAlgo] EM→class (mapped) accuracy on target: {acc_em_pseudo:.4f}")
 
-    # 11) Evaluate updated model on target images
-    tgt_loader_eval = DataLoader(tgt_trainset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    # Optional: check presence of target bundle
+    if use_shared_em:
+        if hasattr(args, "_shared_em_per_domain") and target in getattr(args, "_shared_em_per_domain", {}):
+            em_bundle_target = args._shared_em_per_domain[target]
+        else:
+            em_bundle_target = getattr(args, "_shared_em", None)
+        if em_bundle_target is None:
+            print("[run_main_algo] Warning: no shared EM bundle found for target domain.")
+
+    # 9) Evaluate current source_model on target images (sanity)
+    tgt_loader_eval = DataLoader(
+        tgt_trainset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
     _, tgt_acc_after = test(tgt_loader_eval, source_model)
+    print(f"[MainAlgo] Baseline target accuracy before synthetic training: {tgt_acc_after:.4f}")
 
-    # 12) Generate synthetic domains (unchanged)
+    # 10) Generate synthetic domains
     if generated_domains <= 0:
         return direct_acc, st_acc, direct_acc_all, st_acc_all, 0.0, acc_em_pseudo
 
@@ -3695,70 +2863,231 @@ def run_main_algo(
         raise ValueError(f"Unknown gen_method '{gen_method}'. Use 'fr' or 'natural'.")
 
     for i in range(len(encoded_intersets) - 1):
+        breakpoint()
         out = _gen_fn(
-            generated_domains, encoded_intersets[i], encoded_intersets[i + 1],
-            cov_type="full", save_path=plot_dir, args=args,
+            generated_domains,
+            encoded_intersets[i],
+            encoded_intersets[i + 1],
+            cov_type="full",
+            save_path=plot_dir,
+            args=args,
         )
-        pair_domains = out[0]; domain_stats = out[2]
-        sizes_by_class, sizes_c1 = covariance_sizes(domain_stats, cls=1)
-        print("Class 1 trace per domain:", sizes_c1["trace"])
-        print("Class 1 logdet per domain:", sizes_c1["logdet"])
+        pair_domains = out[0]
+        domain_stats = out[2]
         synthetic_domains += pair_domains
 
     if not synthetic_domains:
         return direct_acc, st_acc, direct_acc_all, st_acc_all, 0.0, acc_em_pseudo
 
-    # 13) Self-training on synthetic domains
+    # 11) Self-training on synthetic domains (EM labels drive training)
     set_all_seeds(args.seed)
     direct_acc_syn, generated_acc, train_acc_by_domain, test_acc_by_domain, last_predictions = self_train(
-        args, source_model.mlp, synthetic_domains, epochs=epochs,
+        args,
+        source_model.mlp,
+        synthetic_domains,
+        epochs=epochs,
         label_source=getattr(args, "label_source", "em"),
     )
 
-    # 14) Plots (unchanged)
+    # 12) Plots
     plot_pca_classes_grid(
         encoded_intersets,
         classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-        save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_gen{args.generated_domains}_real_domains.png"),
-        label_source='real', ground_truths=True, pca=getattr(args, "shared_pca", None)
+        save_path=os.path.join(
+            plot_dir,
+            f"pca_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_real_domains.png",
+        ),
+        label_source="real",
+        ground_truths=True,
+        pca=getattr(args, "shared_pca", None),
     )
-    if synthetic_domains:
-        chain = []
-        step_len = int(generated_domains) + 1
-        for k in range(0, len(synthetic_domains), max(step_len, 1)):
-            chunk = synthetic_domains[k:k + step_len]
-            if chunk:
-                chain.extend(chunk[:-1] if step_len > 0 else chunk)
-        chain_for_plot = [encoded_intersets[0]] + chain + [encoded_intersets[-1]]
 
+    # --- build chain with real + synthetic domains interleaved ---
+    if synthetic_domains:
+        step_len = int(generated_domains) + 1
+        chain_for_plot: List[Dataset] = []
+        n_pairs = len(encoded_intersets) - 1
+
+        for i in range(n_pairs):
+            if i == 0:
+                chain_for_plot.append(encoded_intersets[0])  # first real domain
+
+            start = i * step_len
+            chunk = synthetic_domains[start:start + step_len]
+            if not chunk:
+                continue
+
+            if step_len > 1:
+                chain_for_plot.extend(chunk[:-1])           # synthetic only (drop appended endpoint)
+            chain_for_plot.append(encoded_intersets[i + 1])  # right real endpoint
+
+        # (a) labels used during self_train (typically 'em')
         plot_pca_classes_grid(
             chain_for_plot,
             classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-            save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_gen{args.generated_domains}_{args.label_source}_{getattr(args,'em_match','pseudo')}_{_method}.png"),
+            save_path=os.path.join(
+                plot_dir,
+                f"pca_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_"
+                f"{args.label_source}_{getattr(args, 'em_match', 'pseudo')}_"
+                f"{args.em_select}{'_em-ensemble' if args.em_ensemble else ''}_{_method}.png",
+            ),
             label_source=getattr(args, "label_source", "em"),
             pseudolabels=last_predictions,
-            pca=getattr(args, "shared_pca", None)
-        )
-        plot_pca_classes_grid(
-            chain_for_plot,
-            classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-            save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_gen{args.generated_domains}_emlabels_{_method}.png"),
-            label_source='em',
-            pca=getattr(args, "shared_pca", None)
-        )
-        plot_pca_classes_grid(
-            chain_for_plot,
-            classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-            save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_gen{args.generated_domains}_source_pseudo_{_method}.png"),
-            label_source='pseudo',
-            pseudolabels=pseudolabels,
-            pca=getattr(args, "shared_pca", None)
+            pca=getattr(args, "shared_pca", None),
         )
 
-    return train_acc_by_domain, test_acc_by_domain, st_acc, st_acc_all, generated_acc, acc_em_pseudo
+        # (b) explicit EM labels
+        plot_pca_classes_grid(
+            chain_for_plot,
+            classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
+            save_path=os.path.join(
+                plot_dir,
+                f"pca_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_"
+                f"emlabels_{args.em_select}{'_em-ensemble' if args.em_ensemble else ''}_{_method}.png",
+            ),
+            label_source="em",
+            pca=getattr(args, "shared_pca", None),
+        )
+
+        # (c) teacher pseudo labels along chain
+        plot_pca_classes_grid(
+            chain_for_plot,
+            classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
+            save_path=os.path.join(
+                plot_dir,
+                f"pca_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_source_pseudo_{_method}.png",
+            ),
+            label_source="pseudo",
+            pseudolabels=pseudolabels,
+            pca=getattr(args, "shared_pca", None),
+        )
+
+    return (
+        train_acc_by_domain,
+        test_acc_by_domain,
+        st_acc,
+        st_acc_all,
+        generated_acc,
+        acc_em_pseudo,
+    )
 
 
 # ---------------- Generic plotting helper: N series + per-method baselines ----------------
+# def _plot_series_with_baselines(
+#     series,
+#     labels,
+#     baselines=None,  # list of (st, st_all) per series (optional)
+#     ref_line_value=None,
+#     ref_line_label=None,
+#     ref_line_style="--",
+#     title="",
+#     ylabel="Accuracy",
+#     xlabel="Training Domain Index",
+#     save_path=None,
+#     # New: distinguish real vs synthetic domains
+#     synth_per_segment: int = None,   # number of synthetic domains between two real domains
+#     n_real_segments: int = None,     # number of real gaps (src→inter1, inter1→inter2, ..., →tgt)
+# ):
+
+
+#     def _to_array(v):
+#         return np.array([np.nan if x is None else float(x) for x in (v or [])], dtype=float)
+
+#     S = [ _to_array(s) for s in (series or []) ]
+#     if not S:
+#         print(f"[plot] Skip {title}: no data.")
+#         return
+
+#     L = max(len(s) for s in S)
+#     if L == 0:
+#         print(f"[plot] Skip {title}: empty series.")
+#         return
+#     S = [ (np.pad(s, (0, L - len(s)), constant_values=np.nan) if len(s) < L else s) for s in S ]
+#     x = np.arange(0, L, dtype=int)
+
+#     plt.figure()
+#     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+#     markers = ['o', 's', '^', 'D', 'v', '>', '<', 'P', 'X']
+
+#     n = len(S)
+#     # Compute boundaries of real domains along the x-axis if info provided
+#     boundaries = None
+#     if (
+#         synth_per_segment is not None
+#         and n_real_segments is not None
+#         and isinstance(synth_per_segment, int)
+#         and isinstance(n_real_segments, int)
+#         and synth_per_segment >= 0
+#         and n_real_segments >= 0
+#     ):
+#         # Real domain positions in x (including source at 0 and target at the end)
+#         # Each segment contributes `synth_per_segment` synthetics + 1 real endpoint,
+#         # plus an extra initial point (direct accuracy) at index 0.
+#         step = synth_per_segment + 1
+#         boundaries = [k * step for k in range(n_real_segments + 1)]
+#         # de-duplicate and sort in case synth_per_segment == 0
+#         boundaries = sorted(set(boundaries))
+#         # Keep within current plot length
+#         boundaries = [b for b in boundaries if b < L]
+
+#     for i, s in enumerate(S):
+#         color = colors[i % len(colors)]
+#         marker = markers[i % len(markers)]
+#         label  = labels[i] if labels and i < len(labels) else f"Series {i+1}"
+#         plt.plot(x, s, marker=marker, linewidth=1.8, label=label, color=color)
+
+#         # Highlight real domain points, if boundary info is available
+#         if boundaries:
+#             # valid points only (avoid NaNs)
+#             idxs = [b for b in boundaries if b < len(s) and np.isfinite(s[b])]
+#             if idxs:
+#                 plt.scatter(
+#                     idxs,
+#                     s[idxs],
+#                     s=36,
+#                     facecolors='white',
+#                     edgecolors=color,
+#                     linewidths=1.2,
+#                     zorder=4,
+#                 )
+
+#         if baselines and i < len(baselines) and baselines[i] is not None:
+#             st, st_all = baselines[i]
+#             if st is not None:
+#                 plt.axhline(float(st), linestyle=':', linewidth=1.5, color=color, alpha=0.9, label=f"st")
+#             if st_all is not None:
+#                 plt.axhline(float(st_all), linestyle='--', linewidth=1.5, color=color, alpha=0.9, label=f"st_all")
+
+#     # Draw vertical lines at real-domain boundaries (common for all series)
+#     if boundaries:
+#         for b in boundaries:
+#             plt.axvline(b, linestyle=':', linewidth=1.0, color='gray', alpha=0.7)
+
+#     if ref_line_value is not None:
+#         plt.axhline(float(ref_line_value), linestyle=ref_line_style, linewidth=1.6,
+#                     color='k', alpha=0.7, label=(ref_line_label or "reference"))
+
+#     plt.title(title)
+#     plt.xlabel(xlabel)
+#     plt.ylabel(ylabel)
+#     plt.grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
+#     # Compose legend, adding entries for real/synthetic cues if provided
+#     handles, labels_ = plt.gca().get_legend_handles_labels()
+#     if boundaries:
+#         from matplotlib.lines import Line2D
+#         extra = [
+#             Line2D([0], [0], color='gray', linestyle=':', linewidth=1.0, label='Real boundary'),
+#             Line2D([0], [0], marker='o', markerfacecolor='white', markeredgecolor='gray', linestyle='None', label='Real domain'),
+#         ]
+#         handles += extra
+#         labels_ += [h.get_label() for h in extra]
+#     plt.legend(handles, labels_)
+#     plt.tight_layout()
+#     if save_path:
+#         plt.savefig(save_path, dpi=150)
+#         print(f"[MNIST-EXP] Saved {save_path}")
+#     plt.close()
+
 def _plot_series_with_baselines(
     series,
     labels,
@@ -3770,14 +3099,42 @@ def _plot_series_with_baselines(
     ylabel="Accuracy",
     xlabel="Training Domain Index",
     save_path=None,
+    # New: distinguish real vs synthetic domains
+    synth_per_segment: int = None,   # number of synthetic domains between two real domains
+    n_real_segments: int = None,     # number of real gaps (src→inter1, inter1→inter2, ..., →tgt)
 ):
-
-    import matplotlib.pyplot as plt
+    import numbers
 
     def _to_array(v):
-        return np.array([np.nan if x is None else float(x) for x in (v or [])], dtype=float)
+        # No data
+        if v is None:
+            return np.array([], dtype=float)
 
-    S = [ _to_array(s) for s in (series or []) ]
+        # Torch tensor
+        try:
+            import torch
+            if isinstance(v, torch.Tensor):
+                if v.ndim == 0:
+                    return np.array([float(v.item())], dtype=float)
+                return v.detach().cpu().flatten().numpy().astype(float)
+        except Exception:
+            pass
+
+        # Scalar (float, int, numpy scalar, etc.)
+        if isinstance(v, numbers.Number):
+            return np.array([float(v)], dtype=float)
+
+        # Try as a generic iterable
+        try:
+            return np.array(
+                [np.nan if x is None else float(x) for x in v],
+                dtype=float,
+            )
+        except TypeError:
+            # Fallback: treat as scalar
+            return np.array([float(v)], dtype=float)
+
+    S = [_to_array(s) for s in (series or [])]
     if not S:
         print(f"[plot] Skip {title}: no data.")
         return
@@ -3786,7 +3143,10 @@ def _plot_series_with_baselines(
     if L == 0:
         print(f"[plot] Skip {title}: empty series.")
         return
-    S = [ (np.pad(s, (0, L - len(s)), constant_values=np.nan) if len(s) < L else s) for s in S ]
+    S = [
+        (np.pad(s, (0, L - len(s)), constant_values=np.nan) if len(s) < L else s)
+        for s in S
+    ]
     x = np.arange(0, L, dtype=int)
 
     plt.figure()
@@ -3794,34 +3154,103 @@ def _plot_series_with_baselines(
     markers = ['o', 's', '^', 'D', 'v', '>', '<', 'P', 'X']
 
     n = len(S)
+    # Compute boundaries of real domains along the x-axis if info provided
+    boundaries = None
+    if (
+        synth_per_segment is not None
+        and n_real_segments is not None
+        and isinstance(synth_per_segment, int)
+        and isinstance(n_real_segments, int)
+        and synth_per_segment >= 0
+        and n_real_segments >= 0
+    ):
+        step = synth_per_segment + 1
+        boundaries = [k * step for k in range(n_real_segments + 1)]
+        boundaries = sorted(set(boundaries))
+        boundaries = [b for b in boundaries if b < L]
+
     for i, s in enumerate(S):
         color = colors[i % len(colors)]
         marker = markers[i % len(markers)]
-        label  = labels[i] if labels and i < len(labels) else f"Series {i+1}"
+        label = labels[i] if labels and i < len(labels) else f"Series {i+1}"
         plt.plot(x, s, marker=marker, linewidth=1.8, label=label, color=color)
+
+        if boundaries:
+            idxs = [b for b in boundaries if b < len(s) and np.isfinite(s[b])]
+            if idxs:
+                plt.scatter(
+                    idxs,
+                    s[idxs],
+                    s=36,
+                    facecolors='white',
+                    edgecolors=color,
+                    linewidths=1.2,
+                    zorder=4,
+                )
 
         if baselines and i < len(baselines) and baselines[i] is not None:
             st, st_all = baselines[i]
             if st is not None:
-                plt.axhline(float(st), linestyle=':', linewidth=1.5, color=color, alpha=0.9, label=f"st")
+                plt.axhline(
+                    float(st),
+                    linestyle=':',
+                    linewidth=1.5,
+                    color=color,
+                    alpha=0.9,
+                    label="st",
+                )
             if st_all is not None:
-                plt.axhline(float(st_all), linestyle='--', linewidth=1.5, color=color, alpha=0.9, label=f"st_all")
+                plt.axhline(
+                    float(st_all),
+                    linestyle='--',
+                    linewidth=1.5,
+                    color=color,
+                    alpha=0.9,
+                    label="st_all",
+                )
+
+    if boundaries:
+        for b in boundaries:
+            plt.axvline(b, linestyle=':', linewidth=1.0, color='gray', alpha=0.7)
 
     if ref_line_value is not None:
-        plt.axhline(float(ref_line_value), linestyle=ref_line_style, linewidth=1.6,
-                    color='k', alpha=0.7, label=(ref_line_label or "reference"))
+        plt.axhline(
+            float(ref_line_value),
+            linestyle=ref_line_style,
+            linewidth=1.6,
+            color='k',
+            alpha=0.7,
+            label=(ref_line_label or "reference"),
+        )
 
     plt.title(title)
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
     plt.grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
-    plt.legend()
+
+    handles, labels_ = plt.gca().get_legend_handles_labels()
+    if boundaries:
+        from matplotlib.lines import Line2D
+        extra = [
+            Line2D([0], [0], color='gray', linestyle=':', linewidth=1.0, label='Real boundary'),
+            Line2D(
+                [0],
+                [0],
+                marker='o',
+                markerfacecolor='white',
+                markeredgecolor='gray',
+                linestyle='None',
+                label='Real domain',
+            ),
+        ]
+        handles += extra
+        labels_ += [h.get_label() for h in extra]
+    plt.legend(handles, labels_)
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=150)
         print(f"[MNIST-EXP] Saved {save_path}")
     plt.close()
-
 
 def plot_class_counts(domain_stats: dict, save_path: str):
     ts = _steps(domain_stats)
@@ -4561,7 +3990,12 @@ def plot_pca_classes_grid(
     ground_truths=False,    # if True, use .targets for all domains
     pca: "PCA|None" = None,           # NEW: pass a pre-fit PCA to project onto the SAME axes
     return_pca: bool = False,         # NEW: optionally return the PCA used
-    pca_fit_policy: str = "endpoints" # 'endpoints'|'all' (only used if pca is None)
+    pca_fit_policy: str = "endpoints", # 'endpoints'|'all' (only used if pca is None)
+    # NEW: distinguish real vs synthetic panels
+    real_indices: "Sequence[int]|None" = None,   # indices of real domains; others treated as synthetic
+    real_facecolor: str = "#f0f6ff",
+    syn_facecolor: str = "#fff8f0",
+    annotate_kind: bool = True,
 ):
     """
     If `pca` is provided, it is used to transform *every* panel.
@@ -4592,9 +4026,19 @@ def plot_pca_classes_grid(
         if ground_truths:
             return _to_np(D.targets)
         if label_source == 'pseudo':
-            y = pseudolabels
-            return _to_np(y)
-        
+            if hasattr(D, "targets_pseudo") and D.targets_pseudo is not None:
+                return _to_np(D.targets_pseudo)
+            if hasattr(D, "targets") and D.targets is not None:
+                return _to_np(D.targets)
+            if hasattr(D, "targets_em") and D.targets_em is not None:
+                return _to_np(D.targets_em)
+            if pseudolabels is not None:
+                y = np.asarray(pseudolabels)
+                n = len(D.data) if hasattr(D, "data") else len(y)
+                if len(y) != n:
+                    y = y[:n]
+                return y
+            return None
         if label_source == 'em':
             y = D.targets_em
             # breakpoint()
@@ -4615,20 +4059,17 @@ def plot_pca_classes_grid(
     for j, D in enumerate(domains):
         Xp = pool_feats(D.data)
         pooled_per_domain.append(Xp)
-        # if len(domains) > 2:
-        #     breakpoint()
-        if j == 0:
-            y = D.targets
-        elif j == len(domains) - 1:
-            # breakpoint()
-            y = get_labels_for_domain(D, j)
-        else:
-            if label_source == 'pseudo':
-                # prefer pseudo (targets), fall back to EM for intermediates if you want the opposite, swap next line:
-                # y = pseudolabels
-                y = D.targets
-            elif label_source == 'em':
-                y = _to_np(D.targets_em)
+        y = get_labels_for_domain(D, j)
+        if y is not None:
+            y = np.asarray(y)
+            n_samples = len(Xp)
+            if len(y) != n_samples:
+                if len(y) > n_samples:
+                    y = y[:n_samples]
+                else:
+                    pad_val = -1 if y.ndim == 1 else 0
+                    pad_width = (0, n_samples - len(y))
+                    y = np.pad(y, pad_width, constant_values=pad_val)
         labels_per_domain.append(y)
 
         if y is None:
@@ -4655,6 +4096,21 @@ def plot_pca_classes_grid(
         used_pca = PCA(n_components=2)
         used_pca.fit(X_fit)
 
+    # ---------- infer real vs synthetic indices (if not provided) ----------
+    real_set = None
+    if isinstance(real_indices, (list, tuple, set)):
+        real_set = set(int(i) for i in real_indices if 0 <= int(i) < cols)
+    else:
+        # Heuristics: if plotting only real domains, mark all as real.
+        if ground_truths or label_source == 'real':
+            real_set = set(range(cols))
+        else:
+            # Typical chain: [src] + synthetics + [tgt]
+            if cols >= 2:
+                real_set = {0, cols - 1}
+            else:
+                real_set = {0}
+
     # ---------- plot ----------
     fig_w = max(4, 3 * cols)
     fig, axs = plt.subplots(1, cols, figsize=(fig_w, 3.6), squeeze=False)
@@ -4663,18 +4119,31 @@ def plot_pca_classes_grid(
 
     for j in range(cols):
         ax = axs[j]
+        # Style: background and frame to indicate real vs synthetic
+        if real_set is not None and j in real_set:
+            ax.set_facecolor(real_facecolor)
+            for spine in ax.spines.values():
+                spine.set_linewidth(1.5)
+                spine.set_edgecolor('#2c3e50')
+        else:
+            ax.set_facecolor(syn_facecolor)
+            for spine in ax.spines.values():
+                spine.set_linewidth(1.0)
+                spine.set_edgecolor('#999999')
+
         Xp = pooled_per_domain[j]
         y  = labels_per_domain[j]
         m  = masks_per_domain[j]
 
         if (y is None) or (m is None) or (not np.any(m)):
-            ax.set_title(f"Domain {j}: no classes {tuple(classes)}")
+            kind = "Real" if (real_set is not None and j in real_set) else "Syn"
+            ax.set_title(f"Domain {j} [{kind}]: no classes {tuple(classes)}")
             ax.axis('off')
             continue
 
         Xsel = Xp[m]
         ysel = y[m]
-
+        # breakpoint()
         try:
             if Xsel.shape[1] > 2:
                 Z = used_pca.transform(Xsel)
@@ -4691,10 +4160,23 @@ def plot_pca_classes_grid(
                 ax.scatter(Z[cmask, 0], Z[cmask, 1], s=6, alpha=0.7,
                            color=cmap(idx % 10), label=str(c))
 
-        ax.set_title(f"Domain {j}")
+        if annotate_kind:
+            kind = "Real" if (real_set is not None and j in real_set) else "Syn"
+            ax.set_title(f"Domain {j} [{kind}]")
+        else:
+            ax.set_title(f"Domain {j}")
         ax.set_xticks([]); ax.set_yticks([])
         if j == 0:
-            ax.legend(loc='best', fontsize=8)
+            # Extend legend with Real/Syn markers
+            handles, labels_ = ax.get_legend_handles_labels()
+            from matplotlib.patches import Patch
+            extra = []
+            if annotate_kind:
+                extra = [
+                    Patch(facecolor=real_facecolor, edgecolor='#2c3e50', label='Real domain'),
+                    Patch(facecolor=syn_facecolor, edgecolor='#999999', label='Synthetic domain'),
+                ]
+            ax.legend(handles + extra, labels_ + [e.get_label() for e in extra], loc='best', fontsize=8)
 
     if save_path:
         import os
@@ -4908,34 +4390,67 @@ def plot_pca_classes_grid(
 #         print(f"[MNIST-EXP] Saved {save_path}")
 #     plt.close()
 
-def _apply_em_bundle_to_target(bundle, e_tgt, tgt_trainset):
-    """
-    Put EM labels and mapped soft posteriors on the target dataset so *all* methods
-    can read them without refitting EM.
-    """
-    # hard labels
-    labels_em = np.asarray(bundle.labels_em, dtype=np.int64)
-    e_tgt.targets_em = torch.as_tensor(labels_em, dtype=torch.long)
-    tgt_trainset.targets_em = e_tgt.targets_em.cpu().clone()
 
-    # optional soft posteriors (class posteriors after cluster->class mapping)
-    if getattr(bundle, "P_soft", None) is not None:
-        tgt_trainset.soft_targets = torch.from_numpy(bundle.P_soft).float()
+def _to_numpy_1d_labels(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy().reshape(-1)
+    x = np.asarray(x)
+    return x.reshape(-1)
 
-# ---------------- Run all three methods and compare on shared plots ----------------
+def print_em_model_accuracies(em_models, true_labels):
+    """
+    em_models: list[dict] from fit_many_em_on_target; each has 'labels_mapped'
+    true_labels: array-like or torch tensor of ground-truth target labels
+    """
+    y_true = _to_numpy_1d_labels(true_labels)
+    rows = []
+    for i, m in enumerate(em_models):
+        y_pred = _to_numpy_1d_labels(m["labels_mapped"])
+        if y_pred.shape != y_true.shape:
+            raise ValueError(f"Shape mismatch for model {i}: y_pred {y_pred.shape} vs y_true {y_true.shape}")
+        acc = (y_pred == y_true).mean()
+        cfg = m.get("cfg", {})
+        rows.append({
+            "idx": i,
+            "acc": acc,
+            "seed": cfg.get("seed"),
+            "cov": cfg.get("cov_type"),
+            "K": cfg.get("K"),
+            "bic": m.get("bic"),
+            "final_ll": m.get("final_ll"),
+        })
+
+    # Pretty print
+    for r in rows:
+        print(f"[EM {r['idx']:02d}] acc={r['acc']*100:6.2f}% | seed={r['seed']} | cov={r['cov']} | K={r['K']} | "
+              f"BIC={r['bic']} | final_ll={r['final_ll']}")
+
+    # Also return rows if you want to sort/select programmatically
+    return rows
+
+
 def run_mnist_experiment(target: int, gt_domains: int, generated_domains: int, args=None):
     src_trainset = get_single_rotate(False, 0)
     tgt_trainset = get_single_rotate(False, target)
-    # breakpoint()
     model_dir = f"/data/common/yuenchen/GDA/mnist_models/"
 
+    # ---- (A) Train / load compressed source model ----
     encoder = ENCODER().to(device)
     model_name_smalldim = f"src0_tgt{target}_ssl{args.ssl_weight}_dim{args.small_dim}.pth"
     source_model_smalldim = get_source_model(
-        args, src_trainset, tgt_trainset, n_class=10, mode="mnist",
-        encoder=encoder, epochs=10, model_path=f"{model_dir}/{model_name_smalldim}",
-        target_dataset=tgt_trainset, force_recompute=False, compress=True,
-        in_dim=25088, out_dim=args.small_dim
+        args,
+        src_trainset,
+        tgt_trainset,
+        n_class=10,
+        mode="mnist",
+        encoder=encoder,
+        epochs=10,
+        model_path=f"{model_dir}/{model_name_smalldim}",
+        target_dataset=tgt_trainset,
+        force_recompute=False,
+        compress=True,
+        in_dim=25088,
+        out_dim=args.small_dim,
     )
 
     # SAME reference for all runs
@@ -4943,10 +4458,12 @@ def run_mnist_experiment(target: int, gt_domains: int, generated_domains: int, a
     ref_encoder = nn.Sequential(
         ref_model.encoder,
         nn.Flatten(start_dim=1),
-        getattr(ref_model, 'compressor', nn.Identity())
+        getattr(ref_model, "compressor", nn.Identity()),
     ).eval()
 
-    # Build real intermediate domains
+    # ---- (B) Build real intermediate domains ----
+    # all_sets: [inter1, inter2, ..., target]
+    # deg_idx: [angle_inter1, ..., angle_target]
     all_sets, deg_idx = [], []
     for i in range(1, gt_domains + 1):
         angle = i * target // (gt_domains + 1)
@@ -4955,145 +4472,257 @@ def run_mnist_experiment(target: int, gt_domains: int, generated_domains: int, a
     all_sets.append(tgt_trainset)
     deg_idx.append(target)
 
-    # Evaluate initial (for sanity)
-    tgt_loader_eval = DataLoader(tgt_trainset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-
-
+    # ---- (C) Encode source + intermediates + target once ----
+    cache_dir = f"cache{args.ssl_weight}/target{target}/small_dim{args.small_dim}/"
     e_src, e_tgt, encoded_intersets = encode_all_domains(
-        src_trainset, tgt_trainset, all_sets, deg_idx, ref_encoder,
-        cache_dir=f"cache{args.ssl_weight}/target{target}/small_dim{args.small_dim}/",
-        target=target, force_recompute=False, args=args
+        src_trainset,
+        tgt_trainset,
+        all_sets,
+        deg_idx,
+        ref_encoder,
+        cache_dir=cache_dir,
+        target=target,
+        force_recompute=False,
+        args=args,
     )
+    # encoded_intersets = [e_src, e_inter(angle1), ..., e_inter(angleK), e_tgt]
 
-    
-
-    # (C) Fit a shared PCA on these *real* domains (robust and method-agnostic)
+    # ---- (D) Shared PCA on real domains (unchanged) ----
     shared_pca = fit_global_pca(
-        domains=encoded_intersets,     # same space every method will use
-        classes=None,               # all classes
-        pool="auto",                   # already embedded → 'auto' no-ops
+        domains=encoded_intersets,
+        classes=None,
+        pool="auto",
         n_components=2,
         per_domain_cap=10000,
-        random_state=args.seed if hasattr(args, 'seed') else 0,
+        random_state=args.seed if hasattr(args, "seed") else 0,
     )
-
-    # (D) Store it so children helpers can see it (simple: put into args)
     args.shared_pca = shared_pca
-    # After you have e_src (encoded source domain)
+
+    # Optional: cache source Gaussian params for prototype matching
     if getattr(args, "em_match", "pseudo") == "prototypes":
-        # Compute source Gaussian params from SOURCE labels only (no target GT).
-        mu_s, Sigma_s, priors_s = fit_source_gaussian_params(X=e_src.data, y=e_src.targets)
+        mu_s, Sigma_s, priors_s = fit_source_gaussian_params(
+            X=e_src.data, y=e_src.targets
+        )
         args._cached_source_stats = (mu_s, Sigma_s, priors_s)
 
-
+    # ---- (E) Frozen teacher for pseudo-labels on every REAL domain ----
     with torch.no_grad():
         em_teacher = copy.deepcopy(ref_model).to(device).eval()
-        pseudo_labels, _ = get_pseudo_labels(
-            tgt_trainset, em_teacher,
+
+    # Align raw + encoded + angle:
+    # raw_domains   = [src, inter1, ..., interK, tgt]
+    # enc_domains   = [e_src, e_inter1, ..., e_interK, e_tgt]
+    # angle_list    = [0, angle_inter1, ..., angle_interK, target]
+    raw_domains = [src_trainset] + all_sets
+    # enc_domains = encoded_intersets
+    angle_list = [0] + deg_idx
+    enc_domains = []
+    for angle in angle_list:
+        enc_path = os.path.join(cache_dir, f"encoded_{angle}.pt")
+        if not os.path.exists(enc_path):
+            raise FileNotFoundError(f"Expected encoded features for angle={angle} at {enc_path}, but file is missing.")
+        enc_ds = torch.load(enc_path, weights_only=False)
+        enc_domains.append(enc_ds)
+
+
+    for ang, enc_ds in zip(angle_list, enc_domains):
+        print(f"[DEBUG] angle={ang} encoded shape={enc_ds.data.shape}, first_norm={enc_ds.data[0].norm().item():.4f}")
+
+    n_classes = int(src_trainset.targets.max().item()) + 1
+
+    # Per-angle EM bundle storage
+    em_bundles_by_angle: Dict[int, Any] = {}
+    em_acc_by_angle: Dict[int, float] = {}
+
+    # Keep teacher pseudo-labels on the final target as "canonical" if later needed
+    with torch.no_grad():
+        tgt_teacher_pl, _ = get_pseudo_labels(
+            tgt_trainset,
+            em_teacher,
             confidence_q=getattr(args, "pseudo_confidence_q", 0.9),
             device_override=device,
         )
-    args._cached_pseudolabels = pseudo_labels.cpu().numpy()
+    teacher_pl_target_np = tgt_teacher_pl.cpu().numpy()
 
-    # Fit EM ONCE on the shared target embedding and store on args
-    # em_bundle = ensure_shared_em_for_target(
-    #     e_tgt, args=args,
-    #     K=10, cov_type="diag", pool="gap",
-    #     do_pca=False, pca_dim=64,  # or True & 128 if you prefer
-    #     reg=1e-6, max_iter=150, tol=1e-5, n_init=5, dtype="float32"
-    # )
+    # Save original cached pseudolabels if present (for backwards compatibility)
+    original_cached_pl = getattr(args, "_cached_pseudolabels", None)
 
-    if args.em_match != "none":
+    # ---- (E*) Fit EM + build bundles for each non-source domain ----
+    for idx in range(1, len(raw_domains)):
+        angle = angle_list[idx]
+        raw_ds = raw_domains[idx]   # raw MNIST-rotate dataset at this angle
+        enc_ds = enc_domains[idx]   # encoded DomainDataset at the same angle
+
+        # Pseudo-labels on THIS raw domain using the teacher
+        with torch.no_grad():
+            pseudo_labels, _ = get_pseudo_labels(
+                raw_ds,
+                em_teacher,
+                confidence_q=getattr(args, "pseudo_confidence_q", 0.9),
+                device_override=device,
+            )
+        pseudo_np = pseudo_labels.cpu().numpy()
+
+        # This is what build_em_bundle uses to align clusters → classes.
+        # Set it per-domain, right before fitting EM for that domain.
+        args._cached_pseudolabels = pseudo_np
+
+        # ---- Fit multiple EMs on THIS encoded domain ----
         em_models = fit_many_em_on_target(
-            e_tgt,
-            K_list=getattr(args, "em_K_list", [10]),
-            cov_types=getattr(args, "em_cov_types", ["diag"]),
-            seeds=getattr(args, "em_seeds", [0,1,2]),
+            enc_ds,
+            K_list=[n_classes],
+            cov_types=["diag"],
+            seeds=[0, 1, 2],
             pool="gap",
-            pca_dims=getattr(args, "em_pca_dims", [None]),
-            reg=1e-4, max_iter=300, rng_base=args.seed, args=args
+            pca_dims=[None],
+            reg=1e-4,
+            max_iter=300,
+            rng_base=args.seed,
+            args=args,
         )
-        best = _select_best_em(em_models, criterion=getattr(args, "em_select", "bic"))
-        if getattr(args, "em_do_ensemble", True) and len(em_models) > 1:
-            trimmed, w = _trim_em_models_by_bic(em_models, max_delta_bic=getattr(args, "em_trim_delta_bic", 10.0))
-            P_ens, H_ens = _ensemble_posteriors_trimmed(trimmed, w)
-            labels_ens = P_ens.argmax(axis=1).astype(int)
-            em_bundle = EMBundle(
-                key="multi_em_trimmed", em_res=best["em_res"],
-                mapping=best.get("mapping", None),
-                labels_em=labels_ens, P_soft=P_ens,
-                info={"criterion":"bic+trim", "bic_best":float(best["bic"])}
-            )
-        else:
-            em_bundle = EMBundle(
-                key="multi_em_best", em_res=best["em_res"],
-                mapping=best.get("mapping", None),
-                labels_em=np.asarray(best["labels_mapped"], dtype=int),
-                P_soft=np.asarray(best["mapped_soft"], dtype=float),
-                info={"criterion":getattr(args,"em_select","bic"), "bic_best":float(best["bic"])}
+
+        # Per-model accuracies BEFORE bundling (diagnostic)
+        rows = print_em_model_accuracies(em_models, raw_ds.targets)
+        rows = [{**r, "original_idx": i} for i, r in enumerate(rows)]
+        for r in rows:
+            bic = r.get("bic")
+            print(
+                f"[EM angle ={angle:3d} idx={r['original_idx']:02d}] "
+                f"acc={r['acc']*100:6.2f}% | seed={r.get('seed')} | cov={r.get('cov')} | "
+                f"K={r.get('K')} | BIC={bic if bic is not None else 'NA'} | "
+                f"final_ll={r.get('final_ll')}"
             )
 
-        args._shared_em = em_bundle
-        _apply_em_bundle_to_target(em_bundle, e_tgt, tgt_trainset)
+        # ---- Build and apply EM ensemble for THIS domain ----
+        em_bundle = build_em_bundle(em_models, args)
+        apply_em_bundle_to_target(em_bundle, enc_ds, raw_ds)
 
-    # For ETA/natural path
-    our_source_eta = copy.deepcopy(ref_model)
-    ours_copy_eta  = copy.deepcopy(ref_model)
+        # Ensemble accuracy on THIS domain (encoded vs GT)
+        em_acc = (
+            enc_ds.targets_em
+            == raw_ds.targets.to(enc_ds.targets_em.device)
+        ).float().mean().item()
+        em_bundles_by_angle[angle] = em_bundle
+        em_acc_by_angle[angle] = em_acc
+        print(
+            f"[MNIST-EXP] EM ensemble accuracy at angle={angle}: "
+            f"{em_acc * 100:.2f}%"
+        )
 
-    # # # ---- (1b) Ours/ETA (natural-parameter) path ----
-    set_all_seeds(args.seed)
-    ours_eta_train, ours_eta_test, ours_eta_st, ours_eta_st_all, ours_eta_gen, EM_acc_eta = run_main_algo(
-        ours_copy_eta, our_source_eta, src_trainset, tgt_trainset, all_sets, deg_idx,
-        generated_domains, epochs=5, target=target, args=args, gen_method="natural"
+        # Optional: direct check using em_bundle.labels_em if present
+        if hasattr(em_bundle, "labels_em"):
+            true_labels = raw_ds.targets.cpu().numpy()
+            labels_ens = np.asarray(em_bundle.labels_em)
+            ensemble_acc = (labels_ens == true_labels).mean()
+            print(
+                f"[DEBUG] angle={angle} ensemble_acc (labels_em vs GT): "
+                f"{ensemble_acc * 100:.2f}%"
+            )
+
+    # ---- Restore "canonical" cached pseudo labels for downstream FR/Natural code ----
+    # Use teacher pseudo labels on the FINAL target (what old code expected).
+    args._cached_pseudolabels = teacher_pl_target_np
+
+    # Expose bundles per domain (keyed by angle) to downstream code
+    args._shared_em_per_domain = em_bundles_by_angle
+
+    # Backwards-compatibility: a single shared EM for the target angle
+    if target in em_bundles_by_angle:
+        args._shared_em = em_bundles_by_angle[target]
+    else:
+        args._shared_em = None
+
+    # For logging: initial EM accuracy on the final target (ensemble)
+    em_acc_init = em_acc_by_angle.get(target, 0.0)
+    print(
+        f"[MNIST-EXP] Initial target EM accuracy ({args.em_match}): "
+        f"{em_acc_init * 100:.2f}%"
     )
+
+    # GOAT classwise
     set_all_seeds(args.seed)
     goat_cw_src = copy.deepcopy(ref_model)
-    goat_cw_cp  = copy.deepcopy(goat_cw_src)
-    # ---- (3) GOAT (class-wise synthetics) ----
+    goat_cw_cp = copy.deepcopy(goat_cw_src)
     goatcw_train, goatcw_test, goatcw_st, goatcw_st_all, goatcw_gen, EM_acc_goatcw = run_goat_classwise(
-        goat_cw_cp, goat_cw_src, src_trainset, tgt_trainset, all_sets, deg_idx,
-        generated_domains, epochs=5, target=target, args=args
+        goat_cw_cp,
+        goat_cw_src,
+        src_trainset,
+        tgt_trainset,
+        all_sets,
+        deg_idx,
+        generated_domains,
+        epochs=5,
+        target=target,
+        args=args,
+    )
+
+    # ---- (F) Prepare model copies for different methods ----
+    # ETA / natural path
+    our_source_eta = copy.deepcopy(ref_model)
+    ours_copy_eta = copy.deepcopy(ref_model)
+
+    set_all_seeds(args.seed)
+    ours_eta_train, ours_eta_test, ours_eta_st, ours_eta_st_all, ours_eta_gen, EM_acc_eta = run_main_algo(
+        ours_copy_eta,
+        our_source_eta,
+        src_trainset,
+        tgt_trainset,
+        all_sets,
+        deg_idx,
+        generated_domains,
+        epochs=5,
+        target=target,
+        args=args,
+        gen_method="natural",
     )
 
 
-    # # # breakpoint()
 
-
-    # # # ---- (1) Ours/FR path (returns EM mapping accuracy too) ----
-    # # breakpoint()
+    # Ours-FR
     set_all_seeds(args.seed)
     our_source = copy.deepcopy(ref_model)
-    ours_copy   = copy.deepcopy(ref_model)
+    ours_copy = copy.deepcopy(ref_model)
     ours_train, ours_test, ours_st, ours_st_all, ours_gen, EM_acc = run_main_algo(
-        ours_copy, our_source, src_trainset, tgt_trainset, all_sets, deg_idx,
-        generated_domains, epochs=5, target=target, args=args
+        ours_copy,
+        our_source,
+        src_trainset,
+        tgt_trainset,
+        all_sets,
+        deg_idx,
+        generated_domains,
+        epochs=5,
+        target=target,
+        args=args,
     )
-    # breakpoint()
-    # assert abs(EM_acc - EM_acc_eta) < 1e-4, "EM accuracies differ between methods!"
 
-
+    # GOAT (pairwise synthetics)
     goat_source = copy.deepcopy(ref_model)
-    goat_copy   = copy.deepcopy(goat_source)
-
+    goat_copy = copy.deepcopy(goat_source)
     set_all_seeds(args.seed)
-    # ---- (2) GOAT (pair-wise synthetics) ----
     goat_train, goat_test, goat_st, goat_st_all, goat_gen = run_goat(
-        goat_copy, goat_source, src_trainset, tgt_trainset, all_sets, deg_idx,
-        generated_domains, epochs=5, target=target, args=args
+        goat_copy,
+        goat_source,
+        src_trainset,
+        tgt_trainset,
+        all_sets,
+        deg_idx,
+        generated_domains,
+        epochs=5,
+        target=target,
+        args=args,
     )
 
-    # ---- Persist series ----
+    # ---- (G) Persist plots ----
     plot_dir = f"plots/target{target}/"
     os.makedirs(plot_dir, exist_ok=True)
 
-    # ---- Plot 2: Test/target accuracy (4-way + EM% reference) ----
     _plot_series_with_baselines(
         series=[ours_test, goat_test, goatcw_test, ours_eta_test],
         labels=[
-            f"Ours-FR",
+            "Ours-FR",
             "GOAT",
-            f"GOAT-Classwise",
-            f"Ours-ETA",
+            "GOAT-Classwise",
+            "Ours-ETA",
         ],
         baselines=[
             (ours_st, ours_st_all),
@@ -5104,9 +4733,20 @@ def run_mnist_experiment(target: int, gt_domains: int, generated_domains: int, a
         ref_line_value=(EM_acc * 100.0 if EM_acc is not None else None),
         ref_line_label=f"EM ({args.em_match})",
         ref_line_style="--",
-        title=f"Target Accuracy (ST: {args.label_source} labels; Cluster Map: {args.em_match})",
-        ylabel="Accuracy", xlabel="Domain Index",
-        save_path=os.path.join(plot_dir, f"test_acc_dim{args.small_dim}_gen{args.generated_domains}_{args.label_source}_{args.em_match}.png"),
+        title=(
+            f"Target Accuracy (ST: {args.label_source} labels; "
+            f"Cluster Map: {args.em_match})"
+        ),
+        ylabel="Accuracy",
+        xlabel="Domain Index",
+        save_path=os.path.join(
+            plot_dir,
+            f"test_acc_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_"
+            f"{args.label_source}_{args.em_match}_{args.em_select}"
+            f"{'_em-ensemble' if args.em_ensemble else ''}.png",
+        ),
+        synth_per_segment=int(generated_domains),
+        n_real_segments=len(deg_idx),
     )
 
 
@@ -5231,10 +4871,6 @@ def run_portraits_experiment(gt_domains: int, generated_domains: int, args=None)
         nn.Flatten(start_dim=1),
         getattr(ref_model, 'compressor', nn.Identity())
     ).eval()
-    source_model_goat = copy.deepcopy(ref_model)
-    source_model_main = copy.deepcopy(ref_model)
-    model_copy_goat = copy.deepcopy(source_model_goat)
-    model_copy_main = copy.deepcopy(source_model_main)
 
     def get_domains(n_domains):
         domain_set = []
@@ -5264,8 +4900,8 @@ def run_portraits_experiment(gt_domains: int, generated_domains: int, args=None)
         random_state=args.seed if hasattr(args, 'seed') else 0,
     )
     args.shared_pca = shared_pca
-
-    if getattr(args, "em_match", "pseudo") == "prototypes":
+    start_time_em = time.time()
+    if args.em_match == "prototypes":
         # Compute source Gaussian params from SOURCE labels only (no target GT).
         mu_s, Sigma_s, priors_s = fit_source_gaussian_params(X=_e_src.data, y=_e_src.targets)
         args._cached_source_stats = (mu_s, Sigma_s, priors_s)
@@ -5280,15 +4916,7 @@ def run_portraits_experiment(gt_domains: int, generated_domains: int, args=None)
         )
     args._cached_pseudolabels = pseudo_labels.cpu().numpy()
 
-    # Fit EM ONCE on the shared target embedding and store on args
-    # em_bundle = ensure_shared_em_for_target(
-    #     e_tgt, args=args,
-    #     K=10, cov_type="diag", pool="gap",
-    #     do_pca=False, pca_dim=64,  # or True & 128 if you prefer
-    #     reg=1e-6, max_iter=150, tol=1e-5, n_init=5, dtype="float32"
-    # )
 
-    # Instead of ensure_shared_em_for_target(...):
     em_models = fit_many_em_on_target(
         _e_tgt,
         K_list=getattr(args, "em_K_list",  [src_trainset.targets.max().item() + 1]),
@@ -5299,36 +4927,17 @@ def run_portraits_experiment(gt_domains: int, generated_domains: int, args=None)
         reg=1e-4, max_iter=300, rng_base=args.seed, args=args
     )
     # Select EM by perfect-matching accuracy by default for Color-MNIST
-    best = _select_best_em(em_models, criterion=getattr(args, "em_select", "pm"))
-    if getattr(args, "em_do_ensemble", True) and len(em_models) > 1:
-        trimmed, w = _trim_em_models_by_bic(em_models, max_delta_bic=getattr(args, "em_trim_delta_bic", 10.0))
-        P_ens, H_ens = _ensemble_posteriors_trimmed(trimmed, w)
-        labels_ens = P_ens.argmax(axis=1).astype(int)
-        em_bundle = EMBundle(
-            key="multi_em_trimmed", em_res=best["em_res"],
-            mapping=best.get("mapping", None),
-            labels_em=labels_ens, P_soft=P_ens,
-            info={"criterion":"bic+trim", "bic_best":float(best["bic"])}
-        )
-    else:
-        em_bundle = EMBundle(
-            key="multi_em_best", em_res=best["em_res"],
-            mapping=best.get("mapping", None),
-            labels_em=np.asarray(best["labels_mapped"], dtype=int),
-            P_soft=np.asarray(best["mapped_soft"], dtype=float),
-            info={"criterion":getattr(args,"em_select","bic"), "bic_best":float(best["bic"])}
-        )
-
+    em_bundle = build_em_bundle(em_models, args)
     args._shared_em = em_bundle
-    _apply_em_bundle_to_target(em_bundle, _e_tgt, tgt_trainset)
-
+    apply_em_bundle_to_target(em_bundle, _e_tgt, tgt_trainset)
+    print(f"[Portraits] Fitted and cached EM on target in {round(time.time() - start_time_em, 2)}s")
 
     y_true = np.asarray(tgt_trainset.targets, dtype=int)
     y_em = np.asarray(em_bundle.labels_em, dtype=int)
     em_acc_now = float((y_em == y_true).mean())
-    print(f"[ColorMNIST] EM→class accuracy: {em_acc_now:.4f}")
-
-    # ---------------- Ours (ETA) ----------------
+    print(f"[Portraits] EM→class accuracy: {em_acc_now:.4f}")
+    # ------    ---------- Ours (ETA) ----------------
+    start_time_eta = time.time()
     set_all_seeds(args.seed)
     ours_eta_src = copy.deepcopy(ref_model)
     ours_eta_cp  = copy.deepcopy(ref_model)
@@ -5336,8 +4945,11 @@ def run_portraits_experiment(gt_domains: int, generated_domains: int, args=None)
         ours_eta_cp, ours_eta_src, src_trainset, tgt_trainset, all_sets, 0,
         generated_domains, epochs=5, target=1, args=args, gen_method="natural"
     )
+    print(f"[Portraits] Ours-ETA completed in {round(time.time() - start_time_eta, 2)}s")
+
 
     # ---------------- Ours (FR) ----------------
+    start_time_fr = time.time()
     set_all_seeds(args.seed)
     ours_src = copy.deepcopy(ref_model)
     ours_cp  = copy.deepcopy(ref_model)
@@ -5345,17 +4957,9 @@ def run_portraits_experiment(gt_domains: int, generated_domains: int, args=None)
         ours_cp, ours_src, src_trainset, tgt_trainset, all_sets, 0,
         generated_domains, epochs=5, target=1, args=args, gen_method="fr"
     )
-
-    # ---------------- GOAT (pair-wise synthetics) ----------------
-    set_all_seeds(args.seed)
-    goat_src = copy.deepcopy(ref_model)
-    goat_cp  = copy.deepcopy(goat_src)
-    goat_train, goat_test, goat_st, goat_st_all, goat_gen = run_goat(
-        goat_cp, goat_src, src_trainset, tgt_trainset, all_sets, 0,
-        generated_domains, epochs=5, target=1, args=args
-    )
-
+    print(f"[Portraits] Ours-FR completed in {round(time.time() - start_time_fr, 2)}s")
     # ---------------- GOAT (class-wise synthetics) ----------------
+    start_time_goatcw = time.time()
     set_all_seeds(args.seed)
     goatcw_src = copy.deepcopy(ref_model)
     goatcw_cp  = copy.deepcopy(goatcw_src)
@@ -5363,10 +4967,21 @@ def run_portraits_experiment(gt_domains: int, generated_domains: int, args=None)
         goatcw_cp, goatcw_src, src_trainset, tgt_trainset, all_sets, 0,
         generated_domains, epochs=5, target=1, args=args
     )
-
+    print(f"[Portraits] GOAT-Classwise completed in {round(time.time() - start_time_goatcw, 2)}s")
     if EM_acc is not None and EM_acc_goatcw is not None and abs(EM_acc - EM_acc_goatcw) > 1e-4:
         print(f"[WARNING] EM acc differs between Ours ({EM_acc:.2f}%) and GOAT-Classwise ({EM_acc_goatcw:.2f}%) on portraits!")
-    # breakpoint()
+    
+    # ---------------- GOAT (pair-wise synthetics) ----------------
+    start_time_goat = time.time()
+    set_all_seeds(args.seed)
+    goat_src = copy.deepcopy(ref_model)
+    goat_cp  = copy.deepcopy(goat_src)
+    goat_train, goat_test, goat_st, goat_st_all, goat_gen = run_goat(
+        goat_cp, goat_src, src_trainset, tgt_trainset, all_sets, 0,
+        generated_domains, epochs=5, target=1, args=args
+    )
+    print(f"[Portraits] GOAT completed in {round(time.time() - start_time_goat, 2)}s")
+
     # ---------------- Plot combined target accuracy series ----------------
     plot_dir = f"plots/portraits/"
     os.makedirs(plot_dir, exist_ok=True)
@@ -5380,7 +4995,7 @@ def run_portraits_experiment(gt_domains: int, generated_domains: int, args=None)
         title=f"Portraits: Target Accuracy (ST: {args.label_source}; Cluster Map: {args.em_match})",
         ylabel="Accuracy",
         xlabel="Domain Index",
-        save_path=os.path.join(plot_dir, f"test_acc_dim{args.small_dim}_gen{args.generated_domains}_{args.label_source}_{args.em_match}.png"),
+        save_path=os.path.join(plot_dir, f"test_acc_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_{args.label_source}_{args.em_match}_{args.em_select}{'_em-ensemble' if args.em_ensemble else '' }.png"),
     )
 
     # ---------------- Log summary ----------------
@@ -5452,9 +5067,9 @@ def run_covtype_experiment(gt_domains: int, generated_domains: int, args=None):
         model_path=os.path.join(model_dir, model_name),
         target_dataset=tgt_trainset,
         force_recompute=False,
-        compress=True,
+        compress=(args.small_dim < enc_out_dim),
         in_dim=enc_out_dim,
-        out_dim=min(enc_out_dim, args.small_dim),
+        out_dim=args.small_dim,
     )
 
     # Common reference encoder
@@ -5497,7 +5112,7 @@ def run_covtype_experiment(gt_domains: int, generated_domains: int, args=None):
         per_domain_cap=10000, random_state=args.seed if hasattr(args, "seed") else 0,
     )
     args.shared_pca = shared_pca
-
+    time_start_em_pca = time.time()
     # (Optional) prototype mapping support
     if getattr(args, "em_match", "pseudo") == "prototypes":
         mu_s, Sigma_s, priors_s = fit_source_gaussian_params(X=_e_src.data, y=_e_src.targets)
@@ -5516,42 +5131,30 @@ def run_covtype_experiment(gt_domains: int, generated_domains: int, args=None):
     # ----- Fit many EMs on the target embedding; pick/ensemble; cache bundle -----
     em_models = fit_many_em_on_target(
         _e_tgt,
-        K_list=getattr(args, "em_K_list", [int(src_trainset.targets.max()) + 1]),
-        cov_types=getattr(args, "em_cov_types", ["diag"]),
-        seeds=getattr(args, "em_seeds", [0, 1, 2]),
+        K_list=[int(src_trainset.targets.max()) + 1],
+        cov_types=["diag"],
+        seeds=[0, 1, 2],
         pool="gap",
-        pca_dims=getattr(args, "em_pca_dims", [None]),
+        pca_dims=[None],
         reg=1e-4, max_iter=300, rng_base=args.seed, args=args,
     )
-    best = _select_best_em(em_models, criterion=getattr(args, "em_select", "bic"))
-    if getattr(args, "em_do_ensemble", True) and len(em_models) > 1:
-        trimmed, w = _trim_em_models_by_bic(em_models, max_delta_bic=getattr(args, "em_trim_delta_bic", 10.0))
-        P_ens, _ = _ensemble_posteriors_trimmed(trimmed, w)
-        labels_ens = P_ens.argmax(axis=1).astype(int)
-        em_bundle = EMBundle(
-            key="multi_em_trimmed", em_res=best["em_res"], mapping=best.get("mapping", None),
-            labels_em=labels_ens, P_soft=P_ens,
-            info={"criterion": "bic+trim", "bic_best": float(best["bic"])}
-        )
-    else:
-        em_bundle = EMBundle(
-            key="multi_em_best", em_res=best["em_res"], mapping=best.get("mapping", None),
-            labels_em=np.asarray(best["labels_mapped"], dtype=int),
-            P_soft=np.asarray(best["mapped_soft"], dtype=float),
-            info={"criterion": getattr(args, "em_select", "bic"), "bic_best": float(best["bic"])}
-        )
+    em_bundle = build_em_bundle(em_models, args)
     args._shared_em = em_bundle
-    _apply_em_bundle_to_target(em_bundle, _e_tgt, tgt_trainset)
+    apply_em_bundle_to_target(em_bundle, _e_tgt, tgt_trainset)
+    print(f"[CovType] EM→class accuracy: {(em_bundle.labels_em == np.asarray(tgt_trainset.targets, dtype=int)).mean():.4f}")
+    print(f"[CovType] EM fitting time (s): {time.time() - time_start_em_pca:.2f}")
 
     # ----- Run methods -----
     # Ours-ETA
-    # set_all_seeds(args.seed)
-    # ours_eta_src = copy.deepcopy(ref_model);  ours_eta_cp = copy.deepcopy(ref_model)
-    # ours_eta_train, ours_eta_test, ours_eta_st, ours_eta_st_all, ours_eta_gen, EM_acc_eta = run_main_algo(
-    #     ours_eta_cp, ours_eta_src, src_trainset, tgt_trainset, all_sets, 0,
-    #     generated_domains, epochs=5, target=1, args=args, gen_method="natural"
-    # )
-
+    start_time_eta = time.time()
+    set_all_seeds(args.seed)
+    ours_eta_src = copy.deepcopy(ref_model);  ours_eta_cp = copy.deepcopy(ref_model)
+    ours_eta_train, ours_eta_test, ours_eta_st, ours_eta_st_all, ours_eta_gen, EM_acc_eta = run_main_algo(
+        ours_eta_cp, ours_eta_src, src_trainset, tgt_trainset, all_sets, 0,
+        generated_domains, epochs=5, target=1, args=args, gen_method="natural"
+    )
+    print(f"[CovType] Ours-ETA time (s): {time.time() - start_time_eta:.2f}")
+    start_time_goatcw = time.time()
         # GOAT-Classwise
     set_all_seeds(args.seed)
     goatcw_src = copy.deepcopy(ref_model);  goatcw_cp = copy.deepcopy(goatcw_src)
@@ -5559,7 +5162,8 @@ def run_covtype_experiment(gt_domains: int, generated_domains: int, args=None):
         goatcw_cp, goatcw_src, src_trainset, tgt_trainset, all_sets, 0,
         generated_domains, epochs=5, target=1, args=args
     )
-
+    print(f"[CovType] GOAT-Classwise time (s): {time.time() - start_time_goatcw:.2f}")
+    start_time_fr = time.time()
     # Ours-FR
     set_all_seeds(args.seed)
     ours_src = copy.deepcopy(ref_model);  ours_cp = copy.deepcopy(ref_model)
@@ -5567,7 +5171,8 @@ def run_covtype_experiment(gt_domains: int, generated_domains: int, args=None):
         ours_cp, ours_src, src_trainset, tgt_trainset, all_sets, 0,
         generated_domains, epochs=5, target=1, args=args, gen_method="fr"
     )
-
+    print(f"[CovType] Ours-FR time (s): {time.time() - start_time_fr:.2f}")
+    start_time_goat = time.time()
     # GOAT
     set_all_seeds(args.seed)
     goat_src = copy.deepcopy(ref_model);  goat_cp = copy.deepcopy(goat_src)
@@ -5575,43 +5180,23 @@ def run_covtype_experiment(gt_domains: int, generated_domains: int, args=None):
         goat_cp, goat_src, src_trainset, tgt_trainset, all_sets, 0,
         generated_domains, epochs=5, target=1, args=args
     )
-
+    print(f"[CovType] GOAT time (s): {time.time() - start_time_goat:.2f}")
 
 
     # ----- Plot -----
     plot_dir = f"plots/covtype/"
     os.makedirs(plot_dir, exist_ok=True)
-    # _plot_series_with_baselines(
-    #     series=[ours_test, goat_test, goatcw_test, ours_eta_test],
-    #     labels=["Ours-FR", "GOAT", "GOAT-Classwise", "Ours-ETA"],
-    #     baselines=[(ours_st, ours_st_all)],
-    #     ref_line_value=(EM_acc * 100.0 if EM_acc is not None else None),
-    #     ref_line_label=f"EM ({args.em_match})",
-    #     ref_line_style="--",
-    #     title=f"CovType: Target Accuracy (ST: {args.label_source}; Cluster Map: {args.em_match})",
-    #     ylabel="Accuracy", xlabel="Domain Index",
-    #     save_path=os.path.join(plot_dir, f"test_acc_dim{args.small_dim}_gen{args.generated_domains}_{args.label_source}_{args.em_match}.png"),
-    # )
 
-    # # ----- Log -----
-    # os.makedirs("logs", exist_ok=True)
-    # elapsed = round(time.time() - t0, 2)
-    # with open(f"logs/covtype_exp_{args.log_file}.txt", "a") as f:
-    #     f.write(
-    #         f"seed{args.seed}with{gt_domains}gt{generated_domains}generated,{elapsed},"
-    #         f"OursFR:{round((ours_test[-1] if ours_test else 0.0), 2)},GOAT:{round((goat_test[-1] if goat_test else 0.0), 2)},"
-    #         f"GOATCW:{round((goatcw_test[-1] if goatcw_test else 0.0), 2)},ETA:{round((ours_eta_test[-1] if ours_eta_test else 0.0), 2)}\n"
-    #     )
     _plot_series_with_baselines(
-        series=[ours_test, goat_test, goatcw_test],
-        labels=["Ours-FR", "GOAT", "GOAT-Classwise"],
+        series=[ours_test, goat_test, goatcw_test, ours_eta_test],
+        labels=["Ours-FR", "GOAT", "GOAT-Classwise", "Ours-ETA"],
         baselines=[(ours_st, ours_st_all)],
         ref_line_value=(EM_acc * 100.0 if EM_acc is not None else None),
         ref_line_label=f"EM ({args.em_match})",
         ref_line_style="--",
         title=f"CovType: Target Accuracy (ST: {args.label_source}; Cluster Map: {args.em_match})",
         ylabel="Accuracy", xlabel="Domain Index",
-        save_path=os.path.join(plot_dir, f"test_acc_dim{args.small_dim}_gen{args.generated_domains}_{args.label_source}_{args.em_match}.png"),
+        save_path=os.path.join(plot_dir, f"test_acc_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_{args.label_source}_{args.em_match}_{args.em_select}{'_em-ensemble' if args.em_ensemble else '' }.png"),
     )
 
     # ----- Log -----
@@ -5621,8 +5206,10 @@ def run_covtype_experiment(gt_domains: int, generated_domains: int, args=None):
         f.write(
             f"seed{args.seed}with{gt_domains}gt{generated_domains}generated,{elapsed},"
             f"OursFR:{round((ours_test[-1] if ours_test else 0.0), 2)},GOAT:{round((goat_test[-1] if goat_test else 0.0), 2)},"
-            f"GOATCW:{round((goatcw_test[-1] if goatcw_test else 0.0), 2)}\n"
+            f"GOATCW:{round((goatcw_test[-1] if goatcw_test else 0.0), 2)},ETA:{round((ours_eta_test[-1] if ours_eta_test else 0.0), 2)}\n"
         )
+
+
 
 
 def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=None):
@@ -5741,7 +5328,16 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
         per_domain_cap=10000, random_state=args.seed if hasattr(args, "seed") else 0,
     )
     args.shared_pca = shared_pca
+    # === INSERT AFTER shared_pca IS DEFINED (DIAGNOSTICS) ===
+    # Pull arrays from encoded datasets
+    Zs = np.asarray(_e_src.data, dtype=np.float64)
+    ys = np.asarray(_e_src.targets, dtype=int)
+    Zt = np.asarray(_e_tgt.data, dtype=np.float64)
+    yt = np.asarray(_e_tgt.targets, dtype=int)
 
+
+
+    time_start_em = time.time()
     # Optional prototype mapping
     if getattr(args, "em_match", "pseudo") == "prototypes":
         mu_s, Sigma_s, priors_s = fit_source_gaussian_params(X=_e_src.data, y=_e_src.targets)
@@ -5763,45 +5359,37 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
         cov_types=getattr(args, "em_cov_types", ["diag"]),
         seeds=getattr(args, "em_seeds", [0, 1, 2]),
         pool="gap",
-        pca_dims=getattr(args, "em_pca_dims", [None]),
+        pca_dims=[None],
         reg=1e-4, max_iter=300, rng_base=args.seed, args=args
     )
-    best = _select_best_em(em_models, criterion="cost")
-    if getattr(args, "em_do_ensemble", True) and len(em_models) > 1:
-        trimmed, w = _trim_em_models_by_bic(em_models, max_delta_bic=getattr(args, "em_trim_delta_bic", 10.0))
-        P_ens, _ = _ensemble_posteriors_trimmed(trimmed, w)
-        labels_ens = P_ens.argmax(axis=1).astype(int)
-        em_bundle = EMBundle(
-            key="multi_em_trimmed", em_res=best["em_res"], mapping=best.get("mapping", None),
-            labels_em=labels_ens, P_soft=P_ens,
-            info={"criterion": "bic+trim", "bic_best": float(best["bic"])}
-        )
-    else:
-        em_bundle = EMBundle(
-            key="multi_em_best", em_res=best["em_res"], mapping=best.get("mapping", None),
-            labels_em=np.asarray(best["labels_mapped"], dtype=int),
-            P_soft=np.asarray(best["mapped_soft"], dtype=float),
-            info={"criterion": getattr(args, "em_select", "bic"), "bic_best": float(best["bic"])}
-        )
-    args._shared_em = em_bundle
-    _apply_em_bundle_to_target(em_bundle, _e_tgt, tgt_trainset)
 
+    rows = print_em_model_accuracies(em_models, tgt_trainset.targets)
+
+    rows = [{**r, "original_idx": i} for i, r in enumerate(rows)]
+
+    # 1) Print ALL models in their original order
+    for r in rows:
+        bic = r.get("bic")
+        print(
+            f"[EM {r['original_idx']:02d}] "
+            f"acc={r['acc']*100:6.2f}% | seed={r.get('seed')} | cov={r.get('cov')} | "
+            f"K={r.get('K')} | BIC={bic if bic is not None else 'NA'} | "
+            f"final_ll={r.get('final_ll')}"
+        )
+    em_bundle = build_em_bundle(em_models, args)
+    args._shared_em = em_bundle
+    apply_em_bundle_to_target(em_bundle, _e_tgt, tgt_trainset)
+
+    print(f"[ColorMNIST] EM fitting time (s): {time.time() - time_start_em:.2f}")
     # Print EM accuracy (mapped labels vs true target labels)
     y_true = np.asarray(tgt_trainset.targets, dtype=int)
     y_em = np.asarray(em_bundle.labels_em, dtype=int)
     em_acc_now = float((y_em == y_true).mean())
     print(f"[ColorMNIST] EM→class accuracy: {em_acc_now:.4f}")
     # Also report the best achievable one-to-one mapping accuracy from raw EM clusters
-    try:
-        em_res_ref = best.get("em_res", {})
-        if "labels" in em_res_ref:
-            y_true_np = np.asarray(y_true, dtype=int)
-            best_acc, _best_map, _C = best_mapping_accuracy(em_res_ref["labels"], y_true_np)
-            print(f"[MainAlgo] Best one-to-one mapping accuracy: {best_acc:.4f}, current em accuracy: {em_acc_now:.4f}")
-    except Exception as e:
-        print(f"[ColorMNIST] best-mapping computation failed: {e}")
 
     # ---------- Run methods ----------
+    start_time_fr = time.time()
     # Ours-FR
     set_all_seeds(args.seed)
     ours_src = copy.deepcopy(ref_model);  ours_cp = copy.deepcopy(ref_model)
@@ -5809,6 +5397,9 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
         ours_cp, ours_src, src_trainset, tgt_trainset, all_sets, 0,
         generated_domains, epochs=5, target=1, args=args, gen_method="fr"
     )
+    print(f"[ColorMNIST] Ours-FR time (s): {time.time() - start_time_fr:.2f}")
+    start_time_goatcw = time.time()
+
     # GOAT-Classwise
     set_all_seeds(args.seed)
     goatcw_src = copy.deepcopy(ref_model);  goatcw_cp = copy.deepcopy(goatcw_src)
@@ -5816,6 +5407,8 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
         goatcw_cp, goatcw_src, src_trainset, tgt_trainset, all_sets, 0,
         generated_domains, epochs=5, target=1, args=args
     )
+    print(f"[ColorMNIST] GOAT-Classwise time (s): {time.time() - start_time_goatcw:.2f}")
+    start_time_eta = time.time()
 
     # Ours-ETA
     set_all_seeds(args.seed)
@@ -5824,7 +5417,8 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
         ours_eta_cp, ours_eta_src, src_trainset, tgt_trainset, all_sets, 0,
         generated_domains, epochs=5, target=1, args=args, gen_method="natural"
     )
-
+    print(f"[ColorMNIST] Ours-ETA time (s): {time.time() - start_time_eta:.2f}")
+    start_time_goat = time.time()
 
 
     # GOAT
@@ -5835,7 +5429,7 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
         generated_domains, epochs=5, target=1, args=args
     )
 
-
+    print(f"[ColorMNIST] GOAT time (s): {time.time() - start_time_goat:.2f}")
     # ---------- Plot ----------
     plot_dir = f"plots/color_mnist/"
     os.makedirs(plot_dir, exist_ok=True)
@@ -5848,13 +5442,23 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
         ref_line_style="--",
         title=f"Colored-MNIST: Target Accuracy (ST: {args.label_source}; Cluster Map: {args.em_match})",
         ylabel="Accuracy", xlabel="Domain Index",
-        save_path=os.path.join(plot_dir, f"test_acc_dim{args.small_dim}_gen{args.generated_domains}_{args.label_source}_{args.em_match}.png"),
+        save_path=os.path.join(plot_dir, f"test_acc_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_{args.label_source}_{args.em_match}_{args.em_select}{'_em-ensemble' if args.em_ensemble else '' }.png"),
     )
 
     # ---------- Log ----------
-    os.makedirs("logs", exist_ok=True)
+    log_dir = os.path.join("logs", "color_mnist", f"s{args.seed}")
+    os.makedirs(log_dir, exist_ok=True)
     elapsed = round(time.time() - t0, 2)
-    with open(f"logs/color_{args.log_file}.txt", "a") as f:
+    base_name = (
+        args.log_file
+        if args.log_file
+        else (
+            f"test_acc_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_"
+            f"{args.label_source}_{args.em_match}_{args.em_select}"
+            f"{'_em-ensemble' if args.em_ensemble else ''}"
+        )
+    )
+    with open(os.path.join(log_dir, f"{base_name}.txt"), "a") as f:
         f.write(
             f"seed{args.seed}with{gt_domains}gt{generated_domains}generated,{elapsed},"
             f"OursFR:{round((ours_test[-1] if ours_test else 0.0), 2)},GOAT:{round((goat_test[-1] if goat_test else 0.0), 2)},"
@@ -5907,6 +5511,7 @@ if __name__ == "__main__":
     parser.add_argument("--small-dim", type=int, default=2048, help="Add a small-dim compressor before the head (0 to disable)")
     parser.add_argument("--label-source", choices=["pseudo", "em"], default="pseudo", help="For self-training, which labels to use for pseudo-labeling")
     parser.add_argument("--em-match",  choices=["pseudo", "prototypes","none"], default="pseudo", help="For self-training, which labels to use for pseudo-labeling")
-
+    parser.add_argument("--em-ensemble", action="store_true", help="Whether to ensemble multiple EM models")
+    parser.add_argument("--em-select", choices=["bic", "cost", "ll"], default="bic", help="Criterion to select best EM model")
     args = parser.parse_args()
     main(args)

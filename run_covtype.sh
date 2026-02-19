@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-
-
 label_sources=(pseudo)
-em_matches=(prototypes pseudo)
+em_matches=(prototypes)
 seeds=(0 1 2)
-gt_domains=(0)
-generated_domains=(1)
-dataset="portraits"
-small_dim=2048
+gt_domains=(0 1 2 3)
+generated_domains=(0)
+dataset="covtype"
+# CovType's MLP encoder outputs 54-d features, and experiment_refrac.py will clamp
+# --small-dim down to that. Set it explicitly so log filenames match and skipping works.
+small_dim=54
 em_select="bic"
 em_ensemble_suffix=""
 
@@ -53,8 +53,8 @@ for ls in "${label_sources[@]}"; do
               continue
             fi
           fi
-          echo "Running: label_source=$ls, em_match=$m, seed=$s, gt_domains=$gt, generated_domains=$gd"
-          python experiment_refrac.py --dataset "$dataset" --label-source "$ls" --em-match "$m" --seed "$s" --gt-domains "$gt" --generated-domains "$gd"
+          echo "Running: dataset=covtype, label_source=$ls, em_match=$m, seed=$s, gt_domains=$gt, generated_domains=$gd"
+          python experiment_refrac.py --dataset "$dataset" --label-source "$ls" --em-match "$m" --seed "$s" --gt-domains "$gt" --generated-domains "$gd" --small-dim "$small_dim"
         done
       done
     done

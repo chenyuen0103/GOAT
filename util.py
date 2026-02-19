@@ -96,7 +96,7 @@ def get_encoded_dataset(dataset = None, cache_path = None, encoder = None, force
     # breakpoint()
     if cache_path and os.path.exists(cache_path) and not force_recompute:
         print(f"✅ Loading cached encoded dataset from {cache_path}")
-        return torch.load(cache_path)
+        return torch.load(cache_path, weights_only=False)  # Explicitly allow full deserialization
     
     print(f"🔄 Computing encoded dataset and caching at {cache_path}")
     encoded_dataset = get_encoded_dataset_old(encoder, dataset)
