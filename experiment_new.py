@@ -1550,13 +1550,15 @@ def run_goat(
             # (intermediate real domain or final target)
             chain_for_plot.append(encoded_intersets[i + 1])
 
-        # Ensure the final target encoding carries pseudo labels in .targets_em so we can color by them
+        # Keep EM labels intact; store pseudo labels in a separate field for plotting.
         tgt_pl, _ = get_pseudo_labels(
             encoded_intersets[-1],
             getattr(source_model, 'mlp', source_model),
             confidence_q=getattr(args, 'pseudo_confidence_q', 0.9),
         )
-        encoded_intersets[-1].targets_em = tgt_pl.clone() if hasattr(tgt_pl, 'clone') else torch.as_tensor(tgt_pl, dtype=torch.long)
+        encoded_intersets[-1].targets_pseudo = (
+            tgt_pl.clone() if hasattr(tgt_pl, 'clone') else torch.as_tensor(tgt_pl, dtype=torch.long)
+        )
 
         plot_pca_classes_grid(
             chain_for_plot,
@@ -4194,203 +4196,6 @@ def plot_pca_classes_grid(
 
 
 
-# def plot_pca_classes_grid(
-#     domains,
-#     classes=(3, 8),
-#     save_path=None,
-#     pool: str = 'gap',
-#     label_source: str = 'pseudo',     # 'pseudo' | 'em' | 'real'
-#     pseudolabels=None,
-#     ground_truths=False,    # if True, use .targets for all domains
-# ):
-#     """
-#     Fit ONE PCA on all selected samples across domains, then apply it per-domain.
-
-#     - domains: iterable of datasets with .data and labels (.targets or .targets_em)
-#     - classes: tuple/list of class ids to display
-#     - save_path: file path to save the figure (directory is created)
-#     - pool: 'gap' to global-average-pool 4D (N,C,H,W) -> (N,C); 'flatten' to flatten; 'auto' chooses GAP for 4D
-#     - label_source: 'pseudo' (use provided pseudo labels), 'em' (use .targets_em fallback to .targets), 'real' (use .targets)
-#     - pseudolabels: dict[id(D)]->labels OR list/tuple aligned with `domains` OR array/tensor of labels per dataset
-#     """
-#     import os
-# 
-#     import matplotlib.pyplot as plt
-#     import torch
-#     from sklearn.decomposition import PCA
-
-#     # ---------- helpers ----------
-#     def _to_np(y):
-#         if y is None:
-#             return None
-#         if isinstance(y, torch.Tensor):
-#             return y.detach().cpu().numpy()
-#         return np.asarray(y)
-
-#     def pool_feats(X):
-#         if isinstance(X, torch.Tensor):
-#             X = X.detach().cpu().numpy()
-#         if X.ndim == 4:
-#             if pool == 'gap' or pool == 'auto':
-#                 return X.mean(axis=(2, 3))
-#             elif pool == 'flatten':
-#                 return X.reshape(X.shape[0], -1)
-#             else:
-#                 # default to GAP for 4D if an unexpected value is passed
-#                 return X.mean(axis=(2, 3))
-#         if X.ndim == 3:
-#             return X.reshape(X.shape[0], -1)
-#         return X
-
-#     def get_labels_for_domain(D, j):
-#         """Return labels per `label_source`, robust to different pseudolabels types."""
-#         y = None
-#         if ground_truths:
-#             # breakpoint()
-#             return _to_np(getattr(D, 'targets', None))
-#         if label_source == 'pseudo':
-#             if isinstance(pseudolabels, dict):
-#                 y = pseudolabels.get(id(D), None)
-#             elif isinstance(pseudolabels, (list, tuple)):
-#                 if 0 <= j < len(pseudolabels):
-#                     y = pseudolabels[j]
-#             elif isinstance(pseudolabels, (np.ndarray, torch.Tensor)):
-#                 # assume it's aligned with D
-#                 y = pseudolabels
-#             # fallbacks if pseudo not available
-#             if y is None:
-#                 y = getattr(D, 'targets_em', None)
-#                 if y is None:
-#                     y = getattr(D, 'targets', None)
-
-#         elif label_source == 'em':
-#             y = getattr(D, 'targets_em', None)
-#             if y is None or (isinstance(y, torch.Tensor) and y.numel() > 0 and (y < 0).all()):
-#                 y = getattr(D, 'targets', None)
-
-#         elif label_source == 'real':
-#             y = getattr(D, 'targets', None)
-
-#         return _to_np(y)
-
-#     # ---------- prepare ----------
-#     cols = len(domains)
-#     if cols == 0:
-#         return
-#     classes = np.array(list(classes), dtype=int)
-
-#     # ---------- 1) Collect data for a single global PCA ----------
-#     X_all = []
-#     y_all = []
-#     pooled_per_domain = []
-#     masks_per_domain = []
-
-#     for j, D in enumerate(domains):
-        
-#         Xp = pool_feats(D.data)
-#         pooled_per_domain.append(Xp)
-#         if j == 0:
-#             y = D.targets
-#         elif j == len(domains) - 1:
-#             y = get_labels_for_domain(D, j)
-#         else:
-#             # breakpoint()
-#             y = D.targets if label_source =='pseudo' else D.targets_em
-#         if y is None:
-#             masks_per_domain.append(None)
-#             continue
-
-#         # keep only requested classes
-#         m = np.isin(y, classes)
-#         masks_per_domain.append(m)
-
-#         if m.any():
-#             try:
-#                 X_all.append(Xp[m])
-#                 y_all.append(y[m])
-#             except Exception as e:
-#                 breakpoint()
-#                 print(f"[plot] Failed to append data for domain {j} ({e})")
-
-#     if len(X_all) == 0:
-#         print("[plot] No samples from requested classes; nothing to plot.")
-#         return
-
-#     X_pca = np.concatenate([X_all[0], X_all[-1]], axis=0)
-#     X_all = np.concatenate(X_all, axis=0)
-#     y_all = np.concatenate(y_all, axis=0)
-
-#     # ---------- PCA fit (shared) ----------
-#     try:
-#         pca = PCA(n_components=2)
-#         pca.fit(X_pca)
-#         use_pca = True
-#     except Exception as e:
-#         print(f"[plot] PCA fit failed ({e}); falling back to first two dims.")
-#         use_pca = False
-
-#     # ---------- 2) Plot per domain using the SAME PCA ----------
-#     fig_w = max(4, 3 * cols)
-#     fig, axs = plt.subplots(1, cols, figsize=(fig_w, 3.6), squeeze=False)
-#     axs = axs[0]
-#     cmap = plt.get_cmap('tab10')
-
-#     for j, D in enumerate(domains):
-#         ax = axs[j]
-#         Xp = pooled_per_domain[j]
-#         if j == 0:
-#             y = D.targets
-#         elif j == len(domains) - 1:
-#             y = get_labels_for_domain(D, j)
-#         else:
-#             y = D.targets if label_source =='pseudo' else D.targets_em
-
-#         if y is None:
-#             ax.set_title(f"Domain {j}: no labels")
-#             ax.axis('off')
-#             continue
-
-#         m = masks_per_domain[j]
-#         if m is None or not np.any(m):
-#             ax.set_title(f"Domain {j}: no classes {tuple(classes)}")
-#             ax.axis('off')
-#             continue
-
-#         Xsel = Xp[m]
-#         ysel = y[m]
-
-#         if use_pca:
-#             try:
-#                 Z = pca.transform(Xsel)
-#             except Exception:
-#                 Z = Xsel[:, :2] if Xsel.shape[1] >= 2 else np.pad(
-#                     Xsel, ((0, 0), (0, max(0, 2 - Xsel.shape[1]))), mode='constant'
-#                 )
-#         else:
-#             Z = Xsel[:, :2] if Xsel.shape[1] >= 2 else np.pad(
-#                 Xsel, ((0, 0), (0, max(0, 2 - Xsel.shape[1]))), mode='constant'
-#             )
-
-#         # plot
-#         for idx, c in enumerate(classes):
-#             cmask = (ysel == c)
-#             if cmask.any():
-#                 ax.scatter(Z[cmask, 0], Z[cmask, 1], s=6, alpha=0.7,
-#                            color=cmap(idx % 10), label=str(c))
-
-#         ax.set_title(f"Domain {j}")
-#         ax.set_xticks([]); ax.set_yticks([])
-#         if j == 0:
-#             ax.legend(loc='best', fontsize=8)
-
-#     if save_path:
-#         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-#         plt.tight_layout()
-#         plt.savefig(save_path, dpi=150)
-#         print(f"[MNIST-EXP] Saved {save_path}")
-#     plt.close()
-
-
 def _to_numpy_1d_labels(x):
     if isinstance(x, torch.Tensor):
         return x.detach().cpu().numpy().reshape(-1)
@@ -5141,6 +4946,27 @@ def run_covtype_experiment(gt_domains: int, generated_domains: int, args=None):
     em_bundle = build_em_bundle(em_models, args)
     args._shared_em = em_bundle
     apply_em_bundle_to_target(em_bundle, _e_tgt, tgt_trainset)
+    # Canonical target EM labels: restore these for every method run.
+    canonical_target_em = None
+    if hasattr(tgt_trainset, "targets_em") and tgt_trainset.targets_em is not None:
+        canonical_target_em = torch.as_tensor(tgt_trainset.targets_em).view(-1).long().cpu().clone()
+        args._canonical_target_em = canonical_target_em.clone()
+
+    # Keep immutable references and clone them per method to avoid cross-method mutation.
+    _base_src_trainset = src_trainset
+    _base_tgt_trainset = tgt_trainset
+    _base_all_sets = all_sets
+
+    def _fresh_covtype_domains():
+        src_local = copy.deepcopy(_base_src_trainset)
+        tgt_local = copy.deepcopy(_base_tgt_trainset)
+        if canonical_target_em is not None and hasattr(tgt_local, "targets_em"):
+            tgt_local.targets_em = canonical_target_em.clone()
+        all_sets_local = [copy.deepcopy(ds) for ds in _base_all_sets[:-1]] + [tgt_local]
+        if canonical_target_em is not None and len(all_sets_local) > 0 and hasattr(all_sets_local[-1], "targets_em"):
+            all_sets_local[-1].targets_em = canonical_target_em.clone()
+        return src_local, tgt_local, all_sets_local
+
     print(f"[CovType] EM→class accuracy: {(em_bundle.labels_em == np.asarray(tgt_trainset.targets, dtype=int)).mean():.4f}")
     print(f"[CovType] EM fitting time (s): {time.time() - time_start_em_pca:.2f}")
 
@@ -5148,36 +4974,40 @@ def run_covtype_experiment(gt_domains: int, generated_domains: int, args=None):
     # Ours-ETA
     start_time_eta = time.time()
     set_all_seeds(args.seed)
+    src_eta, tgt_eta, sets_eta = _fresh_covtype_domains()
     ours_eta_src = copy.deepcopy(ref_model);  ours_eta_cp = copy.deepcopy(ref_model)
     ours_eta_train, ours_eta_test, ours_eta_st, ours_eta_st_all, ours_eta_gen, EM_acc_eta = run_main_algo(
-        ours_eta_cp, ours_eta_src, src_trainset, tgt_trainset, all_sets, 0,
+        ours_eta_cp, ours_eta_src, src_eta, tgt_eta, sets_eta, 0,
         generated_domains, epochs=5, target=1, args=args, gen_method="natural"
     )
     print(f"[CovType] Ours-ETA time (s): {time.time() - start_time_eta:.2f}")
     start_time_goatcw = time.time()
         # GOAT-Classwise
     set_all_seeds(args.seed)
+    src_goatcw, tgt_goatcw, sets_goatcw = _fresh_covtype_domains()
     goatcw_src = copy.deepcopy(ref_model);  goatcw_cp = copy.deepcopy(goatcw_src)
     goatcw_train, goatcw_test, goatcw_st, goatcw_st_all, goatcw_gen, EM_acc_goatcw = run_goat_classwise(
-        goatcw_cp, goatcw_src, src_trainset, tgt_trainset, all_sets, 0,
+        goatcw_cp, goatcw_src, src_goatcw, tgt_goatcw, sets_goatcw, 0,
         generated_domains, epochs=5, target=1, args=args
     )
     print(f"[CovType] GOAT-Classwise time (s): {time.time() - start_time_goatcw:.2f}")
     start_time_fr = time.time()
     # Ours-FR
     set_all_seeds(args.seed)
+    src_fr, tgt_fr, sets_fr = _fresh_covtype_domains()
     ours_src = copy.deepcopy(ref_model);  ours_cp = copy.deepcopy(ref_model)
     ours_train, ours_test, ours_st, ours_st_all, ours_gen, EM_acc = run_main_algo(
-        ours_cp, ours_src, src_trainset, tgt_trainset, all_sets, 0,
+        ours_cp, ours_src, src_fr, tgt_fr, sets_fr, 0,
         generated_domains, epochs=5, target=1, args=args, gen_method="fr"
     )
     print(f"[CovType] Ours-FR time (s): {time.time() - start_time_fr:.2f}")
     start_time_goat = time.time()
     # GOAT
     set_all_seeds(args.seed)
+    src_goat, tgt_goat, sets_goat = _fresh_covtype_domains()
     goat_src = copy.deepcopy(ref_model);  goat_cp = copy.deepcopy(goat_src)
     goat_train, goat_test, goat_st, goat_st_all, goat_gen = run_goat(
-        goat_cp, goat_src, src_trainset, tgt_trainset, all_sets, 0,
+        goat_cp, goat_src, src_goat, tgt_goat, sets_goat, 0,
         generated_domains, epochs=5, target=1, args=args
     )
     print(f"[CovType] GOAT time (s): {time.time() - start_time_goat:.2f}")
@@ -5379,6 +5209,26 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
     em_bundle = build_em_bundle(em_models, args)
     args._shared_em = em_bundle
     apply_em_bundle_to_target(em_bundle, _e_tgt, tgt_trainset)
+    # Canonical target EM labels: restore these for every method run.
+    canonical_target_em = None
+    if hasattr(tgt_trainset, "targets_em") and tgt_trainset.targets_em is not None:
+        canonical_target_em = torch.as_tensor(tgt_trainset.targets_em).view(-1).long().cpu().clone()
+        args._canonical_target_em = canonical_target_em.clone()
+
+    # Keep immutable references and clone them per method to avoid cross-method mutation.
+    _base_src_trainset = src_trainset
+    _base_tgt_trainset = tgt_trainset
+    _base_all_sets = all_sets
+
+    def _fresh_color_domains():
+        src_local = copy.deepcopy(_base_src_trainset)
+        tgt_local = copy.deepcopy(_base_tgt_trainset)
+        if canonical_target_em is not None and hasattr(tgt_local, "targets_em"):
+            tgt_local.targets_em = canonical_target_em.clone()
+        all_sets_local = [copy.deepcopy(ds) for ds in _base_all_sets[:-1]] + [tgt_local]
+        if canonical_target_em is not None and len(all_sets_local) > 0 and hasattr(all_sets_local[-1], "targets_em"):
+            all_sets_local[-1].targets_em = canonical_target_em.clone()
+        return src_local, tgt_local, all_sets_local
 
     print(f"[ColorMNIST] EM fitting time (s): {time.time() - time_start_em:.2f}")
     # Print EM accuracy (mapped labels vs true target labels)
@@ -5392,9 +5242,10 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
     start_time_fr = time.time()
     # Ours-FR
     set_all_seeds(args.seed)
+    src_fr, tgt_fr, sets_fr = _fresh_color_domains()
     ours_src = copy.deepcopy(ref_model);  ours_cp = copy.deepcopy(ref_model)
     ours_train, ours_test, ours_st, ours_st_all, ours_gen, EM_acc = run_main_algo(
-        ours_cp, ours_src, src_trainset, tgt_trainset, all_sets, 0,
+        ours_cp, ours_src, src_fr, tgt_fr, sets_fr, 0,
         generated_domains, epochs=5, target=1, args=args, gen_method="fr"
     )
     print(f"[ColorMNIST] Ours-FR time (s): {time.time() - start_time_fr:.2f}")
@@ -5402,9 +5253,10 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
 
     # GOAT-Classwise
     set_all_seeds(args.seed)
+    src_goatcw, tgt_goatcw, sets_goatcw = _fresh_color_domains()
     goatcw_src = copy.deepcopy(ref_model);  goatcw_cp = copy.deepcopy(goatcw_src)
     goatcw_train, goatcw_test, goatcw_st, goatcw_st_all, goatcw_gen, EM_acc_goatcw = run_goat_classwise(
-        goatcw_cp, goatcw_src, src_trainset, tgt_trainset, all_sets, 0,
+        goatcw_cp, goatcw_src, src_goatcw, tgt_goatcw, sets_goatcw, 0,
         generated_domains, epochs=5, target=1, args=args
     )
     print(f"[ColorMNIST] GOAT-Classwise time (s): {time.time() - start_time_goatcw:.2f}")
@@ -5412,9 +5264,10 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
 
     # Ours-ETA
     set_all_seeds(args.seed)
+    src_eta, tgt_eta, sets_eta = _fresh_color_domains()
     ours_eta_src = copy.deepcopy(ref_model);  ours_eta_cp = copy.deepcopy(ref_model)
     ours_eta_train, ours_eta_test, ours_eta_st, ours_eta_st_all, ours_eta_gen, EM_acc_eta = run_main_algo(
-        ours_eta_cp, ours_eta_src, src_trainset, tgt_trainset, all_sets, 0,
+        ours_eta_cp, ours_eta_src, src_eta, tgt_eta, sets_eta, 0,
         generated_domains, epochs=5, target=1, args=args, gen_method="natural"
     )
     print(f"[ColorMNIST] Ours-ETA time (s): {time.time() - start_time_eta:.2f}")
@@ -5423,9 +5276,10 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
 
     # GOAT
     set_all_seeds(args.seed)
+    src_goat, tgt_goat, sets_goat = _fresh_color_domains()
     goat_src = copy.deepcopy(ref_model);  goat_cp = copy.deepcopy(goat_src)
     goat_train, goat_test, goat_st, goat_st_all, goat_gen = run_goat(
-        goat_cp, goat_src, src_trainset, tgt_trainset, all_sets, 0,
+        goat_cp, goat_src, src_goat, tgt_goat, sets_goat, 0,
         generated_domains, epochs=5, target=1, args=args
     )
 

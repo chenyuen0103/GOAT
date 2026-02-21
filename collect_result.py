@@ -47,6 +47,13 @@ METHODS: List[Tuple[str, str]] = [
     ("ours_fr", "C2GDA-FR"),
 ]
 
+# Match notebook selection logic for reporting/plots:
+# (~em_ensemble) & em_match contains "prototype" & em_select contains "bic",
+# then pick best setting per (dataset, degree, gt, gen, method) by acc_mean.
+REPORT_EM_ENSEMBLE = False
+REPORT_EM_MATCH_SUBSTR = "prototype"
+REPORT_EM_SELECT_SUBSTR = "bic"
+
 APPENDIX_COMPARISON_GROUPS: List[Dict[str, object]] = [
     {
         "name": "goat_vs_wass",
@@ -177,6 +184,7 @@ def _latex_preamble_comment() -> str:
         "% Auto-generated tables.\n"
         "% Required packages (in your main.tex):\n"
         "% \\usepackage{booktabs}\n"
+        "% \\usepackage{multirow}\n"
         "% \\usepackage{caption}\n"
     )
 
@@ -243,6 +251,80 @@ def _to_table_df(df: pd.DataFrame) -> pd.DataFrame:
 
     keep = ["dataset", "seed", "degree", "gt", "gen"] + [c for c, _ in METHODS]
     return out[keep]
+
+
+def build_selected_seed_long(df_detailed: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build seed-level long table after applying the same filtering/ranking policy
+    used in analyze_results_summary.ipynb:
+      1) filter settings by em_ensemble/em_match/em_select
+      2) compute mean accuracy per setting and method
+      3) pick best setting per (dataset, degree, gt, gen, method)
+      4) keep seed-level runs only from those selected settings
+    Output columns include:
+      [dataset, seed, degree, gt, gen, method, acc, label_source, em_match,
+       em_select, em_ensemble, file_path]
+    """
+    if df_detailed.empty:
+        return df_detailed
+
+    id_cols = [
+        "dataset",
+        "seed",
+        "degree",
+        "gt",
+        "gen",
+        "label_source",
+        "em_match",
+        "em_select",
+        "em_ensemble",
+        "file_path",
+    ]
+    val_cols = [c for c, _ in METHODS]
+
+    long_df = df_detailed[id_cols + val_cols].melt(
+        id_vars=id_cols,
+        value_vars=val_cols,
+        var_name="method",
+        value_name="acc",
+    )
+    long_df = long_df.dropna(subset=["acc"]).copy()
+
+    setting_keys = [
+        "dataset",
+        "degree",
+        "gt",
+        "gen",
+        "label_source",
+        "em_match",
+        "em_select",
+        "em_ensemble",
+        "method",
+    ]
+    setting_summary = (
+        long_df.groupby(setting_keys, dropna=False)["acc"]
+        .agg(acc_mean="mean", acc_std="std", n_rows="size")
+        .reset_index()
+    )
+
+    filt = (
+        (setting_summary["em_ensemble"] == REPORT_EM_ENSEMBLE)
+        & setting_summary["em_match"].astype(str).str.contains(REPORT_EM_MATCH_SUBSTR, case=False, na=False)
+        & setting_summary["em_select"].astype(str).str.contains(REPORT_EM_SELECT_SUBSTR, case=False, na=False)
+    )
+    cand = setting_summary[filt].copy()
+    if cand.empty:
+        return long_df.iloc[0:0].copy()
+
+    rank_df = cand.sort_values(
+        ["dataset", "degree", "gt", "gen", "method", "acc_mean"],
+        ascending=[True, True, True, True, True, False],
+        na_position="last",
+    )
+    best = rank_df.groupby(["dataset", "degree", "gt", "gen", "method"], dropna=False).head(1).copy()
+
+    selected = long_df.merge(best[setting_keys], on=setting_keys, how="inner")
+    return selected
 
 
 def collect_results_detailed(dataset_name: str) -> pd.DataFrame:
@@ -430,12 +512,22 @@ def _panel_minipage(
     lines.append("\\renewcommand{\\arraystretch}{" + str(arraystretch) + "}")
 
     method_cols = "c" * len(methods)
-    colspec = "@{\\extracolsep{\\fill}}c|" + method_cols
+    colspec = "@{\\extracolsep{\\fill}}c@{\\hspace{6pt}}" + method_cols
     header = [gen_header] + [lab for _col, lab in methods]
 
     lines.append(f"\\begin{{tabular*}}{{\\linewidth}}{{{colspec}}}")
     lines.append("\\toprule")
-    lines.append(" & ".join(header) + " \\\\")
+    is_main_template_header = (
+        len(methods) == 4
+        and methods[0][0] == "goat"
+        and methods[1][0] == "goatcw"
+        and methods[2][0] == "eta"
+        and methods[3][0] == "ours_fr"
+    )
+    if is_main_template_header:
+        lines.append("\\multirow{2}{*}{$G_{\\text{syn}}$} & \\multirow{2}{*}{GOAT} & \\multicolumn{3}{c}{C2GDA} \\\\ \\cmidrule(lr){3-5} & & Wass & Nat & FR \\\\")
+    else:
+        lines.append(" & ".join(header) + " \\\\")
     lines.append("\\midrule")
 
     if sub_df.empty:
@@ -450,13 +542,21 @@ def _panel_minipage(
         row = [str(gen)]
 
         if gen == 0:
-            row += _emit_gen0_row_same_for_all_methods(sg, methods)
+            base = pd.Series(dtype=float)
+            for pref in GEN0_BASELINE_PREFERENCE:
+                s_pref = sg[sg["method"] == pref]["acc"].dropna()
+                if len(s_pref) > 0:
+                    base = s_pref
+                    break
+            cell = _format_mean_std(base)
+            row += [cell] * len(methods)
             lines.append(" & ".join(row) + " \\\\")
             continue
 
         scored: List[Tuple[str, float]] = []
         for col, _lab in methods:
-            cell, score, _n = _render_cell(sg[col])
+            vals = sg[sg["method"] == col]["acc"].dropna()
+            cell, score, _n = _render_cell(vals)
             scored.append((cell, score))
         row += _bold_best_row(scored)
 
@@ -471,14 +571,14 @@ def _panel_minipage(
 # ----------------------------
 # MAIN TABLE (GT = MAIN_GT)
 # ----------------------------
-def make_main_table_gt0_grid_2x3(df_all: pd.DataFrame) -> str:
+def make_main_table_gt0_grid_2x3(df_all_long: pd.DataFrame) -> str:
     r"""
     Main-text composite table, arranged as 2 columns x 3 rows for GT=MAIN_GT.
     """
-    if df_all.empty:
+    if df_all_long.empty:
         return "% No data found.\n"
 
-    df = df_all[df_all["gt"] == MAIN_GT].copy()
+    df = df_all_long[df_all_long["gt"] == MAIN_GT].copy()
     if df.empty:
         return f"% No data for G_gt={MAIN_GT}.\n"
 
@@ -505,23 +605,25 @@ def make_main_table_gt0_grid_2x3(df_all: pd.DataFrame) -> str:
 
     lines: List[str] = []
     lines.append("\\begin{table*}[t]")
-    lines.append("\\small")
+    lines.append("\\footnotesize")
     lines.append("\\centering")
     lines.append(
-        "\\caption{Target accuracy (\\%) in the hardest regime ($G_{\\text{gt}}=0$), "
-        "varying the number of generated intermediate domains $G_{\\text{gen}}$.}"
+        "\\caption{Target accuracy (\\%) in the hardest regime ($G_{\\text{obs}}=0$), "
+        "varying the number of generated intermediate domains $G_{\\text{syn}}$.}"
     )
     lines.append("\\label{tab:main-gt0-gen-sweep-grid}")
+    lines.append("% \\resizebox{\\textwidth}{!}{%")
 
     lines.append("\\setlength{\\tabcolsep}{0pt}")
     lines.append("\\renewcommand{\\arraystretch}{1.0}")
     lines.append(
-        f"\\begin{{tabular}}{{@{{}}p{{{PANEL_COL_WIDTH}}}@{{\\hspace{{{PANEL_GAP}}}}}p{{{PANEL_COL_WIDTH}}}@{{}}}}"
+        "\\begin{tabular*}{\\textwidth}{@{}c@{\\hspace{0.03\\textwidth}}c@{}}"
     )
     lines.append(p11 + " & " + p12 + " \\\\[" + ROW_VGAP + "]")
     lines.append(p21 + " & " + p22 + " \\\\[" + ROW_VGAP + "]")
     lines.append(p31 + " & " + p32 + " \\\\")
-    lines.append("\\end{tabular}")
+    lines.append("\\end{tabular*}")
+    lines.append("% }")
     lines.append("\\end{table*}")
     return "\n".join(lines)
 
@@ -529,18 +631,18 @@ def make_main_table_gt0_grid_2x3(df_all: pd.DataFrame) -> str:
 # ----------------------------
 # APPENDIX TABLES: ONE 2x3 GRID PER G_gt
 # ----------------------------
-def make_appendix_tables_by_gt_2x3(df_all: pd.DataFrame) -> str:
+def make_appendix_tables_by_gt_2x3(df_all_long: pd.DataFrame) -> str:
     r"""
     Appendix: for each G_gt value, produce ONE table* that has the same 2x3 panel layout
     as the main table (RotMNIST 30/45/90, Portraits, Covtype, ColorMNIST), with rows over #gen.
     """
-    if df_all.empty:
+    if df_all_long.empty:
         return "% No appendix tables (no data).\n"
 
     chunks: List[str] = []
-    gt_vals = sorted(df_all["gt"].dropna().unique())
+    gt_vals = sorted(df_all_long["gt"].dropna().unique())
     for gt in gt_vals:
-        df = df_all[df_all["gt"] == gt].copy()
+        df = df_all_long[df_all_long["gt"] == gt].copy()
         if df.empty:
             continue
 
@@ -667,8 +769,8 @@ def _subset_for_panel(df: pd.DataFrame, dataset: str, degree: Optional[int]) -> 
     return sub
 
 
-def _plot_method_family(df_all: pd.DataFrame, family: Dict[str, object], out_dir: str) -> List[str]:
-    df = df_all[df_all["gt"] == MAIN_GT].copy()
+def _plot_method_family(df_all_long: pd.DataFrame, family: Dict[str, object], out_dir: str) -> List[str]:
+    df = df_all_long[df_all_long["gt"] == MAIN_GT].copy()
     if df.empty:
         return []
 
@@ -699,7 +801,7 @@ def _plot_method_family(df_all: pd.DataFrame, family: Dict[str, object], out_dir
             ns = []
             xs = []
             for g in all_gens:
-                vals = sub[sub["gen"] == g][m_key].dropna()
+                vals = sub[(sub["gen"] == g) & (sub["method"] == m_key)]["acc"].dropna()
                 if len(vals) == 0:
                     continue
                 xs.append(g)
@@ -741,7 +843,7 @@ def _plot_method_family(df_all: pd.DataFrame, family: Dict[str, object], out_dir
     return [png_path, pdf_path]
 
 
-def generate_main_plots(df_all: pd.DataFrame, out_dir: str = "figures_main") -> List[str]:
+def generate_main_plots(df_all_long: pd.DataFrame, out_dir: str = "figures_main") -> List[str]:
     plt.rcParams.update(
         {
             "font.family": "serif",
@@ -758,7 +860,7 @@ def generate_main_plots(df_all: pd.DataFrame, out_dir: str = "figures_main") -> 
     )
     written: List[str] = []
     for fam in MAIN_PLOT_FAMILIES:
-        written.extend(_plot_method_family(df_all, fam, out_dir))
+        written.extend(_plot_method_family(df_all_long, fam, out_dir))
     return written
 
 
@@ -777,15 +879,16 @@ def generate_tables() -> Dict[str, str]:
 
     df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
     df_all_detailed = pd.concat(dfs_detailed, ignore_index=True) if dfs_detailed else pd.DataFrame()
+    df_selected_long = build_selected_seed_long(df_all_detailed)
 
-    main_tex = _latex_preamble_comment() + "\n" + make_main_table_gt0_grid_2x3(df_all)
-    appendix_tex = _latex_preamble_comment() + "\n" + make_appendix_tables_by_gt_2x3(df_all)
+    main_tex = _latex_preamble_comment() + "\n" + make_main_table_gt0_grid_2x3(df_selected_long)
+    appendix_tex = _latex_preamble_comment() + "\n" + make_appendix_tables_by_gt_2x3(df_selected_long)
 
     raw_dump = ""
-    if not df_all.empty:
-        raw_dump = df_all.to_string(index=False)
+    if not df_selected_long.empty:
+        raw_dump = df_selected_long.to_string(index=False)
 
-    plots = generate_main_plots(df_all, out_dir="figures_main")
+    plots = generate_main_plots(df_selected_long, out_dir="figures_main")
     summary_csv = build_results_summary(df_all_detailed)
     detailed_csv = df_all_detailed.sort_values(
         by=["dataset", "degree", "seed", "gt", "gen", "file_mtime", "file_name"],

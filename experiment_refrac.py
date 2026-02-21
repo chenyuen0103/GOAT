@@ -147,6 +147,51 @@ def _restore_target_em_labels(args, target_ds, all_sets=None) -> None:
             last_real.targets_em = canonical.clone()
 
 
+def _apply_canonical_target_em(
+    args,
+    target_ds,
+    *,
+    all_sets=None,
+    e_tgt=None,
+    encoded_intersets=None,
+) -> Optional[torch.Tensor]:
+    """
+    Apply one canonical target EM labeling everywhere it can be consumed:
+    raw target dataset, last real-domain alias, encoded target, and encoded chain tail.
+    """
+    canonical = getattr(args, "_canonical_target_em", None)
+    bundle_canonical = getattr(args, "_canonical_target_em_from_bundle", None)
+    if bundle_canonical is not None:
+        canonical = torch.as_tensor(bundle_canonical).view(-1).long().cpu().clone()
+    elif canonical is not None:
+        canonical = torch.as_tensor(canonical).view(-1).long().cpu().clone()
+    else:
+        return None
+
+    if target_ds is not None and hasattr(target_ds, "targets_em"):
+        target_ds.targets_em = canonical.clone()
+
+    if all_sets and len(all_sets) > 0:
+        last_real = all_sets[-1]
+        if hasattr(last_real, "targets_em"):
+            last_real.targets_em = canonical.clone()
+
+    if e_tgt is not None:
+        if hasattr(e_tgt, "data") and torch.is_tensor(e_tgt.data):
+            e_tgt.targets_em = canonical.to(e_tgt.data.device)
+        else:
+            e_tgt.targets_em = canonical.clone()
+
+    if encoded_intersets and len(encoded_intersets) > 0:
+        tail = encoded_intersets[-1]
+        if hasattr(tail, "data") and torch.is_tensor(tail.data):
+            tail.targets_em = canonical.to(tail.data.device)
+        else:
+            tail.targets_em = canonical.clone()
+
+    return canonical
+
+
 def build_reference_model(
     args,
     config: ModelConfig,
@@ -747,12 +792,14 @@ def run_goat_classwise(
         _restore_target_em_labels(args, tgt_trainset, all_sets)
         if hasattr(tgt_trainset, "targets_em") and tgt_trainset.targets_em is not None:
             e_tgt.targets_em = torch.as_tensor(tgt_trainset.targets_em).to(e_tgt.data.device).long()
-    # Final hard guard: if bundle labels were snapshotted, enforce them verbatim.
-    bundle_canonical = getattr(args, "_canonical_target_em_from_bundle", None)
-    if bundle_canonical is not None:
-        canonical = torch.as_tensor(bundle_canonical).view(-1).long()
-        tgt_trainset.targets_em = canonical.clone()
-        e_tgt.targets_em = canonical.to(e_tgt.data.device)
+    # Final hard guard: enforce canonical target EM labels on raw + encoded targets.
+    _apply_canonical_target_em(
+        args,
+        tgt_trainset,
+        all_sets=all_sets,
+        e_tgt=e_tgt,
+        encoded_intersets=encoded_intersets,
+    )
 
     for raw_ds, enc_ds in zip(raw_domains, enc_domains):
         if hasattr(raw_ds, "targets_em"):
@@ -1062,6 +1109,15 @@ def run_main_algo_cached(
             "encoded_intersets": encoded_intersets,
             "pseudolabels": pseudolabels,
         }
+
+    # Force canonical target EM labels across raw/encoded views before diagnostics or training.
+    _apply_canonical_target_em(
+        args,
+        tgt_trainset,
+        all_sets=all_sets,
+        e_tgt=e_tgt,
+        encoded_intersets=encoded_intersets,
+    )
 
     _sanitize_targets_em_field(e_src)
     _sanitize_targets_em_field(e_tgt)
