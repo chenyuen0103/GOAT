@@ -116,7 +116,7 @@ def _plots_base_dir(args) -> str:
 
 
 def _logs_base_dir(args) -> str:
-    return os.path.join("logs", args.dataset, _seed_tag(args))
+    return os.path.join(args.log_root, args.dataset, _seed_tag(args))
 
 
 def _snapshot_target_em_labels(args, target_ds) -> None:
@@ -2481,6 +2481,12 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument(
+        "--log-root",
+        type=str,
+        default=os.environ.get("LOG_ROOT", "logs_rerun"),
+        help="Root directory for experiment logs.",
+    )
     parser.add_argument("--log-file", type=str, default="")
     parser.add_argument("--ssl-weight", type=float, default=0.1)
     parser.add_argument(

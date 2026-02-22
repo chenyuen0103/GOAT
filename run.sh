@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+LOG_ROOT="${LOG_ROOT:-logs_rerun}"
+
 angles=(45 90 30 60)
 label_sources=(pseudo)
 em_matches=(prototypes pseudo)
@@ -60,7 +62,7 @@ for a in "${angles[@]}"; do
             fi
 
             log_base="test_acc_dim${small_dim}_int${gt}_gen${gd}_${ls}_${m}_${em_select}${em_ensemble_suffix}.txt"
-            log_dir="logs/mnist/s${s}/target${a}"
+            log_dir="${LOG_ROOT}/mnist/s${s}/target${a}"
             log_path="${log_dir}/${log_base}"
             if [[ -f "$log_path" ]]; then
               marker="seed${s}with${gt}gt${gd}generated,"
@@ -85,9 +87,9 @@ for a in "${angles[@]}"; do
             fi
             echo "Running: angle=$a, label_source=$ls, em_match=$m, seed=$s, gt_domains=$gt, generated_domains=$gd"
             if [[ "${DRY_RUN}" == "1" ]]; then
-              echo "DRY_RUN=1: python experiment_refrac.py --rotation-angle \"$a\" --label-source \"$ls\" --em-match \"$m\" --gt-domains \"$gt\" --generated-domains \"$gd\" ${em_ensemble_flag[*]} --seed \"$s\""
+              echo "DRY_RUN=1: python experiment_refrac.py --log-root \"$LOG_ROOT\" --rotation-angle \"$a\" --label-source \"$ls\" --em-match \"$m\" --gt-domains \"$gt\" --generated-domains \"$gd\" ${em_ensemble_flag[*]} --seed \"$s\""
             else
-              python experiment_refrac.py --rotation-angle "$a" --label-source "$ls" --em-match "$m" --gt-domains "$gt" --generated-domains "$gd" "${em_ensemble_flag[@]}" --seed "$s"
+              python experiment_refrac.py --log-root "$LOG_ROOT" --rotation-angle "$a" --label-source "$ls" --em-match "$m" --gt-domains "$gt" --generated-domains "$gd" "${em_ensemble_flag[@]}" --seed "$s"
             fi
           done
         done

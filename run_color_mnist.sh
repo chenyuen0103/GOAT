@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+LOG_ROOT="${LOG_ROOT:-logs_rerun}"
+
 label_sources=(pseudo em)
 em_matches=(prototypes pseudo)
 seeds=(0 1 2)
@@ -134,7 +136,7 @@ for ls in "${label_sources[@]}"; do
           fi
 
           log_file="test_acc_dim${small_dim}_int${gt}_gen${gd}_${ls}_${m}_${em_select}${em_ensemble_suffix}"
-          log_path="logs/color_mnist/s${s}/${log_file}.txt"
+          log_path="${LOG_ROOT}/color_mnist/s${s}/${log_file}.txt"
 
           marker="seed${s}with${gt}gt${gd}generated,"
           if is_complete_any_log "$log_path" "$marker"; then
@@ -156,11 +158,11 @@ for ls in "${label_sources[@]}"; do
           gpu="$(pick_gpu)"
           echo "Using GPU ${gpu} (set GPU_ID to override; GPU_LIST=${GPU_LIST})"
           if [[ "${DRY_RUN}" == "1" ]]; then
-            echo "DRY_RUN=1: CUDA_VISIBLE_DEVICES=\"${gpu}\" PYTORCH_CUDA_ALLOC_CONF=\"${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}\" python experiment_refrac.py --dataset color_mnist --label-source \"$ls\" --em-match \"$m\" --seed \"$s\" --gt-domains \"$gt\" --generated-domains \"$gd\" --log-file \"$log_file\" ${em_ensemble_flag[*]}"
+            echo "DRY_RUN=1: CUDA_VISIBLE_DEVICES=\"${gpu}\" PYTORCH_CUDA_ALLOC_CONF=\"${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}\" python experiment_refrac.py --log-root \"$LOG_ROOT\" --dataset color_mnist --label-source \"$ls\" --em-match \"$m\" --seed \"$s\" --gt-domains \"$gt\" --generated-domains \"$gd\" --log-file \"$log_file\" ${em_ensemble_flag[*]}"
           else
             CUDA_VISIBLE_DEVICES="${gpu}" \
               PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
-              python experiment_refrac.py --dataset color_mnist --label-source "$ls" --em-match "$m" --seed "$s" --gt-domains "$gt" --generated-domains "$gd" --log-file "$log_file" "${em_ensemble_flag[@]}"
+              python experiment_refrac.py --log-root "$LOG_ROOT" --dataset color_mnist --label-source "$ls" --em-match "$m" --seed "$s" --gt-domains "$gt" --generated-domains "$gd" --log-file "$log_file" "${em_ensemble_flag[@]}"
           fi
         done
       done

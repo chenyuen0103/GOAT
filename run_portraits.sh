@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+LOG_ROOT="${LOG_ROOT:-logs_rerun}"
+
 
 
 label_sources=(pseudo)
@@ -28,7 +30,7 @@ for ls in "${label_sources[@]}"; do
           fi
 
           log_base="test_acc_dim${small_dim}_int${gt}_gen${gd}_${ls}_${m}_${em_select}${em_ensemble_suffix}.txt"
-          log_dir="logs/${dataset}/s${s}"
+          log_dir="${LOG_ROOT}/${dataset}/s${s}"
           log_path="${log_dir}/${log_base}"
           if [[ -f "$log_path" ]]; then
             if [[ "$gd" == "0" && "$RERUN_GEN0" == "1" ]]; then
@@ -54,7 +56,7 @@ for ls in "${label_sources[@]}"; do
             fi
           fi
           echo "Running: label_source=$ls, em_match=$m, seed=$s, gt_domains=$gt, generated_domains=$gd"
-          python experiment_refrac.py --dataset "$dataset" --label-source "$ls" --em-match "$m" --seed "$s" --gt-domains "$gt" --generated-domains "$gd"
+          python experiment_refrac.py --log-root "$LOG_ROOT" --dataset "$dataset" --label-source "$ls" --em-match "$m" --seed "$s" --gt-domains "$gt" --generated-domains "$gd"
         done
       done
     done

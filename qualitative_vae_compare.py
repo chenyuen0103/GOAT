@@ -35,29 +35,32 @@ from experiment_new import set_all_seeds
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-class MLPVAE(nn.Module):
-    def __init__(self, input_dim: int = 784, latent_dim: int = 2048) -> None:
+class FeatureToImageVAE(nn.Module):
+    def __init__(self, feature_dim: int, latent_dim: int = 256, image_dim: int = 784) -> None:
         super().__init__()
         hidden = 1024
-        self.enc = nn.Sequential(
-            nn.Linear(input_dim, hidden),
+        self.feature_enc = nn.Sequential(
+            nn.Linear(feature_dim, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
         )
         self.mu = nn.Linear(hidden, latent_dim)
         self.logvar = nn.Linear(hidden, latent_dim)
-        self.dec = nn.Sequential(
+        self.image_dec = nn.Sequential(
             nn.Linear(latent_dim, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
-            nn.Linear(hidden, input_dim),
+            nn.Linear(hidden, image_dim),
             nn.Sigmoid(),
         )
+        self.feature_dim = int(feature_dim)
+        self.latent_dim = int(latent_dim)
+        self.image_dim = int(image_dim)
 
-    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self.enc(x)
+    def encode_feature(self, feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = self.feature_enc(feat)
         return self.mu(h), self.logvar(h)
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -66,14 +69,20 @@ class MLPVAE(nn.Module):
         return mu + eps * std
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        x = self.dec(z)
+        x = self.image_dec(z)
         return x.view(-1, 1, 28, 28)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        mu, logvar = self.encode(x)
+    def forward(self, feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu, logvar = self.encode_feature(feat)
         z = self.reparameterize(mu, logvar)
         recon = self.decode(z)
         return recon, mu, logvar
+
+    @torch.no_grad()
+    def decode_from_features(self, feat: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
+        mu, logvar = self.encode_feature(feat)
+        z = mu if deterministic else self.reparameterize(mu, logvar)
+        return self.decode(z)
 
 
 def _ensure_default_args(args: argparse.Namespace) -> argparse.Namespace:
@@ -225,57 +234,79 @@ def _vae_checkpoint_path(args: argparse.Namespace, output_dir: str, latent_dim: 
         return args.vae_path
     return os.path.join(
         output_dir,
-        f"vae_target{args.target_angle}_z{latent_dim}_seed{args.seed}.pt",
+        f"feature_vae_target{args.target_angle}_z{latent_dim}_seed{args.seed}.pt",
     )
 
 
 def train_or_load_vae(
     args: argparse.Namespace,
     target_dataset: Dataset,
+    target_features: torch.Tensor,
     latent_dim: int,
     output_dir: str,
-) -> MLPVAE:
+) -> FeatureToImageVAE:
     ckpt_path = _vae_checkpoint_path(args, output_dir, latent_dim)
-    vae = MLPVAE(input_dim=28 * 28, latent_dim=latent_dim).to(DEVICE)
+    feature_dim = int(target_features.shape[1])
+    vae = FeatureToImageVAE(feature_dim=feature_dim, latent_dim=latent_dim, image_dim=28 * 28).to(DEVICE)
 
     if os.path.exists(ckpt_path):
         payload = torch.load(ckpt_path, map_location=DEVICE)
         state = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
-        vae.load_state_dict(state, strict=True)
-        vae.eval()
-        print(f"[VAE] Loaded checkpoint: {ckpt_path}")
-        return vae
+        kind = payload.get("model_kind") if isinstance(payload, dict) else None
+        feat_dim_ckpt = payload.get("feature_dim") if isinstance(payload, dict) else None
+        latent_ckpt = payload.get("latent_dim") if isinstance(payload, dict) else None
+        if kind == "feature_to_image_vae" and feat_dim_ckpt == feature_dim and latent_ckpt == latent_dim:
+            vae.load_state_dict(state, strict=True)
+            vae.eval()
+            print(f"[VAE] Loaded checkpoint: {ckpt_path}")
+            return vae
+        print("[VAE] Existing checkpoint is incompatible with feature decoder; retraining.")
 
+    feature_tensor = target_features.detach().cpu().float()
     loader = DataLoader(
         target_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=args.num_workers,
         drop_last=False,
     )
     opt = torch.optim.Adam(vae.parameters(), lr=args.vae_lr)
     vae.train()
+    if feature_tensor.size(0) != len(target_dataset):
+        raise ValueError(
+            f"Feature/image count mismatch: features={feature_tensor.size(0)} vs images={len(target_dataset)}"
+        )
     for epoch in range(1, args.vae_epochs + 1):
         running = 0.0
         n_seen = 0
+        offset = 0
         for x, _ in loader:
             x = x.to(DEVICE).float()
-            x_flat = x.view(x.size(0), -1)
-            recon, mu, logvar = vae(x_flat)
+            bsz = x.size(0)
+            feat = feature_tensor[offset : offset + bsz].to(DEVICE)
+            offset += bsz
+            x_flat = x.view(bsz, -1)
+            recon, mu, logvar = vae(feat)
             recon_flat = recon.view(x.size(0), -1)
             bce = F.binary_cross_entropy(recon_flat, x_flat, reduction="sum")
             kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-            loss = (bce + kld) / max(1, x.size(0))
+            loss = (bce + kld) / max(1, bsz)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
-            running += float(loss.item()) * x.size(0)
-            n_seen += x.size(0)
+            running += float(loss.item()) * bsz
+            n_seen += bsz
         print(f"[VAE] epoch={epoch}/{args.vae_epochs} loss={running / max(1, n_seen):.4f}")
 
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
     torch.save(
-        {"state_dict": vae.state_dict(), "latent_dim": latent_dim, "target_angle": args.target_angle},
+        {
+            "model_kind": "feature_to_image_vae",
+            "state_dict": vae.state_dict(),
+            "feature_dim": feature_dim,
+            "latent_dim": latent_dim,
+            "target_angle": args.target_angle,
+        },
         ckpt_path,
     )
     print(f"[VAE] Saved checkpoint: {ckpt_path}")
@@ -284,14 +315,14 @@ def train_or_load_vae(
 
 
 @torch.no_grad()
-def decode_latents(vae: MLPVAE, latents: torch.Tensor) -> torch.Tensor:
-    z = latents.to(DEVICE).float()
-    imgs = vae.decode(z).detach().cpu()
+def decode_features(vae: FeatureToImageVAE, features: torch.Tensor) -> torch.Tensor:
+    feat = features.to(DEVICE).float()
+    imgs = vae.decode_from_features(feat, deterministic=True).detach().cpu()
     return imgs.clamp(0.0, 1.0)
 
 
 def _collect_step_images(
-    vae: MLPVAE,
+    vae: FeatureToImageVAE,
     methods: Sequence[str],
     method_domains: Dict[str, List[Dataset]],
     step: int,
@@ -313,8 +344,8 @@ def _collect_step_images(
     out: Dict[str, torch.Tensor] = {}
     for m in methods:
         ds = method_domains[m][step]
-        z = ds.data[idx] if torch.is_tensor(ds.data) else torch.as_tensor(ds.data[idx])
-        out[m] = decode_latents(vae, z)
+        f = ds.data[idx] if torch.is_tensor(ds.data) else torch.as_tensor(ds.data[idx])
+        out[m] = decode_features(vae, f)
     return out, idx
 
 
@@ -351,7 +382,7 @@ def save_summary_grid(
     save_path: str,
     methods: Sequence[str],
     method_domains: Dict[str, List[Dataset]],
-    vae: MLPVAE,
+    vae: FeatureToImageVAE,
     steps: Sequence[int],
 ) -> None:
     rows = len(methods)
@@ -364,8 +395,8 @@ def save_summary_grid(
     for r, m in enumerate(methods):
         for c, step in enumerate(steps):
             ds = method_domains[m][step]
-            x = ds.data[0:1] if torch.is_tensor(ds.data) else torch.as_tensor(ds.data[0:1])
-            img = decode_latents(vae, x)[0, 0]
+            f = ds.data[0:1] if torch.is_tensor(ds.data) else torch.as_tensor(ds.data[0:1])
+            img = decode_features(vae, f)[0, 0]
             ax = axes[r, c]
             ax.imshow(img, cmap="gray", vmin=0.0, vmax=1.0)
             ax.axis("off")
@@ -435,9 +466,20 @@ def run(args: argparse.Namespace) -> None:
     output_dir = _resolve_output_dir(args)
     os.makedirs(output_dir, exist_ok=True)
 
+    # Keep a dedicated args object for qualitative artifacts so we never touch
+    # the main experiment model/cache/plot paths.
+    args_main = copy.deepcopy(args)
+    args_main.dataset = "mnist"
+
     src_trainset = get_single_rotate(False, 0)
     tgt_trainset = get_single_rotate(False, args.target_angle)
     all_sets, deg_idx = _build_rotated_domains(tgt_trainset, args.target_angle, args.gt_domains)
+
+    artifact_tag = f"mnist_qualvae_target{args.target_angle}"
+    model_dir = os.path.join(output_dir, "models")
+    cache_dir = os.path.join(output_dir, "encoded_cache")
+    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(cache_dir, exist_ok=True)
 
     model_cfg = ModelConfig(
         encoder_builder=ENCODER,
@@ -445,7 +487,7 @@ def run(args: argparse.Namespace) -> None:
         n_class=10,
         epochs=10,
         model_path=os.path.join(
-            "/data/common/yuenchen/GDA/mnist_models/",
+            model_dir,
             f"src0_tgt{args.target_angle}_ssl{args.ssl_weight}_dim{args.small_dim}.pth",
         ),
         compress=True,
@@ -453,10 +495,9 @@ def run(args: argparse.Namespace) -> None:
         out_dim=args.small_dim,
     )
 
-    ref_model, ref_encoder = build_reference_model(args, model_cfg, src_trainset, tgt_trainset)
-    cache_dir = f"cache{args.ssl_weight}/target{args.target_angle}/small_dim{args.small_dim}/"
+    ref_model, ref_encoder = build_reference_model(args_main, model_cfg, src_trainset, tgt_trainset)
     _, _, _ = encode_real_domains(
-        args,
+        args_main,
         ref_encoder=ref_encoder,
         src_trainset=src_trainset,
         tgt_trainset=tgt_trainset,
@@ -473,7 +514,7 @@ def run(args: argparse.Namespace) -> None:
 
     teacher = copy.deepcopy(ref_model).to(DEVICE).eval()
     _em_bundles, _em_accs, _ = build_em_bundles_for_chain(
-        args,
+        args_main,
         raw_domains=raw_domains,
         encoded_domains=encoded_domains,
         domain_keys=angle_keys,
@@ -483,8 +524,12 @@ def run(args: argparse.Namespace) -> None:
     )
 
     print("[Run] Running standard methods through run_core_methods for consistency...")
+    # Method internals write plots/caches under args.dataset; switch to an
+    # isolated namespace to avoid overwriting main experiment artifacts.
+    method_args = copy.deepcopy(args_main)
+    method_args.dataset = artifact_tag
     results = run_core_methods(
-        args,
+        method_args,
         ref_model=ref_model,
         src_trainset=src_trainset,
         tgt_trainset=tgt_trainset,
@@ -497,7 +542,7 @@ def run(args: argparse.Namespace) -> None:
         if k in results and results[k].test_curve:
             print(f"[Run] {k}: final test={results[k].test_curve[-1]:.2f}")
 
-    method_domains = extract_method_domains(args, encoded_domains, args.generated_domains)
+    method_domains = extract_method_domains(method_args, encoded_domains, args.generated_domains)
     n_steps_by_method = {k: len(v) for k, v in method_domains.items()}
     print(f"[Run] Extracted synthetic steps per method: {n_steps_by_method}")
     min_steps = min(n_steps_by_method.values())
@@ -506,8 +551,13 @@ def run(args: argparse.Namespace) -> None:
     if min_steps <= 0:
         raise RuntimeError("No synthetic intermediate steps were produced.")
 
-    latent_dim = args.vae_latent_dim if args.vae_latent_dim is not None else args.small_dim
-    vae = train_or_load_vae(args, tgt_trainset, latent_dim, output_dir)
+    latent_dim = args.vae_latent_dim if args.vae_latent_dim is not None else min(512, args.small_dim)
+    target_features = (
+        encoded_domains[-1].data
+        if torch.is_tensor(encoded_domains[-1].data)
+        else torch.as_tensor(encoded_domains[-1].data)
+    )
+    vae = train_or_load_vae(args, tgt_trainset, target_features, latent_dim, output_dir)
 
     save_endpoint_grid(
         os.path.join(output_dir, "endpoints_source_target.png"),

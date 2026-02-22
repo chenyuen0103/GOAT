@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+LOG_ROOT="${LOG_ROOT:-logs_rerun}"
+
 get_arg_value() {
   local flag="$1"
   shift
@@ -48,9 +50,9 @@ compute_log_path() {
   if [[ "$dataset" == "mnist" ]]; then
     target="$(get_arg_value --rotation-angle "${argv[@]}" || echo "")"
     [[ -n "$target" ]] || { echo "ERROR: missing --rotation-angle for MNIST" >&2; return 2; }
-    log_dir="logs/${dataset}/s${seed}/target${target}"
+    log_dir="${LOG_ROOT}/${dataset}/s${seed}/target${target}"
   else
-    log_dir="logs/${dataset}/s${seed}"
+    log_dir="${LOG_ROOT}/${dataset}/s${seed}"
   fi
 
   log_file="$(get_arg_value --log-file "${argv[@]}" || echo "")"
@@ -80,4 +82,3 @@ while IFS= read -r line; do
   echo "Running: $line"
   eval "$line"
 done < "$input"
-
