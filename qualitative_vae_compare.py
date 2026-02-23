@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import TensorDataset
 
 from dataset import DomainDataset
 from experiment_refrac import (
@@ -22,7 +23,7 @@ from experiment_refrac import (
     load_encoded_domains,
     run_core_methods,
 )
-from model import ENCODER
+from model import ENCODER, VAE
 from ot_util import generate_domains
 from util import get_single_rotate
 from a_star_util import (
@@ -47,14 +48,9 @@ class FeatureToImageVAE(nn.Module):
         )
         self.mu = nn.Linear(hidden, latent_dim)
         self.logvar = nn.Linear(hidden, latent_dim)
-        self.image_dec = nn.Sequential(
-            nn.Linear(latent_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, image_dim),
-            nn.Sigmoid(),
-        )
+        # Reuse the VAE decoder architecture defined in model.py
+        base_vae = VAE(x_dim=image_dim, z_dim=latent_dim, h_dim=hidden)
+        self.image_dec = base_vae.decoder
         self.feature_dim = int(feature_dim)
         self.latent_dim = int(latent_dim)
         self.image_dim = int(image_dim)
@@ -191,6 +187,12 @@ def extract_method_domains(
         right = encoded_domains[i + 1]
 
         goat_chain, _, _ = generate_domains(generated_domains, left, right)
+        # GOAT generator does not attach labels; inherit left-domain labels by index.
+        left_labels = _get_label_tensor(left, use_em=(i > 0))
+        for ds in goat_chain[:-1]:
+            if len(ds.data) == len(left_labels):
+                ds.targets = left_labels.clone().cpu()
+                ds.targets_em = left_labels.clone().cpu()
         methods["goat"].extend(goat_chain[:-1])
 
         class_chains: List[List[DomainDataset]] = []
@@ -229,6 +231,43 @@ def extract_method_domains(
     return methods
 
 
+def _labels_for_domain(ds: Dataset) -> torch.Tensor:
+    if hasattr(ds, "targets") and ds.targets is not None:
+        return torch.as_tensor(ds.targets).long().view(-1)
+    if hasattr(ds, "targets_em") and ds.targets_em is not None:
+        return torch.as_tensor(ds.targets_em).long().view(-1)
+    return torch.full((len(ds.data),), -1, dtype=torch.long)
+
+
+def _common_indices_for_class(
+    trajectory_chains: Dict[str, Sequence[Dataset]],
+    methods: Sequence[str],
+    cls: int,
+    n_samples: int,
+    seed: int,
+) -> np.ndarray:
+    check_domains: List[Dataset] = []
+    for m in methods:
+        check_domains.extend(list(trajectory_chains[m]))
+
+    min_len = min(len(ds.data) for ds in check_domains)
+    if min_len <= 0:
+        return np.array([], dtype=np.int64)
+
+    common = np.ones(min_len, dtype=bool)
+    for ds in check_domains:
+        y = _labels_for_domain(ds).cpu().numpy()[:min_len]
+        common &= (y == int(cls))
+    idx = np.where(common)[0]
+    if len(idx) == 0:
+        return idx
+
+    n = min(n_samples, len(idx))
+    rng = np.random.default_rng(seed + 9000 + int(cls))
+    picked = np.sort(rng.choice(idx, size=n, replace=False))
+    return picked.astype(np.int64)
+
+
 def _vae_checkpoint_path(args: argparse.Namespace, output_dir: str, latent_dim: int) -> str:
     if args.vae_path:
         return args.vae_path
@@ -240,13 +279,13 @@ def _vae_checkpoint_path(args: argparse.Namespace, output_dir: str, latent_dim: 
 
 def train_or_load_vae(
     args: argparse.Namespace,
-    target_dataset: Dataset,
-    target_features: torch.Tensor,
+    train_dataset: Dataset,
+    train_features: torch.Tensor,
     latent_dim: int,
     output_dir: str,
 ) -> FeatureToImageVAE:
     ckpt_path = _vae_checkpoint_path(args, output_dir, latent_dim)
-    feature_dim = int(target_features.shape[1])
+    feature_dim = int(train_features.shape[1])
     vae = FeatureToImageVAE(feature_dim=feature_dim, latent_dim=latent_dim, image_dim=28 * 28).to(DEVICE)
 
     if os.path.exists(ckpt_path):
@@ -255,36 +294,77 @@ def train_or_load_vae(
         kind = payload.get("model_kind") if isinstance(payload, dict) else None
         feat_dim_ckpt = payload.get("feature_dim") if isinstance(payload, dict) else None
         latent_ckpt = payload.get("latent_dim") if isinstance(payload, dict) else None
-        if kind == "feature_to_image_vae" and feat_dim_ckpt == feature_dim and latent_ckpt == latent_dim:
+        scope_ckpt = payload.get("train_scope") if isinstance(payload, dict) else None
+        decoder_arch_ckpt = payload.get("decoder_arch") if isinstance(payload, dict) else None
+        if (
+            kind == "feature_to_image_vae"
+            and feat_dim_ckpt == feature_dim
+            and latent_ckpt == latent_dim
+            and scope_ckpt == "source_target"
+            and decoder_arch_ckpt == "model.VAE.decoder"
+        ):
             vae.load_state_dict(state, strict=True)
             vae.eval()
             print(f"[VAE] Loaded checkpoint: {ckpt_path}")
             return vae
         print("[VAE] Existing checkpoint is incompatible with feature decoder; retraining.")
 
-    feature_tensor = target_features.detach().cpu().float()
-    loader = DataLoader(
-        target_dataset,
+    feature_tensor = train_features.detach().cpu().float()
+    opt = torch.optim.Adam(vae.parameters(), lr=args.vae_lr)
+    if feature_tensor.size(0) != len(train_dataset):
+        raise ValueError(
+            f"Feature/image count mismatch: features={feature_tensor.size(0)} vs images={len(train_dataset)}"
+        )
+
+    # Build aligned (feature, image) pairs and split train/val for early stopping.
+    all_images = train_dataset.tensors[0].detach().cpu().float()
+    if all_images.size(0) != feature_tensor.size(0):
+        raise ValueError(
+            f"Image/feature pair mismatch: images={all_images.size(0)} vs features={feature_tensor.size(0)}"
+        )
+    n_all = int(feature_tensor.size(0))
+    idx_all = np.arange(n_all)
+    rng = np.random.default_rng(args.seed)
+    rng.shuffle(idx_all)
+    n_val = int(round(n_all * float(args.vae_val_frac)))
+    n_val = min(max(n_val, 1), max(1, n_all - 1))
+    val_idx = idx_all[:n_val]
+    tr_idx = idx_all[n_val:]
+
+    tr_feat = feature_tensor[tr_idx]
+    tr_img = all_images[tr_idx]
+    va_feat = feature_tensor[val_idx]
+    va_img = all_images[val_idx]
+
+    train_pairs = TensorDataset(tr_feat, tr_img)
+    val_pairs = TensorDataset(va_feat, va_img)
+    train_loader = DataLoader(
+        train_pairs,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_pairs,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         drop_last=False,
     )
-    opt = torch.optim.Adam(vae.parameters(), lr=args.vae_lr)
-    vae.train()
-    if feature_tensor.size(0) != len(target_dataset):
-        raise ValueError(
-            f"Feature/image count mismatch: features={feature_tensor.size(0)} vs images={len(target_dataset)}"
-        )
+
+    best_val = float("inf")
+    best_state = copy.deepcopy(vae.state_dict())
+    bad_epochs = 0
+
     for epoch in range(1, args.vae_epochs + 1):
+        vae.train()
         running = 0.0
         n_seen = 0
-        offset = 0
-        for x, _ in loader:
+        for feat, x in train_loader:
+            feat = feat.to(DEVICE).float()
             x = x.to(DEVICE).float()
             bsz = x.size(0)
-            feat = feature_tensor[offset : offset + bsz].to(DEVICE)
-            offset += bsz
             x_flat = x.view(bsz, -1)
             recon, mu, logvar = vae(feat)
             recon_flat = recon.view(x.size(0), -1)
@@ -296,7 +376,43 @@ def train_or_load_vae(
             opt.step()
             running += float(loss.item()) * bsz
             n_seen += bsz
-        print(f"[VAE] epoch={epoch}/{args.vae_epochs} loss={running / max(1, n_seen):.4f}")
+
+        # Validation loss for convergence-based stopping.
+        vae.eval()
+        val_sum = 0.0
+        val_n = 0
+        with torch.no_grad():
+            for feat, x in val_loader:
+                feat = feat.to(DEVICE).float()
+                x = x.to(DEVICE).float()
+                bsz = x.size(0)
+                x_flat = x.view(bsz, -1)
+                recon, mu, logvar = vae(feat)
+                recon_flat = recon.view(bsz, -1)
+                bce = F.binary_cross_entropy(recon_flat, x_flat, reduction="sum")
+                kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+                loss = (bce + kld) / max(1, bsz)
+                val_sum += float(loss.item()) * bsz
+                val_n += bsz
+
+        tr_loss = running / max(1, n_seen)
+        val_loss = val_sum / max(1, val_n)
+        print(f"[VAE] epoch={epoch}/{args.vae_epochs} train={tr_loss:.4f} val={val_loss:.4f}")
+
+        if val_loss < (best_val - float(args.vae_min_delta)):
+            best_val = val_loss
+            best_state = copy.deepcopy(vae.state_dict())
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+            if bad_epochs >= int(args.vae_patience):
+                print(
+                    f"[VAE] Early stopping at epoch {epoch} "
+                    f"(best_val={best_val:.4f}, patience={args.vae_patience})"
+                )
+                break
+
+    vae.load_state_dict(best_state, strict=True)
 
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
     torch.save(
@@ -306,6 +422,9 @@ def train_or_load_vae(
             "feature_dim": feature_dim,
             "latent_dim": latent_dim,
             "target_angle": args.target_angle,
+            "train_scope": "source_target",
+            "decoder_arch": "model.VAE.decoder",
+            "best_val_loss": float(best_val),
         },
         ckpt_path,
     )
@@ -443,6 +562,192 @@ def save_endpoint_grid(
     plt.close(fig)
 
 
+def _sample_common_indices_for_trajectories(
+    trajectory_chains: Dict[str, Sequence[Dataset]],
+    methods: Sequence[str],
+    n_samples: int,
+    seed: int,
+) -> np.ndarray:
+    """Pick one shared index set valid for all methods and all trajectory columns."""
+    lengths: List[int] = []
+    for m in methods:
+        for ds in trajectory_chains[m]:
+            lengths.append(len(ds.data))
+
+    min_len = int(min(lengths)) if lengths else 0
+    if min_len <= 0:
+        raise RuntimeError("Cannot sample trajectory indices: no common valid length.")
+
+    n = min(n_samples, min_len)
+    rng = np.random.default_rng(seed + 4242)
+    idx = np.sort(rng.choice(min_len, size=n, replace=False))
+    return idx
+
+
+def build_labeled_trajectory_chain(
+    encoded_domains: Sequence[Dataset],
+    method_synth_domains: Sequence[Dataset],
+    *,
+    generated_domains: int,
+) -> Tuple[List[Dataset], List[str], List[bool]]:
+    """
+    Build trajectory columns with explicit Real/Synthetic structure:
+      R0(source), S, ..., S, R1, S, ..., R2, ..., RT(target)
+    """
+    if generated_domains <= 0:
+        raise ValueError("generated_domains must be > 0.")
+    n_pairs = len(encoded_domains) - 1
+    expected_synth = n_pairs * generated_domains
+    if len(method_synth_domains) < expected_synth:
+        raise RuntimeError(
+            f"Not enough synthetic domains: expected at least {expected_synth}, got {len(method_synth_domains)}"
+        )
+
+    chain: List[Dataset] = [encoded_domains[0]]
+    labels: List[str] = ["R0 (Source)"]
+    is_synth: List[bool] = [False]
+
+    cursor = 0
+    for pair_idx in range(n_pairs):
+        for j in range(generated_domains):
+            chain.append(method_synth_domains[cursor])
+            labels.append(f"S{pair_idx+1}.{j+1} (Synthetic)")
+            is_synth.append(True)
+            cursor += 1
+
+        # Real endpoint of this pair: intermediate or final target
+        real_domain_idx = pair_idx + 1
+        is_target = real_domain_idx == len(encoded_domains) - 1
+        if is_target:
+            labels.append(f"R{real_domain_idx} (Target)")
+        else:
+            labels.append(f"R{real_domain_idx} (Real)")
+        chain.append(encoded_domains[real_domain_idx])
+        is_synth.append(False)
+
+    return chain, labels, is_synth
+
+
+def save_method_trajectory_grid(
+    save_path: str,
+    method_name: str,
+    trajectory_domains: Sequence[Dataset],
+    trajectory_labels: Sequence[str],
+    vae: FeatureToImageVAE,
+    indices: np.ndarray,
+) -> None:
+    """Rows are fixed sample indices; columns are source->...->target trajectory."""
+    n_rows = len(indices)
+    n_cols = len(trajectory_domains)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 1.2, n_rows * 1.2))
+    if n_rows == 1:
+        axes = np.expand_dims(axes, axis=0)
+    if n_cols == 1:
+        axes = np.expand_dims(axes, axis=1)
+
+    for c, ds in enumerate(trajectory_domains):
+        feat = ds.data if torch.is_tensor(ds.data) else torch.as_tensor(ds.data)
+        decoded = decode_features(vae, feat[indices])
+        for r in range(n_rows):
+            ax = axes[r, c]
+            ax.imshow(decoded[r, 0], cmap="gray", vmin=0.0, vmax=1.0)
+            ax.axis("off")
+            if r == 0:
+                ax.set_title(trajectory_labels[c], fontsize=8)
+            if c == 0:
+                ax.set_ylabel(f"idx={int(indices[r])}", fontsize=8)
+
+    fig.suptitle(f"{method_name}: fixed-index trajectory", fontsize=12)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_all_methods_class_trajectory_grid(
+    save_path: str,
+    methods: Sequence[str],
+    display_names: Dict[str, str],
+    trajectory_chains: Dict[str, Sequence[Dataset]],
+    trajectory_labels: Sequence[str],
+    trajectory_is_synth: Sequence[bool],
+    vae: FeatureToImageVAE,
+    indices: np.ndarray,
+    class_id: int,
+) -> None:
+    if len(indices) == 0:
+        return
+    n_methods = len(methods)
+    n_rows = n_methods
+    n_cols = len(trajectory_labels)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2.35, n_rows * 1.85), squeeze=False)
+
+    def _to_strip(decoded: torch.Tensor) -> np.ndarray:
+        # decoded: (N,1,28,28) -> strip (28, N*28)
+        arr = decoded[:, 0].cpu().numpy()
+        return np.concatenate([arr[i] for i in range(arr.shape[0])], axis=1)
+
+    for m_idx, m in enumerate(methods):
+        chain = trajectory_chains[m]
+        for c in range(n_cols):
+            ds = chain[c]
+            feat = ds.data if torch.is_tensor(ds.data) else torch.as_tensor(ds.data)
+            decoded = decode_features(vae, feat[indices])
+            strip = _to_strip(decoded)
+            ax = axes[m_idx, c]
+            ax.imshow(strip, cmap="gray", vmin=0.0, vmax=1.0, aspect="auto")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(True)
+                spine.set_linewidth(0.8)
+                spine.set_color("#202020")
+            # Sample separators inside each strip (every 28 px).
+            for k in range(1, len(indices)):
+                ax.axvline(28 * k - 0.5, color="#f3f3f3", lw=0.8, alpha=0.9)
+            if m_idx == 0:
+                title_fc = "#fdebd0" if trajectory_is_synth[c] else "#e8f1fb"
+                ax.set_title(
+                    trajectory_labels[c],
+                    fontsize=10,
+                    fontweight="bold",
+                    pad=8,
+                    bbox=dict(boxstyle="round,pad=0.22", fc=title_fc, ec="#777777", lw=0.8),
+                )
+            if c == 0:
+                ax.set_ylabel(
+                    display_names[m],
+                    fontsize=11,
+                    fontweight="bold",
+                    rotation=0,
+                    labelpad=38,
+                    va="center",
+                    ha="right",
+                    bbox=dict(boxstyle="round,pad=0.28", fc="#f5f5f5", ec="#999999", lw=0.9),
+                )
+
+    fig.suptitle(
+        f"Class {class_id} Trajectories Across Methods",
+        fontsize=14,
+        fontweight="bold",
+        y=0.995,
+    )
+    fig.text(
+        0.5,
+        0.01,
+        f"Shared sample indices (same for all methods/columns): {indices.tolist()}",
+        ha="center",
+        va="bottom",
+        fontsize=10,
+    )
+    fig.tight_layout(rect=(0.02, 0.04, 1.0, 0.96))
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path, dpi=400, bbox_inches="tight")
+    pdf_path = os.path.splitext(save_path)[0] + ".pdf"
+    fig.savefig(pdf_path, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _resolve_output_dir(args: argparse.Namespace) -> str:
     if args.output_dir:
         return args.output_dir
@@ -451,6 +756,16 @@ def _resolve_output_dir(args: argparse.Namespace) -> str:
         f"qualitative_mnist_target{args.target_angle}",
         f"seed{args.seed}",
     )
+
+
+def _collect_images_in_order(dataset: Dataset, batch_size: int, num_workers: int) -> torch.Tensor:
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False)
+    imgs = []
+    for x, _ in loader:
+        imgs.append(x.detach().cpu().float())
+    if not imgs:
+        raise RuntimeError("Failed to collect images from dataset.")
+    return torch.cat(imgs, dim=0)
 
 
 def run(args: argparse.Namespace) -> None:
@@ -512,6 +827,29 @@ def run(args: argparse.Namespace) -> None:
     angle_keys = [0] + deg_idx
     encoded_domains = load_encoded_domains(cache_dir, angle_keys)
 
+    latent_dim = args.vae_latent_dim if args.vae_latent_dim is not None else min(512, args.small_dim)
+    source_features = (
+        encoded_domains[0].data
+        if torch.is_tensor(encoded_domains[0].data)
+        else torch.as_tensor(encoded_domains[0].data)
+    )
+    target_features = (
+        encoded_domains[-1].data
+        if torch.is_tensor(encoded_domains[-1].data)
+        else torch.as_tensor(encoded_domains[-1].data)
+    )
+    src_images = _collect_images_in_order(src_trainset, batch_size=args.batch_size, num_workers=args.num_workers)
+    tgt_images = _collect_images_in_order(tgt_trainset, batch_size=args.batch_size, num_workers=args.num_workers)
+    vae_images = torch.cat([src_images, tgt_images], dim=0)
+    vae_features = torch.cat([source_features.detach().cpu().float(), target_features.detach().cpu().float()], dim=0)
+    vae_trainset = TensorDataset(vae_images, torch.zeros(len(vae_images), dtype=torch.long))
+
+    _ = train_or_load_vae(args, vae_trainset, vae_features, latent_dim, output_dir)
+    if args.vae_only:
+        print("[Done] VAE-only mode: reconstruction model trained/loaded. Skipping method runs and trajectory plots.")
+        print(f"[Done] Outputs saved under: {output_dir}")
+        return
+
     teacher = copy.deepcopy(ref_model).to(DEVICE).eval()
     _em_bundles, _em_accs, _ = build_em_bundles_for_chain(
         args_main,
@@ -550,14 +888,7 @@ def run(args: argparse.Namespace) -> None:
         min_steps = min(min_steps, args.max_steps)
     if min_steps <= 0:
         raise RuntimeError("No synthetic intermediate steps were produced.")
-
-    latent_dim = args.vae_latent_dim if args.vae_latent_dim is not None else min(512, args.small_dim)
-    target_features = (
-        encoded_domains[-1].data
-        if torch.is_tensor(encoded_domains[-1].data)
-        else torch.as_tensor(encoded_domains[-1].data)
-    )
-    vae = train_or_load_vae(args, tgt_trainset, target_features, latent_dim, output_dir)
+    vae = train_or_load_vae(args, vae_trainset, vae_features, latent_dim, output_dir)
 
     save_endpoint_grid(
         os.path.join(output_dir, "endpoints_source_target.png"),
@@ -624,6 +955,75 @@ def run(args: argparse.Namespace) -> None:
         steps=summary_steps,
     )
 
+    # Fixed-index trajectories: same indices across all methods/domains.
+    trajectory_methods = ("goat", "goat_classwise", "ours_fr", "ours_eta")
+    trajectory_chains: Dict[str, List[Dataset]] = {}
+    trajectory_labels: Optional[List[str]] = None
+    trajectory_is_synth: Optional[List[bool]] = None
+    for m in trajectory_methods:
+        chain, labels, is_synth = build_labeled_trajectory_chain(
+            encoded_domains=encoded_domains,
+            method_synth_domains=method_domains[m][:min_steps],
+            generated_domains=args.generated_domains,
+        )
+        trajectory_chains[m] = chain
+        if trajectory_labels is None:
+            trajectory_labels = labels
+            trajectory_is_synth = is_synth
+
+    assert trajectory_labels is not None and trajectory_is_synth is not None
+
+    shared_idx = _sample_common_indices_for_trajectories(
+        trajectory_chains=trajectory_chains,
+        methods=trajectory_methods,
+        n_samples=args.samples_per_step,
+        seed=args.seed,
+    )
+    np.save(os.path.join(output_dir, "trajectory_indices.npy"), shared_idx)
+    print(f"[Trajectory] Shared indices: {shared_idx.tolist()}")
+
+    display_names = {
+        "goat": "GOAT",
+        "goat_classwise": "GOATCW",
+        "ours_fr": "OURS-FR",
+        "ours_eta": "OURS-Nat",
+    }
+    for m in trajectory_methods:
+        save_method_trajectory_grid(
+            os.path.join(output_dir, f"trajectory_{m}.png"),
+            method_name=display_names[m],
+            trajectory_domains=trajectory_chains[m],
+            trajectory_labels=trajectory_labels,
+            vae=vae,
+            indices=shared_idx,
+        )
+
+    # Combined figure per class: all methods in the same grid.
+    n_classes = int(torch.as_tensor(encoded_domains[0].targets).max().item()) + 1
+    for cls in range(n_classes):
+        class_idx = _common_indices_for_class(
+            trajectory_chains=trajectory_chains,
+            methods=trajectory_methods,
+            cls=cls,
+            n_samples=1,
+            seed=args.seed,
+        )
+        if len(class_idx) == 0:
+            print(f"[Trajectory] class {cls}: skipped (no common indices across all methods/steps).")
+            continue
+        save_all_methods_class_trajectory_grid(
+            save_path=os.path.join(output_dir, f"trajectory_all_methods_class{cls}.png"),
+            methods=trajectory_methods,
+            display_names=display_names,
+            trajectory_chains=trajectory_chains,
+            trajectory_labels=trajectory_labels,
+            trajectory_is_synth=trajectory_is_synth,
+            vae=vae,
+            indices=class_idx,
+            class_id=cls,
+        )
+        print(f"[Trajectory] class {cls}: saved with indices {class_idx.tolist()}")
+
     print(f"[Done] Outputs saved under: {output_dir}")
 
 
@@ -646,10 +1046,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae-latent-dim", type=int, default=None)
     parser.add_argument("--vae-epochs", type=int, default=100)
     parser.add_argument("--vae-lr", type=float, default=1e-3)
+    parser.add_argument("--vae-val-frac", type=float, default=0.1, help="Validation fraction for VAE early stopping.")
+    parser.add_argument("--vae-patience", type=int, default=12, help="Early stopping patience on VAE validation loss.")
+    parser.add_argument("--vae-min-delta", type=float, default=1e-3, help="Minimum validation-loss improvement to reset patience.")
     parser.add_argument("--vae-path", type=str, default="")
     parser.add_argument("--samples-per-step", type=int, default=16)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--output-dir", type=str, default="")
+    parser.add_argument(
+        "--vae-only",
+        action="store_true",
+        help="Train/load the feature-to-image VAE only, then exit before EM/method trajectory generation.",
+    )
     return parser.parse_args()
 
 

@@ -5,6 +5,7 @@
 # python experiment_new.py --rotation-angle 90 --label-source em
 
 LOG_ROOT="${LOG_ROOT:-logs_rerun}"
+PLOT_ROOT="${PLOT_ROOT:-plots_rerun}"
 
 seeds=(1 2)
 angles=(30 45 60 75 90)
@@ -27,7 +28,7 @@ for s in "${seeds[@]}"; do
           echo "Skip (already ran): $log_path"
           continue
         fi
-        python experiment_refrac.py --log-root "$LOG_ROOT" --rotation-angle "$a" --label-source "$label_source" --seed "$s" --gt-domains "$gt" --generated-domains "$gd"
+        python experiment_refrac.py --plot-root "$PLOT_ROOT" --log-root "$LOG_ROOT" --rotation-angle "$a" --label-source "$label_source" --seed "$s" --gt-domains "$gt" --generated-domains "$gd"
       done
     done
   done

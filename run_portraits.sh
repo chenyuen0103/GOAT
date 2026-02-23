@@ -2,6 +2,7 @@
 set -euo pipefail
 
 LOG_ROOT="${LOG_ROOT:-logs_rerun}"
+PLOT_ROOT="${PLOT_ROOT:-plots_rerun}"
 
 
 
@@ -56,7 +57,7 @@ for ls in "${label_sources[@]}"; do
             fi
           fi
           echo "Running: label_source=$ls, em_match=$m, seed=$s, gt_domains=$gt, generated_domains=$gd"
-          python experiment_refrac.py --log-root "$LOG_ROOT" --dataset "$dataset" --label-source "$ls" --em-match "$m" --seed "$s" --gt-domains "$gt" --generated-domains "$gd"
+          python experiment_refrac.py --plot-root "$PLOT_ROOT" --log-root "$LOG_ROOT" --dataset "$dataset" --label-source "$ls" --em-match "$m" --seed "$s" --gt-domains "$gt" --generated-domains "$gd"
         done
       done
     done

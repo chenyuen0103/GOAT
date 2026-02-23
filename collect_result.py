@@ -1,5 +1,6 @@
 import os
 import re
+import argparse
 from typing import Optional, Dict, List, Tuple
 
 os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
@@ -14,7 +15,7 @@ from matplotlib import ticker
 # ----------------------------
 # CONFIG
 # ----------------------------
-LOG_BASE = "logs"
+DEFAULT_LOG_BASES = ["logs","logs_rerun"]  # search these roots for logs, in order. If a run appears in multiple, keep the most recent one.
 
 DATASETS = {
     "rotated_mnist": {"log_dir": "mnist", "has_target": True},
@@ -327,7 +328,35 @@ def build_selected_seed_long(df_detailed: pd.DataFrame) -> pd.DataFrame:
     return selected
 
 
-def collect_results_detailed(dataset_name: str) -> pd.DataFrame:
+def _dedupe_prefer_latest(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    # Same logical run may appear in multiple log roots (e.g., logs + logs_rerun).
+    # Keep the most recently modified file as the canonical record.
+    dedupe_keys = [
+        "dataset",
+        "seed",
+        "degree",
+        "dim",
+        "gt",
+        "gen",
+        "setting_suffix",
+        "suffix_tokens",
+        "label_source",
+        "em_match",
+        "em_select",
+        "em_ensemble",
+        "extra_tokens",
+    ]
+    return (
+        df.sort_values(by=["file_mtime", "file_path"], ascending=[False, False], na_position="last")
+        .drop_duplicates(subset=dedupe_keys, keep="first")
+        .reset_index(drop=True)
+    )
+
+
+def collect_results_detailed(dataset_name: str, log_bases: Optional[List[str]] = None) -> pd.DataFrame:
     """
     Collect accuracies into a DataFrame with columns:
     [dataset, seed, degree, gt, gen, dim, file_path, setting fields, goat, goatcw, eta, ours_fr].
@@ -339,82 +368,93 @@ def collect_results_detailed(dataset_name: str) -> pd.DataFrame:
     if config is None:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
-    base_path = os.path.join(LOG_BASE, config["log_dir"])
-    if not os.path.isdir(base_path):
-        raise FileNotFoundError(f"Log directory not found: {base_path}")
+    roots = log_bases if log_bases else DEFAULT_LOG_BASES
+    base_paths = [os.path.join(root, config["log_dir"]) for root in roots]
+    existing_paths = [p for p in base_paths if os.path.isdir(p)]
+    if not existing_paths:
+        raise FileNotFoundError(
+            f"No log directory found for dataset={dataset_name}. Tried: {base_paths}"
+        )
 
     rows = []
 
-    for root, _dirs, files in os.walk(base_path):
-        parts = root.split(os.sep)
+    for base_path in existing_paths:
+        for root, _dirs, files in os.walk(base_path):
+            parts = root.split(os.sep)
 
-        seed = _extract_seed_from_parts(parts)
-        if seed is None:
-            continue
-
-        degree = _extract_target_degree_from_parts(parts) if config["has_target"] else None
-
-        for fname in files:
-            if not fname.endswith(".txt"):
+            seed = _extract_seed_from_parts(parts)
+            if seed is None:
                 continue
 
-            parsed = _parse_filename_settings(fname)
-            if parsed is None:
-                continue
+            degree = _extract_target_degree_from_parts(parts) if config["has_target"] else None
 
-            fp = os.path.join(root, fname)
-            last_parts: Dict[str, float] = {}
+            for fname in files:
+                if not fname.endswith(".txt"):
+                    continue
 
-            try:
-                with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        pairs = PAIR_RE.findall(line)
-                        if not pairs:
-                            continue
-                        for name, val in pairs:
-                            last_parts[name.strip().lower()] = float(val)
-            except OSError:
-                continue
+                parsed = _parse_filename_settings(fname)
+                if parsed is None:
+                    continue
+                # Ignore non-canonical variants (e.g., *_old, *_copy, etc.).
+                # Keep only the expected setting triplet:
+                #   label_source_em_match_em_select[_em-ensemble]
+                if parsed.get("extra_tokens") is not None:
+                    continue
 
-            if not last_parts:
-                continue
+                fp = os.path.join(root, fname)
+                last_parts: Dict[str, float] = {}
 
-            rows.append(
-                dict(
-                    dataset=dataset_name,
-                    log_dataset_dir=config["log_dir"],
-                    seed=seed,
-                    degree=degree,
-                    dim=parsed["dim"],
-                    gt=parsed["gt"],
-                    gen=parsed["gen"],
-                    setting_suffix=parsed["setting_suffix"],
-                    suffix_tokens=parsed["suffix_tokens"],
-                    label_source=parsed["label_source"],
-                    em_match=parsed["em_match"],
-                    em_select=parsed["em_select"],
-                    em_ensemble=parsed["em_ensemble"],
-                    extra_tokens=parsed["extra_tokens"],
-                    file_name=fname,
-                    file_path=fp,
-                    file_mtime=int(os.path.getmtime(fp)),
-                    goat=last_parts.get("goat"),
-                    goatcw=last_parts.get("goatcw"),
-                    eta=last_parts.get("eta"),
-                    ours_fr=last_parts.get("oursfr")
-                    if "oursfr" in last_parts
-                    else last_parts.get("ours_fr"),
+                try:
+                    with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            pairs = PAIR_RE.findall(line)
+                            if not pairs:
+                                continue
+                            for name, val in pairs:
+                                last_parts[name.strip().lower()] = float(val)
+                except OSError:
+                    continue
+
+                if not last_parts:
+                    continue
+
+                rows.append(
+                    dict(
+                        dataset=dataset_name,
+                        log_dataset_dir=config["log_dir"],
+                        log_root=os.path.normpath(base_path),
+                        seed=seed,
+                        degree=degree,
+                        dim=parsed["dim"],
+                        gt=parsed["gt"],
+                        gen=parsed["gen"],
+                        setting_suffix=parsed["setting_suffix"],
+                        suffix_tokens=parsed["suffix_tokens"],
+                        label_source=parsed["label_source"],
+                        em_match=parsed["em_match"],
+                        em_select=parsed["em_select"],
+                        em_ensemble=parsed["em_ensemble"],
+                        extra_tokens=parsed["extra_tokens"],
+                        file_name=fname,
+                        file_path=fp,
+                        file_mtime=int(os.path.getmtime(fp)),
+                        goat=last_parts.get("goat"),
+                        goatcw=last_parts.get("goatcw"),
+                        eta=last_parts.get("eta"),
+                        ours_fr=last_parts.get("oursfr")
+                        if "oursfr" in last_parts
+                        else last_parts.get("ours_fr"),
+                    )
                 )
-            )
 
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    return df
+    return _dedupe_prefer_latest(df)
 
 
-def collect_results(dataset_name: str) -> pd.DataFrame:
-    detailed = collect_results_detailed(dataset_name)
+def collect_results(dataset_name: str, log_bases: Optional[List[str]] = None) -> pd.DataFrame:
+    detailed = collect_results_detailed(dataset_name, log_bases=log_bases)
     if detailed.empty:
         return detailed
     return _to_table_df(detailed)
@@ -867,11 +907,11 @@ def generate_main_plots(df_all_long: pd.DataFrame, out_dir: str = "figures_main"
 # ----------------------------
 # DRIVER
 # ----------------------------
-def generate_tables() -> Dict[str, str]:
+def generate_tables(log_bases: Optional[List[str]] = None) -> Dict[str, str]:
     dfs = []
     dfs_detailed = []
     for dataset in DATASETS.keys():
-        df_detailed = collect_results_detailed(dataset)
+        df_detailed = collect_results_detailed(dataset, log_bases=log_bases)
         if df_detailed.empty:
             continue
         dfs_detailed.append(df_detailed)
@@ -906,7 +946,16 @@ def generate_tables() -> Dict[str, str]:
 
 
 if __name__ == "__main__":
-    out = generate_tables()
+    parser = argparse.ArgumentParser(description="Collect and summarize experiment logs.")
+    parser.add_argument(
+        "--log-bases",
+        type=str,
+        default=",".join(DEFAULT_LOG_BASES),
+        help="Comma-separated log root directories (e.g., logs,logs_rerun).",
+    )
+    args = parser.parse_args()
+    log_bases = [x.strip() for x in args.log_bases.split(",") if x.strip()]
+    out = generate_tables(log_bases=log_bases)
 
     with open("tables_main.tex", "w", encoding="utf-8") as f:
         f.write(out["main_tables_tex"] + "\n")

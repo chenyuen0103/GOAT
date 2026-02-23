@@ -2,6 +2,7 @@ import torch.nn as nn
 import torch
 
 import torch, torch.nn as nn, torch.nn.functional as F
+import math
 
 # --- Encoder backbone: any conv trunk that returns N×C×H×W ---
 class SmallConv(nn.Module):
@@ -438,3 +439,153 @@ class GaussianClassifier(nn.Module):
     def forward(self, x):
         z = self.features(x)
         return self.classifier(z)  # logits N×K
+
+
+class VAE(nn.Module):
+    """
+    MLP VAE for grayscale images (e.g. MNIST).
+
+    Expected by train_vae.py:
+      - constructor: VAE(x_dim=28*28, z_dim=...)
+      - forward(x): returns (recon, mu, log_var)
+      - decoder(z): callable for latent decoding
+    """
+    def __init__(self, x_dim=28 * 28, z_dim=20, h_dim=512):
+        super().__init__()
+        self.x_dim = int(x_dim)
+        self.z_dim = int(z_dim)
+        self.h_dim = int(h_dim)
+        side = int(math.sqrt(self.x_dim))
+        if side * side != self.x_dim:
+            raise ValueError(f"VAE expects square x_dim, got {x_dim}")
+        self.side = side
+
+        self.encoder_net = nn.Sequential(
+            nn.Linear(self.x_dim, self.h_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.h_dim, self.h_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.fc_mu = nn.Linear(self.h_dim, self.z_dim)
+        self.fc_log_var = nn.Linear(self.h_dim, self.z_dim)
+
+        self.decoder = nn.Sequential(
+            nn.Linear(self.z_dim, self.h_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.h_dim, self.h_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.h_dim, self.x_dim),
+            nn.Sigmoid(),
+        )
+
+    def encode(self, x):
+        h = self.encoder_net(x)
+        return self.fc_mu(h), self.fc_log_var(h)
+
+    def reparameterize(self, mu, log_var):
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        x = self.decoder(z)
+        return x.view(-1, 1, self.side, self.side)
+
+    def forward(self, x):
+        x_flat = x.view(x.size(0), -1)
+        mu, log_var = self.encode(x_flat)
+        z = self.reparameterize(mu, log_var)
+        recon = self.decode(z)
+        return recon, mu, log_var
+
+
+class _ResBlock(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(c, c, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(c),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c, c, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(c),
+        )
+
+    def forward(self, x):
+        return F.relu(x + self.block(x), inplace=True)
+
+
+class CVAE(nn.Module):
+    """
+    Conv VAE for RGB images (e.g. CIFAR10).
+
+    Expected by train_vae.py:
+      - constructor: CVAE(x_dim=32*32, z_dim=..., res=True/False)
+      - forward(x): returns (recon, mu, log_var)
+      - decoder(z): callable for latent decoding
+    """
+    def __init__(self, x_dim=32 * 32, z_dim=20, in_channels=3, base_c=64, res=False):
+        super().__init__()
+        self.x_dim = int(x_dim)
+        self.z_dim = int(z_dim)
+        self.in_channels = int(in_channels)
+        self.base_c = int(base_c)
+        side = int(math.sqrt(self.x_dim))
+        if side * side != self.x_dim:
+            raise ValueError(f"CVAE expects square x_dim, got {x_dim}")
+        self.side = side
+        self.use_res = bool(res)
+
+        enc_layers = [
+            nn.Conv2d(self.in_channels, self.base_c, 4, 2, 1),  # 32 -> 16
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.base_c, self.base_c * 2, 4, 2, 1),   # 16 -> 8
+            nn.BatchNorm2d(self.base_c * 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.base_c * 2, self.base_c * 4, 4, 2, 1),  # 8 -> 4
+            nn.BatchNorm2d(self.base_c * 4),
+            nn.ReLU(inplace=True),
+        ]
+        if self.use_res:
+            enc_layers.append(_ResBlock(self.base_c * 4))
+        self.encoder_conv = nn.Sequential(*enc_layers)
+        self.flat_dim = self.base_c * 4 * (self.side // 8) * (self.side // 8)
+        self.fc_mu = nn.Linear(self.flat_dim, self.z_dim)
+        self.fc_log_var = nn.Linear(self.flat_dim, self.z_dim)
+
+        self.decoder_input = nn.Linear(self.z_dim, self.flat_dim)
+        dec_layers = []
+        if self.use_res:
+            dec_layers.append(_ResBlock(self.base_c * 4))
+        dec_layers.extend([
+            nn.ConvTranspose2d(self.base_c * 4, self.base_c * 2, 4, 2, 1),  # 4 -> 8
+            nn.BatchNorm2d(self.base_c * 2),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(self.base_c * 2, self.base_c, 4, 2, 1),      # 8 -> 16
+            nn.BatchNorm2d(self.base_c),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(self.base_c, self.in_channels, 4, 2, 1),      # 16 -> 32
+            nn.Sigmoid(),
+        ])
+        self.decoder_conv = nn.Sequential(*dec_layers)
+
+        # Expose callable decoder(z) API expected by train_vae.py
+        self.decoder = self.decode
+
+    def encode(self, x):
+        h = self.encoder_conv(x).view(x.size(0), -1)
+        return self.fc_mu(h), self.fc_log_var(h)
+
+    def reparameterize(self, mu, log_var):
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        h = self.decoder_input(z).view(-1, self.base_c * 4, self.side // 8, self.side // 8)
+        return self.decoder_conv(h)
+
+    def forward(self, x):
+        mu, log_var = self.encode(x)
+        z = self.reparameterize(mu, log_var)
+        recon = self.decode(z)
+        return recon, mu, log_var

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 LOG_ROOT="${LOG_ROOT:-logs_rerun}"
+PLOT_ROOT="${PLOT_ROOT:-plots_rerun}"
 
 label_sources=(pseudo em)
 em_matches=(prototypes pseudo)
@@ -158,11 +159,11 @@ for ls in "${label_sources[@]}"; do
           gpu="$(pick_gpu)"
           echo "Using GPU ${gpu} (set GPU_ID to override; GPU_LIST=${GPU_LIST})"
           if [[ "${DRY_RUN}" == "1" ]]; then
-            echo "DRY_RUN=1: CUDA_VISIBLE_DEVICES=\"${gpu}\" PYTORCH_CUDA_ALLOC_CONF=\"${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}\" python experiment_refrac.py --log-root \"$LOG_ROOT\" --dataset color_mnist --label-source \"$ls\" --em-match \"$m\" --seed \"$s\" --gt-domains \"$gt\" --generated-domains \"$gd\" --log-file \"$log_file\" ${em_ensemble_flag[*]}"
+            echo "DRY_RUN=1: CUDA_VISIBLE_DEVICES=\"${gpu}\" PYTORCH_CUDA_ALLOC_CONF=\"${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}\" python experiment_refrac.py --plot-root \"$PLOT_ROOT\" --log-root \"$LOG_ROOT\" --dataset color_mnist --label-source \"$ls\" --em-match \"$m\" --seed \"$s\" --gt-domains \"$gt\" --generated-domains \"$gd\" --log-file \"$log_file\" ${em_ensemble_flag[*]}"
           else
             CUDA_VISIBLE_DEVICES="${gpu}" \
               PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
-              python experiment_refrac.py --log-root "$LOG_ROOT" --dataset color_mnist --label-source "$ls" --em-match "$m" --seed "$s" --gt-domains "$gt" --generated-domains "$gd" --log-file "$log_file" "${em_ensemble_flag[@]}"
+              python experiment_refrac.py --plot-root "$PLOT_ROOT" --log-root "$LOG_ROOT" --dataset color_mnist --label-source "$ls" --em-match "$m" --seed "$s" --gt-domains "$gt" --generated-domains "$gd" --log-file "$log_file" "${em_ensemble_flag[@]}"
           fi
         done
       done

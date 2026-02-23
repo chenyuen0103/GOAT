@@ -2,6 +2,7 @@
 set -euo pipefail
 
 LOG_ROOT="${LOG_ROOT:-logs_rerun}"
+PLOT_ROOT="${PLOT_ROOT:-plots_rerun}"
 
 angles=(45 90 30 60)
 label_sources=(pseudo)
@@ -87,9 +88,9 @@ for a in "${angles[@]}"; do
             fi
             echo "Running: angle=$a, label_source=$ls, em_match=$m, seed=$s, gt_domains=$gt, generated_domains=$gd"
             if [[ "${DRY_RUN}" == "1" ]]; then
-              echo "DRY_RUN=1: python experiment_refrac.py --log-root \"$LOG_ROOT\" --rotation-angle \"$a\" --label-source \"$ls\" --em-match \"$m\" --gt-domains \"$gt\" --generated-domains \"$gd\" ${em_ensemble_flag[*]} --seed \"$s\""
+              echo "DRY_RUN=1: python experiment_refrac.py --plot-root \"$PLOT_ROOT\" --log-root \"$LOG_ROOT\" --rotation-angle \"$a\" --label-source \"$ls\" --em-match \"$m\" --gt-domains \"$gt\" --generated-domains \"$gd\" ${em_ensemble_flag[*]} --seed \"$s\""
             else
-              python experiment_refrac.py --log-root "$LOG_ROOT" --rotation-angle "$a" --label-source "$ls" --em-match "$m" --gt-domains "$gt" --generated-domains "$gd" "${em_ensemble_flag[@]}" --seed "$s"
+              python experiment_refrac.py --plot-root "$PLOT_ROOT" --log-root "$LOG_ROOT" --rotation-angle "$a" --label-source "$ls" --em-match "$m" --gt-domains "$gt" --generated-domains "$gd" "${em_ensemble_flag[@]}" --seed "$s"
             fi
           done
         done

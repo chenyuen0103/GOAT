@@ -14,7 +14,7 @@ import copy
 import os
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -36,7 +36,6 @@ from train_model import test
 from torchvision.transforms import ToTensor
 
 from experiment_new import (
-    _plot_series_with_baselines,
     apply_em_bundle_to_target,
     build_em_bundle,
     encode_all_domains,
@@ -47,7 +46,6 @@ from experiment_new import (
     plot_pca_classes_grid,
     print_em_model_accuracies,
     run_goat,
-    run_goat_classwise,
     run_mnist_ablation,
     set_all_seeds,
 )
@@ -112,11 +110,13 @@ def _seed_tag(args) -> str:
 
 
 def _plots_base_dir(args) -> str:
-    return os.path.join("plots", args.dataset, _seed_tag(args))
+    plot_root = getattr(args, "plot_root", os.environ.get("PLOT_ROOT", "plots_rerun"))
+    return os.path.join(plot_root, args.dataset, _seed_tag(args))
 
 
 def _logs_base_dir(args) -> str:
-    return os.path.join(args.log_root, args.dataset, _seed_tag(args))
+    log_root = getattr(args, "log_root", os.environ.get("LOG_ROOT", "logs_rerun"))
+    return os.path.join(log_root, args.dataset, _seed_tag(args))
 
 
 def _snapshot_target_em_labels(args, target_ds) -> None:
@@ -127,6 +127,112 @@ def _snapshot_target_em_labels(args, target_ds) -> None:
     if labels_em is None:
         return
     args._canonical_target_em = torch.as_tensor(labels_em).view(-1).long().cpu().clone()
+
+
+def _snapshot_target_gt_labels(args, target_ds) -> None:
+    """Persist canonical target ground-truth labels for stable EM accuracy reporting."""
+    if target_ds is None or not hasattr(target_ds, "targets"):
+        return
+    labels = getattr(target_ds, "targets", None)
+    if labels is None:
+        return
+    args._canonical_target_gt = torch.as_tensor(labels).view(-1).long().cpu().clone()
+
+
+def _get_canonical_target_em(args) -> Optional[torch.Tensor]:
+    bundle_canonical = getattr(args, "_canonical_target_em_from_bundle", None)
+    if bundle_canonical is not None:
+        return torch.as_tensor(bundle_canonical).view(-1).long().cpu().clone()
+    canonical = getattr(args, "_canonical_target_em", None)
+    if canonical is None:
+        return None
+    return torch.as_tensor(canonical).view(-1).long().cpu().clone()
+
+
+def _get_canonical_target_gt(args, target_ds=None, e_tgt=None) -> Optional[torch.Tensor]:
+    canonical_gt = getattr(args, "_canonical_target_gt", None)
+    if canonical_gt is not None:
+        return torch.as_tensor(canonical_gt).view(-1).long().cpu().clone()
+    if target_ds is not None and hasattr(target_ds, "targets") and target_ds.targets is not None:
+        return torch.as_tensor(target_ds.targets).view(-1).long().cpu().clone()
+    if e_tgt is not None and hasattr(e_tgt, "targets") and e_tgt.targets is not None:
+        return torch.as_tensor(e_tgt.targets).view(-1).long().cpu().clone()
+    return None
+
+
+def _assert_target_em_is_canonical(args, *, target_ds=None, e_tgt=None) -> None:
+    canonical = _get_canonical_target_em(args)
+    if canonical is None:
+        return
+
+    def _check(name: str, value):
+        if value is None:
+            return
+        cur = torch.as_tensor(value).view(-1).long().cpu()
+        if cur.shape != canonical.shape or not torch.equal(cur, canonical):
+            raise RuntimeError(
+                f"[canonical-em] Drift detected on {name}: "
+                f"expected canonical EM labels with shape {tuple(canonical.shape)}, "
+                f"got {tuple(cur.shape)}."
+            )
+
+    if target_ds is not None and hasattr(target_ds, "targets_em"):
+        _check("target_ds.targets_em", target_ds.targets_em)
+    if e_tgt is not None and hasattr(e_tgt, "targets_em"):
+        _check("e_tgt.targets_em", e_tgt.targets_em)
+
+
+def _canonical_em_accuracy(args, *, target_ds=None, e_tgt=None) -> float:
+    canonical_em = _get_canonical_target_em(args)
+    canonical_gt = _get_canonical_target_gt(args, target_ds=target_ds, e_tgt=e_tgt)
+    if canonical_em is None or canonical_gt is None:
+        return float("nan")
+    if canonical_em.shape != canonical_gt.shape:
+        return float("nan")
+    return float((canonical_em == canonical_gt).to(torch.float32).mean().item())
+
+
+def _assert_target_em_alignment(
+    args,
+    *,
+    context: str,
+    target_ds=None,
+    all_sets=None,
+    e_tgt=None,
+    encoded_intersets=None,
+) -> None:
+    """
+    Validate that every target-side EM label view is identical to canonical EM labels.
+    Raises RuntimeError with context on any drift.
+    """
+    canonical = _get_canonical_target_em(args)
+    if canonical is None:
+        return
+
+    def _check(name: str, value) -> None:
+        if value is None:
+            return
+        cur = torch.as_tensor(value).view(-1).long().cpu()
+        if cur.shape != canonical.shape or not torch.equal(cur, canonical):
+            mismatch = (
+                int((cur == canonical).sum().item())
+                if cur.shape == canonical.shape
+                else -1
+            )
+            raise RuntimeError(
+                f"[canonical-em-sync] Drift at {context} on {name}: "
+                f"shape={tuple(cur.shape)} expected={tuple(canonical.shape)} "
+                f"match={mismatch}/{canonical.numel() if cur.shape == canonical.shape else canonical.numel()}."
+            )
+
+    if target_ds is not None and hasattr(target_ds, "targets_em"):
+        _check("target_ds.targets_em", target_ds.targets_em)
+    if all_sets and len(all_sets) > 0 and hasattr(all_sets[-1], "targets_em"):
+        _check("all_sets[-1].targets_em", all_sets[-1].targets_em)
+    if e_tgt is not None and hasattr(e_tgt, "targets_em"):
+        _check("e_tgt.targets_em", e_tgt.targets_em)
+    if encoded_intersets and len(encoded_intersets) > 0 and hasattr(encoded_intersets[-1], "targets_em"):
+        _check("encoded_intersets[-1].targets_em", encoded_intersets[-1].targets_em)
 
 
 def _restore_target_em_labels(args, target_ds, all_sets=None) -> None:
@@ -440,7 +546,14 @@ def run_core_methods(
         return results
 
     # ---------------- Ours-FR ----------------
-    _restore_target_em_labels(args, tgt_trainset, all_sets)
+    _apply_canonical_target_em(args, tgt_trainset, all_sets=all_sets)
+    _assert_target_em_is_canonical(args, target_ds=tgt_trainset)
+    _assert_target_em_alignment(
+        args,
+        context="run_core_methods/pre-ours_fr",
+        target_ds=tgt_trainset,
+        all_sets=all_sets,
+    )
     set_all_seeds(args.seed)
     start = time.time()
     ours_src = _clone()
@@ -461,7 +574,14 @@ def run_core_methods(
     results["ours_fr"] = _wrap_result("Ours-FR", payload, time.time() - start)
 
     # ---------------- Ours-ETA ----------------
-    _restore_target_em_labels(args, tgt_trainset, all_sets)
+    _apply_canonical_target_em(args, tgt_trainset, all_sets=all_sets)
+    _assert_target_em_is_canonical(args, target_ds=tgt_trainset)
+    _assert_target_em_alignment(
+        args,
+        context="run_core_methods/pre-ours_eta",
+        target_ds=tgt_trainset,
+        all_sets=all_sets,
+    )
     set_all_seeds(args.seed)
     start = time.time()
     ours_eta_src = _clone()
@@ -485,7 +605,14 @@ def run_core_methods(
     # Only meaningful (and only safe) when we actually generate synthetic domains
     if generated_domains > 0:
         # GOAT
-        _restore_target_em_labels(args, tgt_trainset, all_sets)
+        _apply_canonical_target_em(args, tgt_trainset, all_sets=all_sets)
+        _assert_target_em_is_canonical(args, target_ds=tgt_trainset)
+        _assert_target_em_alignment(
+            args,
+            context="run_core_methods/pre-goat",
+            target_ds=tgt_trainset,
+            all_sets=all_sets,
+        )
         set_all_seeds(args.seed)
         start = time.time()
         goat_src = _clone()
@@ -505,7 +632,14 @@ def run_core_methods(
         results["goat"] = _wrap_result("GOAT", payload, time.time() - start, has_em=False)
 
         # GOAT-Classwise
-        _restore_target_em_labels(args, tgt_trainset, all_sets)
+        _apply_canonical_target_em(args, tgt_trainset, all_sets=all_sets)
+        _assert_target_em_is_canonical(args, target_ds=tgt_trainset)
+        _assert_target_em_alignment(
+            args,
+            context="run_core_methods/pre-goat_classwise",
+            target_ds=tgt_trainset,
+            all_sets=all_sets,
+        )
         set_all_seeds(args.seed)
         start = time.time()
         goatcw_src = _clone()
@@ -688,6 +822,21 @@ def run_goat_classwise(
         e_tgt             = cached_setup["e_tgt"]
         encoded_intersets = cached_setup["encoded_intersets"]
         pseudolabels      = cached_setup["pseudolabels"]
+
+        # Keep GOAT-CW startup behavior aligned with GOAT / run_main_algo_cached:
+        # warm the current source_model on the real-domain chain before synthetic ST.
+        # Without this, cached mode starts synthetic ST from a colder model state and
+        # shifts the first test point ("gen 0") relative to other methods.
+        set_all_seeds(args.seed)
+        _direct_acc_all_fresh, st_acc_all_fresh, _train_acc_list_all_fresh, _test_acc_list_all_fresh, _ = self_train(
+            args,
+            source_model,
+            all_sets,
+            epochs=epochs,
+            label_source="pseudo",
+        )
+        direct_acc_all = _direct_acc_all_fresh
+        st_acc_all = st_acc_all_fresh
     else:
         # 1) Baselines
         set_all_seeds(args.seed)
@@ -800,6 +949,14 @@ def run_goat_classwise(
         e_tgt=e_tgt,
         encoded_intersets=encoded_intersets,
     )
+    _assert_target_em_alignment(
+        args,
+        context="run_goat_classwise/post-canonical-apply",
+        target_ds=tgt_trainset,
+        all_sets=all_sets,
+        e_tgt=e_tgt,
+        encoded_intersets=encoded_intersets,
+    )
 
     for raw_ds, enc_ds in zip(raw_domains, enc_domains):
         if hasattr(raw_ds, "targets_em"):
@@ -809,6 +966,15 @@ def run_goat_classwise(
         enc_ds.targets_em = labels_em.to(enc_ds.data.device)
         enc_ds.targets    = torch.as_tensor(raw_ds.targets).to(enc_ds.data.device)
 
+    _assert_target_em_alignment(
+        args,
+        context="run_goat_classwise/post-raw-enc-sync",
+        target_ds=tgt_trainset,
+        all_sets=all_sets,
+        e_tgt=e_tgt,
+        encoded_intersets=encoded_intersets,
+    )
+
     # Attach pseudo-labels on target
     setattr(args, "_cached_pseudolabels", pseudolabels)
     # Here we assume tgt_trainset.targets_em was set upstream by EM mapping
@@ -816,17 +982,11 @@ def run_goat_classwise(
 
     # K: number of classes from source
     K = int(e_src.targets.max().item()) + 1
-    y_true = e_tgt.targets.cpu().numpy() if torch.is_tensor(e_tgt.targets) else np.asarray(e_tgt.targets)
     e_tgt.targets_pseudo = torch.as_tensor(pseudolabels, dtype=torch.long)
     tgt_trainset.targets_pseudo = e_tgt.targets_pseudo.cpu().clone()
 
-    acc_em_pseudo = (
-        tgt_trainset.targets_em == torch.as_tensor(
-            y_true,
-            device=tgt_trainset.targets_em.device,
-            dtype=tgt_trainset.targets_em.dtype,
-        )
-    ).to(torch.float32).mean().item()
+    _assert_target_em_is_canonical(args, target_ds=tgt_trainset, e_tgt=e_tgt)
+    acc_em_pseudo = _canonical_em_accuracy(args, target_ds=tgt_trainset, e_tgt=e_tgt)
     print(f"[GOAT-CW] EM→class (pseudo mapping) accuracy: {acc_em_pseudo:.4f}")
 
     # -------------------- class-wise generation --------------------
@@ -866,13 +1026,37 @@ def run_goat_classwise(
         merged_chain = _merge_domains_per_step(per_class_chains)
         all_domains += merged_chain
 
-    # ensure last training domain is the full encoded target
+    # ensure last training domain is the full encoded target with canonical labels.
+    # IMPORTANT: use raw/canonical target labels here, not cached encoded labels,
+    # because encoded labels can drift across method runs/caches.
     if len(all_domains) > 0:
+        canonical_gt = _get_canonical_target_gt(args, target_ds=tgt_trainset, e_tgt=e_tgt)
+        if canonical_gt is None:
+            canonical_gt = torch.as_tensor(tgt_trainset.targets).view(-1).long().cpu()
+
+        canonical_em = _get_canonical_target_em(args)
+        if canonical_em is None:
+            canonical_em = torch.as_tensor(tgt_trainset.targets_em).view(-1).long().cpu()
+
+        if canonical_gt.shape != canonical_em.shape:
+            raise RuntimeError(
+                f"[GOAT-CW] canonical target label shape mismatch: "
+                f"gt={tuple(canonical_gt.shape)} vs em={tuple(canonical_em.shape)}"
+            )
+
         all_domains[-1] = DomainDataset(
             e_tgt.data if torch.is_tensor(e_tgt.data) else torch.as_tensor(e_tgt.data),
-            torch.ones(len(e_tgt.targets)),
-            e_tgt.targets,
-            e_tgt.targets_em,
+            torch.ones(len(canonical_gt)),
+            canonical_gt,
+            canonical_em,
+        )
+        _assert_target_em_alignment(
+            args,
+            context="run_goat_classwise/pre-self_train",
+            target_ds=tgt_trainset,
+            all_sets=all_sets,
+            e_tgt=e_tgt,
+            encoded_intersets=encoded_intersets,
         )
 
     # -------------------- train on merged synthetic chain --------------------
@@ -1118,6 +1302,7 @@ def run_main_algo_cached(
         e_tgt=e_tgt,
         encoded_intersets=encoded_intersets,
     )
+    _assert_target_em_is_canonical(args, target_ds=tgt_trainset, e_tgt=e_tgt)
 
     _sanitize_targets_em_field(e_src)
     _sanitize_targets_em_field(e_tgt)
@@ -1125,9 +1310,13 @@ def run_main_algo_cached(
         _sanitize_targets_em_field(ds)
 
     # 5) Diagnostics: pseudo-label accuracy on target
-    y_true = e_tgt.targets
-    if torch.is_tensor(y_true):
-        y_true = y_true.cpu()
+    y_true = _get_canonical_target_gt(args, target_ds=tgt_trainset, e_tgt=e_tgt)
+    if y_true is None:
+        y_true = e_tgt.targets
+        if torch.is_tensor(y_true):
+            y_true = y_true.cpu()
+        else:
+            y_true = torch.as_tensor(y_true).view(-1).long().cpu()
     preds = torch.as_tensor(pseudolabels, device=y_true.device)
     acc_pl = (preds == y_true).float().mean().item()
     print(f"Pseudo-label accuracy (teacher on target): {acc_pl:.4f}")
@@ -1144,13 +1333,8 @@ def run_main_algo_cached(
     e_tgt.targets_pseudo = torch.as_tensor(pseudolabels, dtype=torch.long)
     tgt_trainset.targets_pseudo = e_tgt.targets_pseudo.cpu().clone()
 
-    # 8) EM→class accuracy on TARGET from precomputed labels
-    if hasattr(e_tgt, "targets_em") and e_tgt.targets_em is not None:
-        acc_em_pseudo = (
-            e_tgt.targets_em.cpu() == torch.as_tensor(y_true, dtype=e_tgt.targets_em.dtype)
-        ).to(torch.float32).mean().item()
-    else:
-        acc_em_pseudo = float("nan")
+    # 8) EM→class accuracy on TARGET from canonical labels only
+    acc_em_pseudo = _canonical_em_accuracy(args, target_ds=tgt_trainset, e_tgt=e_tgt)
     print(f"[MainAlgo] EM→class (mapped) accuracy on target: {acc_em_pseudo:.4f}")
 
     # Optional: check presence of target bundle
@@ -1572,8 +1756,9 @@ def _append_curves_jsonl(
     elapsed: float,
 ):
     """
-    Append one JSON record with full train/test/ST curves for all methods.
+    Write one JSON record with full train/test/ST curves for all methods.
     Each element in the curves corresponds to one adaptation step (domain).
+    Existing file content is replaced to keep one canonical record per run config.
     """
     os.makedirs(os.path.dirname(curves_path), exist_ok=True)
 
@@ -1597,7 +1782,7 @@ def _append_curves_jsonl(
         "methods": methods_payload,
     }
 
-    with open(curves_path, "a") as f:
+    with open(curves_path, "w") as f:
         f.write(json.dumps(record) + "\n")
 
 def log_summary(
@@ -1609,7 +1794,7 @@ def log_summary(
     results: Dict[str, MethodResult],
     elapsed: float,
 ):
-    """Persist a short CSV row with the final accuracies AND the full curves."""
+    """Persist one CSV-style summary row plus one full-curves JSON record (overwrite mode)."""
 
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
@@ -1633,7 +1818,7 @@ def log_summary(
     if val is not None:
         parts.append(f"ETA:{round(val, 2)}")
 
-    with open(log_path, "a") as f:
+    with open(log_path, "w") as f:
         f.write(
             f"seed{args.seed}with{gt_domains}gt{generated_domains}generated,{elapsed},"
             f"{','.join(parts)}\n"
@@ -1740,6 +1925,7 @@ def build_em_bundles_for_chain(
 
     # Snapshot canonical target EM labels once; later method calls restore from this.
     _snapshot_target_em_labels(args, final_domain)
+    _snapshot_target_gt_labels(args, final_domain)
     if last_key in em_bundles and getattr(em_bundles[last_key], "labels_em", None) is not None:
         args._canonical_target_em_from_bundle = np.asarray(
             em_bundles[last_key].labels_em, dtype=np.int64
@@ -2481,6 +2667,12 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument(
+        "--plot-root",
+        type=str,
+        default=os.environ.get("PLOT_ROOT", "plots_rerun"),
+        help="Root directory for experiment plots.",
+    )
     parser.add_argument(
         "--log-root",
         type=str,

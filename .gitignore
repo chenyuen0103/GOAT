@@ -37,3 +37,7 @@ plots_old/
 figures_main/
 .mplconfig/
 *.txt
+
+analysis_outputs/
+logs_rerun/
+plots_rerun/

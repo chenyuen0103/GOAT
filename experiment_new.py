@@ -31,19 +31,17 @@ import time
 import copy
 import argparse
 import random
-from typing import Optional, Tuple, List, Sequence, Iterable, Union, Dict, Any
+from typing import Optional, Tuple, List, Sequence, Iterable, Dict, Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torchvision
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 import torch.backends.cudnn as cudnn
 import matplotlib.pyplot as plt
 # --- Visualization: PCA(2) of standardized target features + EM Gaussians ---
-from matplotlib.patches import Ellipse
 # Project-local deps (must exist in your repo)
 from model import *
 from train_model import *
@@ -56,19 +54,16 @@ from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 
 from da_algo import *
-import matplotlib.pyplot as plt
 import json
 try:
     import kornia.augmentation as K
 except Exception:
     K = None  # Kornia is optional; see build_augment()
-import math
 import numpy as np
 # Robust tqdm import with a no-op fallback
 
 from em_utils import *
 from check_dist import *
-from itertools import product
 # -------------------------------------------------------------
 # Global config / utilities
 # -------------------------------------------------------------
@@ -76,8 +71,6 @@ from itertools import product
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # --- em_registry.py (or near your EM helpers) ---
-from dataclasses import dataclass
-import torch
 from PIL import Image, ImageOps
 import torchvision.transforms as T
 
@@ -284,10 +277,7 @@ def set_all_seeds(seed: int) -> None:
 # Logging & visualization
 # -------------------------------------------------------------
 
-from torch.utils.data import DataLoader
 # ---- helper: init Gaussian head from source features ----
-import torch
-import torch.nn.functional as F
 
 def _save_list(path, obj):
     """
@@ -1572,297 +1562,6 @@ def run_goat(
     return train_acc_by_domain, test_acc_by_domain, st_acc, st_acc_all, generated_acc
 
 
-# def run_goat_classwise(
-#     model_copy: Classifier,
-#     source_model: Classifier,
-#     src_trainset: Dataset,
-#     tgt_trainset: Dataset,
-#     all_sets: List[Dataset],
-#     deg_idx: List[int],
-#     generated_domains: int,
-#     epochs: int = 10,
-#     target: int = 60,
-#     args=None
-# ):
-#     """GOAT baseline with class-wise synthetic generation (still calls generate_domains).
-#        This function will compute .targets_em for any encoded dataset that lacks it.
-#     """
-
-#     # Freeze a clean teacher for EM/pseudo labels to avoid any leakage
-#     # from subsequent adaptation. Use the head that consumes encoded features.
-#     em_teacher = copy.deepcopy(source_model).to(device).eval()
-#     em_head = getattr(em_teacher, 'mlp', em_teacher)
-
-#     # ---------- Direct adapt (target only) ----------
-#     direct_acc, st_acc, train_acc_by_domain0, test_acc_by_domain0 = self_train(
-#         args, model_copy, [tgt_trainset], epochs=epochs, label_source="pseudo"
-#     )
-
-#     # ---------- Pooled ST on real intermediates + target ----------
-#     direct_acc_all, st_acc_all, train_acc_list_all, test_acc_list_all = self_train(
-#         args, source_model, all_sets, epochs=epochs, label_source="pseudo",
-#         use_labels=getattr(args, "use_labels", False)
-#     )
-
-#     # ---------- Dirs ----------
-#     cache_dir = f"cache{args.ssl_weight}/target{target}/small_dim{args.small_dim}/"
-#     plot_dir  = f"plots/target{target}/"
-#     os.makedirs(cache_dir, exist_ok=True)
-#     os.makedirs(plot_dir,  exist_ok=True)
-
-
-#     # ---------- Encode all domains ----------
-#     e_src, e_tgt, encoded_intersets = encode_all_domains(
-#         src_trainset,
-#         tgt_trainset,
-#         all_sets,
-#         deg_idx,
-#         nn.Sequential(
-#             source_model.encoder,
-#             nn.Flatten(start_dim=1),
-#             getattr(source_model, 'compressor', nn.Identity())
-#         ),
-#         cache_dir,
-#         target,
-#         force_recompute=False,
-#     )
-
-#     # Use frozen teacher for pseudo labels on target to keep it target-GT agnostic
-#     pseudo_labels, _pseudo_keep = get_pseudo_labels(
-#         tgt_trainset,
-#         em_teacher,
-#         confidence_q=getattr(args, "pseudo_confidence_q", 0.1),
-#         device_override=next(em_teacher.parameters()).device,
-#     )
-#     pseudolabels = pseudo_labels.cpu().numpy()
-#     K = int(pseudo_labels.max().item()) + 1
-#     # def _ensure_targets_em(ds: Dataset, infer_model: nn.Module):
-#     #     """Compute ds.targets_em via EM clustered labels mapped to pseudo-labels from infer_model."""
-#     #     # skip if already exists and not all -1
-#     #     if getattr(ds, "targets_em", None) is not None and not (ds.targets_em == -1).all():
-#     #         return
-#     #     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-
-#     #     # Pseudo labels from the classifier head that consumes encoded features
-#     #     pseudo_lab, _ = get_pseudo_labels(
-#     #         loader, infer_model, device_override=next(infer_model.parameters()).device
-#     #     )
-#     #     if pseudo_lab.numel() == 0:
-#     #         raise ValueError("Failed to compute pseudo labels for EM mapping.")
-#     #     pseudo_np = pseudo_lab.cpu().numpy()
-#     #     K = int(pseudo_lab.max().item()) + 1
-
-#     #     # EM on the encoded dataset (same feature space)
-        
-#     #     em_res = run_em_on_encoded(
-#     #         ds, K=K, cov_type="diag", pool="flatten", do_pca=False,
-#     #         return_transforms=True, verbose=False
-#     #     )
-
-#     #     if args.em_match == "prototypes":
-#     #         mu_s, Sigma_s, priors_s = fit_source_gaussian_params(
-#     #             X = e_src.data, y = e_src.targets)
-#     #         mapping_pseudo_main, labels_mapped_pseudo_main, _ = map_em_clusters(
-#     #             em_res,
-#     #             method=args.em_match,
-#     #             n_classes=K,
-#     #             mus_s=mu_s,
-#     #             Sigma_s=Sigma_s,
-#     #             priors_s=priors_s,
-#     #         )
-#     #         ds.targets_em = torch.as_tensor(labels_mapped_pseudo_main, dtype=torch.long)
-#     #         return
-#     #     # Map clusters to classes by Hungarian vs pseudo labels
-#     #     _, labels_mapped, _ = map_em_clusters(
-#     #         em_res, method=args.em_match, n_classes=K, pseudo_labels=pseudo_np
-#     #     )
-#     #     ds.targets_em = torch.as_tensor(labels_mapped, dtype=torch.long)
-
-
-#     def _labels_for_split(ds: Dataset, is_source: bool, ) -> torch.Tensor:
-#         """
-#         Class labels used for per-class splitting:
-#         - If is_source==True and ds.targets exists → use ds.targets (allowed).
-#         - Otherwise (non-source domains, including target) → use inferred ds.targets_em.
-#         """
-#         if is_source and hasattr(ds, "targets") and ds.targets is not None:
-#             y = ds.targets
-#             return torch.as_tensor(y).long().cpu()
-
-#         # Always use the frozen EM head for non-source domains
-#         # _ensure_targets_em(ds, em_head)
-#         return torch.as_tensor(ds.targets_em).long().cpu()
-
-#     em_res_tgt = run_em_on_encoded(
-#         e_tgt,
-#         K=K,
-#         cov_type="diag",
-#         pool="gap",            # GAP pooling
-#         do_pca=False,            # Enable PCA for stability of full covariances
-#         pca_dim=None,             # Reduce to 64 dimensions
-#         reg=1e-4,               # Stronger ridge for full covariances
-#         max_iter=500,  # Reduce max iterations from default 100 to 50
-#         return_transforms=True,
-#         verbose=True,  # Enable to see progress and timing
-#         subsample_init=10000,  # Reduce subsampling for faster initialization
-#     )
-#     if args.em_match == "prototypes":
-#         mu_s, Sigma_s, priors_s = fit_source_gaussian_params(
-#             X = e_src.data, y = e_src.targets)
-
-#         mapping_pseudo_main, labels_mapped_pseudo_main, _ = map_em_clusters(
-#             em_res_tgt,
-#             method=args.em_match,
-#             n_classes=K,
-#             metric='FR',
-#             mus_s=mu_s,
-#             Sigma_s=Sigma_s,
-#             priors_s=priors_s,
-#         )
-#     else:
-#         mapping_pseudo_main, labels_mapped_pseudo_main, _ = map_em_clusters(
-#             em_res_tgt,
-#             method=args.em_match,
-#             n_classes=K,
-#             pseudo_labels=pseudolabels,
-#         )
-
-#     def _subset_by_class(ds: Dataset, cls: int, is_source: bool) -> Optional[Dataset]:
-#         """Return a per-class DomainDataset compatible with generate_domains."""
-#         labels = _labels_for_split(ds, is_source=is_source)
-#         X = ds.data if torch.is_tensor(getattr(ds, "data", None)) else torch.as_tensor(ds.data)
-#         X = X.cpu()
-#         m = (labels == int(cls))
-#         if m.sum().item() == 0:
-#             return None
-#         Xc = X[m]
-#         yc = labels[m]
-#         w  = torch.ones(len(yc))
-#         # DomainDataset(data, weights, targets)
-#         return DomainDataset(Xc, w, yc)
-
-
-#     def _merge_domains_per_step(list_of_lists: List[List[Dataset]]) -> List[Dataset]:
-#         """Merge step j across classes into a single DomainDataset."""
-#         if not list_of_lists:
-#             return []
-#         n_steps = min(len(L) for L in list_of_lists)   # should be n_inter + 1 (includes appended target)
-#         merged: List[Dataset] = []
-#         for j in range(n_steps):
-#             parts = [L[j] for L in list_of_lists if L[j] is not None]
-#             if not parts:
-#                 continue
-#             Xs, Ws, Ys = [], [], []
-#             for D in parts:
-#                 Xs.append(D.data if torch.is_tensor(D.data) else torch.as_tensor(D.data))
-#                 ws = getattr(D, "weights", None)
-#                 if ws is None:
-#                     ws = torch.ones(len(D.targets))
-#                 Ws.append(ws if torch.is_tensor(ws) else torch.as_tensor(ws))
-#                 Ys.append(D.targets if torch.is_tensor(D.targets) else torch.as_tensor(D.targets))
-#             X = torch.cat([x.cpu().float() for x in Xs], dim=0)
-#             W = torch.cat([w.cpu().float() for w in Ws], dim=0)
-#             Y = torch.cat([y.cpu().long()  for y in Ys], dim=0)
-#             merged.append(DomainDataset(X, W, Y, Y))  # set targets_em := Y for training
-#         return merged
-#     e_tgt.targets_em = torch.as_tensor(labels_mapped_pseudo_main, dtype=torch.long)
-#     # ---------- Class-wise synthetic generation loop (inside run_goat_classwise) ----------
-#     generated_acc = 0.0
-#     if generated_domains > 0:
-#         all_domains: List[Dataset] = []
-#         # Number of classes from the *inferred* labels on the final target encoding
-#         # _ensure_targets_em(e_tgt, em_head)
-#         K = int(torch.as_tensor(e_tgt.targets_em).max().item()) + 1
-
-#         for i in range(len(encoded_intersets) - 1):
-#             s_ds = encoded_intersets[i]
-#             t_ds = encoded_intersets[i + 1]
-#             # breakpoint()
-
-#             # Define whether the left side of the pair is the original source encoding
-#             is_source_left = (i == 0)
-
-#             # Ensure EM labels for the right side (non-source)
-#             # _ensure_targets_em(t_ds, getattr(source_model, 'mlp', source_model))
-
-#             # Build per-class chains by calling the original generator per class
-#             per_class_chains: List[List[Dataset]] = []
-#             for c in range(K):
-#                 s_c = _subset_by_class(s_ds, c, is_source=is_source_left)
-#                 t_c = _subset_by_class(t_ds, c, is_source=False)  # never use GT on right
-#                 if s_c is None or t_c is None:
-#                     continue
-#                 chain_c, _, domain_stats_c = generate_domains(generated_domains, s_c, t_c)
-
-#                 for D in chain_c:
-#                     # force GLOBAL class ID for both targets and targets_em
-#                     y_global = torch.full((len(D.targets),), c, dtype=torch.long)
-#                     D.targets = y_global
-#                     if getattr(D, "targets_em", None) is not None:
-#                         D.targets_em = y_global.clone()
-#                     else:
-#                         D.targets_em = y_global.clone()  # ensure it exists for self_train
-#                 if chain_c:
-#                     per_class_chains.append(chain_c)
-#                     # check that the labels are all c
-#                     for step_ds in chain_c:
-#                         labs = step_ds.targets if torch.is_tensor(step_ds.targets) else torch.as_tensor(step_ds.targets)
-#                         labs = labs.cpu().numpy()
-#                         assert (labs == c).all(), f"Class mismatch in generated chain for class {c} at step {step_ds}"
-
-#             # Merge per step across classes, then append
-#             merged_chain = _merge_domains_per_step(per_class_chains)
-#             # breakpoint()
-#             all_domains += merged_chain
-
-#         # Ensure evaluation target matches other methods: use the full encoded target
-#         # as the final held-out dataset for consistency of the 0th plot point.
-#         if len(all_domains) > 0:
-#             all_domains[-1] = e_tgt
-
-#         # Self-train on the synthetic class-wise chain
-#         _, generated_acc, train_acc_by_domain, test_acc_by_domain = self_train(
-#             args, source_model.mlp, all_domains,
-#             epochs=epochs, label_source=args.label_source,
-#             use_labels=getattr(args, "use_labels", False),
-#             return_stats=True
-#         )
-
-
-#         _save_list(os.path.join(plot_dir, "goat_train_acc_by_domain.json"), train_acc_by_domain)
-#         _save_list(os.path.join(plot_dir, "goat_test_acc_by_domain.json"),  test_acc_by_domain)
-
-#         # PCA grids: real domains and synthetic chain (source → generated → target)
-#         try:
-#             # Real domains
-#             plot_pca_classes_grid(
-#                 encoded_intersets,
-#                 classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-#                 save_path=os.path.join(plot_dir, f"pca_classes_real_domains_goatcw.png"),
-#             )
-#             # Synthetic chain: group per pair and drop appended right endpoint
-#             step_len = int(generated_domains) + 1
-#             chain_only = []
-#             for k in range(0, len(all_domains), max(step_len, 1)):
-#                 chunk = all_domains[k:k + step_len]
-#                 if not chunk:
-#                     continue
-#                 chain_only.extend(chunk[:-1] if step_len > 0 else chunk)
-#             chain_for_plot = [encoded_intersets[0]] + chain_only + [encoded_intersets[-1]]
-#             plot_pca_classes_grid(
-#                 chain_for_plot,
-#                 classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),f
-#                 save_path=os.path.join(plot_dir, f"pca_classes_synth_goatcw_{args.label_source}_{args.em_match}_{args.em_select}{'_em-ensemble' if args.em_ensemble else '' }.png"),
-#                 label_source=args.label_source,
-#             )
-#         except Exception as e:
-#             print(f"[GOAT-CW][PCA] Skipped PCA plotting: {e}")
-
-#         return train_acc_by_domain, test_acc_by_domain, st_acc, st_acc_all, generated_acc
-
-#     # If no synthetics requested, still return meaningful values/lists
-#     # return train_acc_by_domain0, test_acc_by_domain0, st_acc, st_acc_all, generated_acc
-
 
 
 def run_goat_classwise(
@@ -2378,317 +2077,6 @@ def covariance_sizes(domain_stats, reduce="weighted", eps=1e-12, cls=None):
         }
 
     return sizes_by_class, sizes_by_domain
-
-# def run_main_algo(
-#     model_copy: nn.Module,
-#     source_model: nn.Module,
-#     src_trainset,
-#     tgt_trainset,
-#     all_sets,
-#     deg_idx,
-#     generated_domains: int,
-#     epochs: int = 3,
-#     target: int = 60,
-#     args= None,
-#     gen_method: str = "fr",
-# ):
-#     """Teacher self-training along generated domains **in embedding space**.
-#     Encoder stays fixed; only the head adapts."""
-#     # breakpoint()
-#     # check if the source_model and model_copy have the same initial weights
-#     for p1, p2 in zip(model_copy.parameters(), source_model.parameters()):
-#         if not torch.equal(p1, p2):
-#             print("[run_main_algo] Warning: model_copy and source_model have different initial weights.")
-#             breakpoint()
-#             break
-#     set_all_seeds(args.seed)
-#     direct_acc, st_acc, train_acc_by_domain0, test_acc_by_domain0,_ = self_train(
-#         args, model_copy, [tgt_trainset], epochs=epochs, label_source="pseudo")
-#     set_all_seeds(args.seed)
-#     # Pooled ST on real intermediates + target
-#     direct_acc_all, st_acc_all, train_acc_list_all, test_acc_list_all,_ = self_train(
-#         args, source_model, all_sets, epochs=epochs, label_source="pseudo")
-
-#     # check st_acc == st_acc_all
-#     if abs(st_acc - st_acc_all) > 1e-4:
-#         print(f"[run_main_algo] Warning: st_acc ({st_acc}) != st_acc_all ({st_acc_all})")
-#         breakpoint()
-
-
-#     em_teacher = copy.deepcopy(source_model).to(device).eval()
-#     with torch.no_grad():  # avoids accidental stat updates anywhere
-#         pseudo_labels, _ = get_pseudo_labels(
-#             tgt_trainset, em_teacher,
-#             confidence_q=getattr(args, "pseudo_confidence_q", 0.9),
-#             device_override=next(em_teacher.parameters()).device,
-#         )
-
-
-#     pseudolabels = pseudo_labels.cpu().numpy()
-#     if args.dataset != "mnist":
-#         cache_dir = f"{args.dataset}_features/cache{args.ssl_weight}/"
-#         plot_dir  = f"plots/{args.dataset}/"
-#     else:
-#         cache_dir = f"cache{args.ssl_weight}/target{target}/small_dim{args.small_dim}/"
-#         plot_dir  = f"plots/target{target}/"
-#     os.makedirs(cache_dir, exist_ok=True)
-#     os.makedirs(plot_dir, exist_ok=True)
-
-#     e_src, e_tgt, encoded_intersets = encode_all_domains(
-#         src_trainset,
-#         tgt_trainset,
-#         all_sets,
-#         deg_idx,
-#         nn.Sequential(
-#             source_model.encoder,
-#             nn.Flatten(start_dim=1),
-#             source_model.compressor if hasattr(source_model, 'compressor') else nn.Identity()
-#         ),  # <- encode with full model (encoder -> flatten -> compressor)
-#         cache_dir,
-#         target,
-#         force_recompute=False,
-#         args=args
-#     )
-
-
-#     y_true = e_tgt.targets
-#     if torch.is_tensor(y_true):
-#         y_true = y_true.cpu()
-
-#     preds = torch.as_tensor(pseudolabels, device=y_true.device)
-#     acc = (preds == y_true).float().mean().item()
-#     print(f"Pseudo-label accuracy: {acc:.4f}")
-
-#     # -------- Step 1: EM soft-targets on target embeddings, train head with soft labels --------
-#     try:
-#         K = int(max(int(preds.max().item()), int(y_true.max().item()))) + 1
-#     except Exception:
-#         K = 10
-
-#     print(f"[MainAlgo] Running EM clustering with K={K} components...")
-#     start_time = time.time()
-    
-
-#     # fit 
-#     # EM on encoded target (use same pooling/shape as encoded data)
-#     # Optimizations: PCA for dimensionality reduction, GAP pooling instead of flatten, fewer iterations
-#     em_res_tgt = run_em_on_encoded(
-#         e_tgt,
-#         K=K,
-#         cov_type="diag",
-#         pool="gap",
-#         do_pca=False,
-#         pca_dim=None,
-#         reg=1e-4,
-#         max_iter=500,  # Reduce max iterations from default 100 to 50
-#         return_transforms=True,
-#         verbose=True,  # Enable to see progress and timing
-#         subsample_init=10000,  # Reduce subsampling for faster initialization
-#         rng=args.seed,
-#     )
-#     em_time = time.time() - start_time
-#     print(f"[MainAlgo] EM clustering completed in {em_time:.2f} seconds")
-    
-
-#     if args.em_match == "prototypes":
-#         mu_s, Sigma_s, priors_s = fit_source_gaussian_params(
-#             X = e_src.data, y = e_src.targets)
-
-#         mapping_pseudo_main, labels_mapped_pseudo_main, _ = map_em_clusters(
-#             em_res_tgt,
-#             method=args.em_match,
-#             n_classes=K,
-#             mus_s=mu_s,
-#             Sigma_s=Sigma_s,
-#             priors_s=priors_s,
-#         )
-#     else:
-#         mapping_pseudo_main, labels_mapped_pseudo_main, _ = map_em_clusters(
-#             em_res_tgt,
-#             method=args.em_match,
-#             n_classes=K,
-#             pseudo_labels=pseudolabels,
-#             metric='FR'
-#         )
-
-#     y_true_np = np.asarray(y_true)
-#     acc_em_pseudo = float((np.asarray(labels_mapped_pseudo_main) == y_true_np).mean())
-#     print(f"[MainAlgo] EM→class (pseudo mapping) accuracy: {acc_em_pseudo:.4f}")
-#     # breakpoint()
-#     try:
-#         best_acc, _best_map, _C = best_mapping_accuracy(em_res_tgt["labels"], y_true_np)
-#         print(f"[MainAlgo] Best one-to-one mapping accuracy: {best_acc:.4f}")
-#     except Exception as e:
-#         print(f"[MainAlgo] Best-mapping computation failed: {e}")
-
-#     # Build EM soft class targets using the prototype mapping if available; otherwise pseudo mapping
-#     # use_mapping = mapping_proto_main if mapping_proto_main is not None else mapping_pseudo_main
-#     # use_mapping = mapping_pseudo_main
-#     # em_soft = em_soft_targets_from_mapping(em_res_tgt["gamma"], use_mapping, n_classes=K)
-
-#     # Ensure target datasets carry EM labels for downstream steps
-#     e_tgt.targets_em = torch.as_tensor(labels_mapped_pseudo_main, dtype=torch.long)
-#     tgt_trainset.targets_em = e_tgt.targets_em.cpu().clone()
-
-
-
-
-#     X_std = np.asarray(em_res_tgt.get("X"))
-#     if X_std is not None and X_std.ndim == 2 and X_std.shape[0] == len(e_tgt):
-#         pca = PCA(n_components=2)
-#         Z = pca.fit_transform(X_std)
-
-#         # Prepare shared items
-#         y_np      = np.asarray(y_true)                    # ground-truth for left panel
-#         right_em  = np.asarray(labels_mapped_pseudo_main) # EM-mapped labels (int array)
-#         right_pl  = np.asarray(pseudolabels)              # raw pseudo labels (int array)
-#         cmap      = plt.get_cmap('tab10')
-
-#         # Project EM means/covs into PCA(2)
-#         C2 = pca.components_[:2, :]
-#         m2 = pca.mean_
-#         mu_src     = em_res_tgt.get("mu")
-#         Sigma_src  = em_res_tgt.get("Sigma")
-#         mapping_ps = mapping_pseudo_main  # cluster id -> class id
-
-#         # 1) Second panel colored by EM labels
-#         plot_pca_em_pair_side_by_side(
-#             X_std,
-#             y_np,
-#             mu_src,
-#             Sigma_src,
-#             mapping_ps,
-#             right_labels=right_em,
-#             right_title="EM-mapped labels",
-#             save_path=os.path.join(plot_dir, f"target_pca_emlabels_dim{args.small_dim}_side_by_side_{gen_method}.png"),
-#         )
-
-#         # 2) Second panel colored by pseudo labels
-#         plot_pca_em_pair_side_by_side(
-#             X_std,
-#             y_np,
-#             mu_src,
-#             Sigma_src,
-#             mapping_ps,
-#             right_labels=right_pl,
-#             right_title="Pseudo labels",
-#             save_path=os.path.join(plot_dir, f"target_pca_pseudolabels_dim{args.small_dim}_side_by_side_{gen_method}.png"),
-#         )
-
-
-#     # Evaluate updated model on target images
-#     tgt_loader_eval = DataLoader(tgt_trainset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-#     _, tgt_acc_after = test(tgt_loader_eval, source_model)
-#     # print(f"[Head-Soft] Target accuracy after soft-target tuning: {tgt_acc_after:.4f}")
-#     # breakpoint()
-#     if generated_domains <= 0:
-#         return direct_acc, st_acc, direct_acc_all, st_acc_all, 0.0
-
-#     synthetic_domains: List[Dataset] = []
-#     # choose generator based on flag (default 'fr'); accept common aliases
-#     _method = (gen_method or "fr").lower()
-#     if _method in {"fr", "fisher-rao", "fisher_rao"}:
-#         _gen_fn = generate_fr_domains_between_optimized
-#     elif _method in {"natural", "natureal", "eta", "nat", "np"}:
-#         _gen_fn = generate_natural_domains_between
-#     else:
-#         raise ValueError(f"Unknown gen_method '{gen_method}'. Use 'fr' or 'natural'.")
-
-#     for i in range(len(encoded_intersets) - 1):
-#         # breakpoint()
-#         out = _gen_fn(
-#             generated_domains,
-#             encoded_intersets[i],
-#             encoded_intersets[i + 1],
-#             # source_model=source_model,
-#             # pseudolabels=pseudolabels,
-#             # visualize=False,
-#             cov_type="full",
-#             save_path=plot_dir,
-#             args=args,
-#         )
-#         pair_domains = out[0]
-#         domain_stats = out[2]
-
-#         sizes_by_class, sizes_c1 = covariance_sizes(domain_stats, cls=1)
-#         print("Class 1 trace per domain:", sizes_c1["trace"])
-#         print("Class 1 logdet per domain:", sizes_c1["logdet"])
-
-
-
-#         # include the appended target from the generator; self_train will hold it out
-#         synthetic_domains += pair_domains
-
-
-
-#     if not synthetic_domains:
-#         return direct_acc, st_acc, direct_acc_all, st_acc_all, 0.0
-#     set_all_seeds(args.seed)
-#     breakpoint()
-#     direct_acc_syn, generated_acc, train_acc_by_domain, test_acc_by_domain, last_predictions = self_train(
-#         args,
-#         source_model.mlp,
-#         synthetic_domains,
-#         epochs=epochs,
-#         label_source=args.label_source,
-#     )
-
-
-#     plot_pca_classes_grid(
-#         encoded_intersets,
-#         classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-#         save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_real_domains.png"),
-#         label_source='real',
-#         ground_truths=True,
-#         pca=getattr(args, "shared_pca", None)  # <<— SAME basis
-#     )
-#     # Synthetic chain if available: source (domain 0), then generated steps, then final target
-#     if synthetic_domains:
-#         chain = []
-#         step_len = int(generated_domains) + 1  # per pair: n_inter steps + appended right-side domain
-#         for k in range(0, len(synthetic_domains), max(step_len, 1)):
-#             chunk = synthetic_domains[k:k + step_len]
-#             if not chunk:
-#                 continue
-#             # exclude the last element (the right-hand endpoint) from each chunk
-#             chain.extend(chunk[:-1] if step_len > 0 else chunk)
-#         # prepend source and append final target to show full path
-#         chain_for_plot = [encoded_intersets[0]] + chain + [encoded_intersets[-1]]
-#         # Color the target by pseudo labels rather than GT or EM labels
-#         # try:
-#         #     encoded_intersets[-1].targets_em = torch.as_tensor(pseudolabels, dtype=torch.long)
-#         # except Exception as _e:
-#         #     print(f"[MainAlgo][PCA] Warning: failed to attach pseudo labels to target for coloring: {_e}")
-#         plot_pca_classes_grid(
-#             chain_for_plot,
-#             classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-#             save_path=os.path.join(plot_dir, f"pca_classes_synth_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_{args.label_source}_{args.em_match}_{_method}.png"),
-#             label_source=args.label_source,
-#             pseudolabels=last_predictions,
-#             pca=getattr(args, "shared_pca", None)  # <<— SAME basis
-#         )
-
-#         plot_pca_classes_grid(
-#             chain_for_plot,
-#             classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-#             save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_emlabels_{_method}.png"),
-#             label_source='em',
-#             # pseudolabels=last_predictions,
-#             pca=getattr(args, "shared_pca", None)  # <<— SAME basis
-#         )
-#         plot_pca_classes_grid(
-#             chain_for_plot,
-#             classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
-#             save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_source_pseudo_{_method}.png"),
-#             label_source='pseudo',
-#             pseudolabels=pseudolabels,
-#             pca=getattr(args, "shared_pca", None)  # <<— SAME basis
-#         )
-        
-
-
-#     return train_acc_by_domain, test_acc_by_domain, st_acc, st_acc_all, generated_acc, acc_em_pseudo
-
 
 def run_main_algo(
     model_copy: nn.Module,
@@ -4923,29 +4311,66 @@ def run_covtype_experiment(gt_domains: int, generated_domains: int, args=None):
         mu_s, Sigma_s, priors_s = fit_source_gaussian_params(X=_e_src.data, y=_e_src.targets)
         args._cached_source_stats = (mu_s, Sigma_s, priors_s)
 
-    # ----- Pseudo labels from frozen teacher (only for mapping/eval plumbing) -----
+    # ----- Pseudo labels from frozen teacher + per-domain EM fitting -----
+    # Mirror MNIST logic: assign EM labels to every non-source real domain
+    # so downstream FR/Natural generators consume valid targets_em everywhere.
     with torch.no_grad():
         teacher = copy.deepcopy(ref_model).to(device).eval()
-        pseudo_labels, _ = get_pseudo_labels(
-            tgt_trainset, teacher,
+
+    raw_domains = [src_trainset] + all_sets
+    enc_domains = encoded_intersets
+    n_classes = int(src_trainset.targets.max().item()) + 1
+    em_bundles_by_domain: Dict[int, Any] = {}
+    em_acc_by_domain: Dict[int, float] = {}
+
+    # Canonical target pseudo labels for compatibility with legacy downstream code.
+    with torch.no_grad():
+        tgt_pl, _ = get_pseudo_labels(
+            tgt_trainset,
+            teacher,
             confidence_q=getattr(args, "pseudo_confidence_q", 0.9),
             device_override=device,
         )
-    args._cached_pseudolabels = pseudo_labels.cpu().numpy()
+    args._cached_pseudolabels = tgt_pl.cpu().numpy()
 
-    # ----- Fit many EMs on the target embedding; pick/ensemble; cache bundle -----
-    em_models = fit_many_em_on_target(
-        _e_tgt,
-        K_list=[int(src_trainset.targets.max()) + 1],
-        cov_types=["diag"],
-        seeds=[0, 1, 2],
-        pool="gap",
-        pca_dims=[None],
-        reg=1e-4, max_iter=300, rng_base=args.seed, args=args,
-    )
-    em_bundle = build_em_bundle(em_models, args)
+    for idx in range(1, len(raw_domains)):
+        raw_ds = raw_domains[idx]
+        enc_ds = enc_domains[idx]
+
+        with torch.no_grad():
+            pseudo_labels, _ = get_pseudo_labels(
+                raw_ds,
+                teacher,
+                confidence_q=getattr(args, "pseudo_confidence_q", 0.9),
+                device_override=device,
+            )
+        args._cached_pseudolabels = pseudo_labels.cpu().numpy()
+
+        em_models = fit_many_em_on_target(
+            enc_ds,
+            K_list=[n_classes],
+            cov_types=["diag"],
+            seeds=[0, 1, 2],
+            pool="gap",
+            pca_dims=[None],
+            reg=1e-4, max_iter=300, rng_base=args.seed, args=args,
+        )
+        em_bundle = build_em_bundle(em_models, args)
+        apply_em_bundle_to_target(em_bundle, enc_ds, raw_ds)
+
+        em_bundles_by_domain[idx] = em_bundle
+        em_acc = (
+            enc_ds.targets_em == raw_ds.targets.to(enc_ds.targets_em.device)
+        ).float().mean().item()
+        em_acc_by_domain[idx] = em_acc
+        print(f"[CovType] EM accuracy domain_idx={idx}: {em_acc:.4f}")
+
+    # Keep target-domain EM bundle as shared default for run_main_algo.
+    target_idx = len(raw_domains) - 1
+    em_bundle = em_bundles_by_domain[target_idx]
     args._shared_em = em_bundle
-    apply_em_bundle_to_target(em_bundle, _e_tgt, tgt_trainset)
+    args._shared_em_per_domain = em_bundles_by_domain
+    args._cached_pseudolabels = tgt_pl.cpu().numpy()
     # Canonical target EM labels: restore these for every method run.
     canonical_target_em = None
     if hasattr(tgt_trainset, "targets_em") and tgt_trainset.targets_em is not None:
