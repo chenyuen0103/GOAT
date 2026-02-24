@@ -6,9 +6,16 @@ LOG_ROOT="${LOG_ROOT:-logs_rerun}"
 PLOT_ROOT="${PLOT_ROOT:-plots_rerun}"
 
 pick_gpu() {
-  nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits |
-  awk -F',' '{gsub(/ /,"",$1); gsub(/ /,"",$2); gsub(/ /,"",$3); score=$2 + 200*$3; print score, $1}' |
-  sort -n | head -1 | awk '{print $2}'
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo 0
+    return 0
+  fi
+  nvidia-smi --query-gpu=index,memory.free,utilization.gpu --format=csv,noheader,nounits | \
+  awk -F',' '{
+    gsub(/ /, "", $1); gsub(/ /, "", $2); gsub(/ /, "", $3);
+    # sort key: free desc, util asc
+    printf "%012d %03d %s\n", $2, 1000-$3, $1
+  }' | sort -r | head -1 | awk '{print $3}'
 }
 
 run_exp() {
@@ -24,9 +31,9 @@ run_exp() {
     --seed "${seed}" --gt-domains "${gt}" --generated-domains "${gen}" --num-workers 0
 }
 
-rm -f "${LOG_ROOT}/color_mnist/s0/test_acc_dim54_int0_gen1_pseudo_prototypes_bic.txt" "${LOG_ROOT}/color_mnist/s0/test_acc_dim54_int0_gen1_pseudo_prototypes_bic_curves.jsonl" "${LOG_ROOT}/color_mnist/s0/test_acc_dim2048_int0_gen1_pseudo_prototypes_bic.txt" "${LOG_ROOT}/color_mnist/s0/test_acc_dim2048_int0_gen1_pseudo_prototypes_bic_curves.jsonl"
-rm -f "${PLOT_ROOT}/color_mnist/s0/test_acc_dim54_int0_gen1_pseudo_prototypes_bic.png" "${PLOT_ROOT}/color_mnist/s0/test_acc_dim2048_int0_gen1_pseudo_prototypes_bic.png"
-run_exp "color_mnist" "0" "0" "1"
+rm -f "${LOG_ROOT}/color_mnist/s1/test_acc_dim54_int0_gen1_pseudo_prototypes_bic.txt" "${LOG_ROOT}/color_mnist/s1/test_acc_dim54_int0_gen1_pseudo_prototypes_bic_curves.jsonl" "${LOG_ROOT}/color_mnist/s1/test_acc_dim2048_int0_gen1_pseudo_prototypes_bic.txt" "${LOG_ROOT}/color_mnist/s1/test_acc_dim2048_int0_gen1_pseudo_prototypes_bic_curves.jsonl"
+rm -f "${PLOT_ROOT}/color_mnist/s1/test_acc_dim54_int0_gen1_pseudo_prototypes_bic.png" "${PLOT_ROOT}/color_mnist/s1/test_acc_dim2048_int0_gen1_pseudo_prototypes_bic.png"
+run_exp "color_mnist" "1" "0" "1"
 
 rm -f "${LOG_ROOT}/color_mnist/s0/test_acc_dim54_int0_gen3_pseudo_prototypes_bic.txt" "${LOG_ROOT}/color_mnist/s0/test_acc_dim54_int0_gen3_pseudo_prototypes_bic_curves.jsonl" "${LOG_ROOT}/color_mnist/s0/test_acc_dim2048_int0_gen3_pseudo_prototypes_bic.txt" "${LOG_ROOT}/color_mnist/s0/test_acc_dim2048_int0_gen3_pseudo_prototypes_bic_curves.jsonl"
 rm -f "${PLOT_ROOT}/color_mnist/s0/test_acc_dim54_int0_gen3_pseudo_prototypes_bic.png" "${PLOT_ROOT}/color_mnist/s0/test_acc_dim2048_int0_gen3_pseudo_prototypes_bic.png"
@@ -36,9 +43,9 @@ rm -f "${LOG_ROOT}/color_mnist/s2/test_acc_dim54_int1_gen1_pseudo_prototypes_bic
 rm -f "${PLOT_ROOT}/color_mnist/s2/test_acc_dim54_int1_gen1_pseudo_prototypes_bic.png" "${PLOT_ROOT}/color_mnist/s2/test_acc_dim2048_int1_gen1_pseudo_prototypes_bic.png"
 run_exp "color_mnist" "2" "1" "1"
 
-rm -f "${LOG_ROOT}/color_mnist/s1/test_acc_dim54_int1_gen3_pseudo_prototypes_bic.txt" "${LOG_ROOT}/color_mnist/s1/test_acc_dim54_int1_gen3_pseudo_prototypes_bic_curves.jsonl" "${LOG_ROOT}/color_mnist/s1/test_acc_dim2048_int1_gen3_pseudo_prototypes_bic.txt" "${LOG_ROOT}/color_mnist/s1/test_acc_dim2048_int1_gen3_pseudo_prototypes_bic_curves.jsonl"
-rm -f "${PLOT_ROOT}/color_mnist/s1/test_acc_dim54_int1_gen3_pseudo_prototypes_bic.png" "${PLOT_ROOT}/color_mnist/s1/test_acc_dim2048_int1_gen3_pseudo_prototypes_bic.png"
-run_exp "color_mnist" "1" "1" "3"
+rm -f "${LOG_ROOT}/color_mnist/s1/test_acc_dim54_int1_gen2_pseudo_prototypes_bic.txt" "${LOG_ROOT}/color_mnist/s1/test_acc_dim54_int1_gen2_pseudo_prototypes_bic_curves.jsonl" "${LOG_ROOT}/color_mnist/s1/test_acc_dim2048_int1_gen2_pseudo_prototypes_bic.txt" "${LOG_ROOT}/color_mnist/s1/test_acc_dim2048_int1_gen2_pseudo_prototypes_bic_curves.jsonl"
+rm -f "${PLOT_ROOT}/color_mnist/s1/test_acc_dim54_int1_gen2_pseudo_prototypes_bic.png" "${PLOT_ROOT}/color_mnist/s1/test_acc_dim2048_int1_gen2_pseudo_prototypes_bic.png"
+run_exp "color_mnist" "1" "1" "2"
 
 rm -f "${LOG_ROOT}/color_mnist/s1/test_acc_dim54_int2_gen2_pseudo_prototypes_bic.txt" "${LOG_ROOT}/color_mnist/s1/test_acc_dim54_int2_gen2_pseudo_prototypes_bic_curves.jsonl" "${LOG_ROOT}/color_mnist/s1/test_acc_dim2048_int2_gen2_pseudo_prototypes_bic.txt" "${LOG_ROOT}/color_mnist/s1/test_acc_dim2048_int2_gen2_pseudo_prototypes_bic_curves.jsonl"
 rm -f "${PLOT_ROOT}/color_mnist/s1/test_acc_dim54_int2_gen2_pseudo_prototypes_bic.png" "${PLOT_ROOT}/color_mnist/s1/test_acc_dim2048_int2_gen2_pseudo_prototypes_bic.png"

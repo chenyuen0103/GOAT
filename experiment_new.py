@@ -1212,8 +1212,11 @@ def get_source_model(
     model = model.to(device)      # <- apply to BOTH branches
     if os.path.exists(model_path) and not force_recompute:
         print(f"[Cache] Loading trained model from {model_path}")
-        ckpt = torch.load(model_path, map_location=device)
+        # Load checkpoint on CPU first to avoid GPU-side deserialization spikes
+        # that can trigger OOM on busy devices, then move model weights to GPU.
+        ckpt = torch.load(model_path, map_location="cpu")
         missing, unexpected = model.load_state_dict(ckpt.get("state_dict", ckpt), strict=False)
+        model = model.to(device)
         return model
 
 

@@ -23,7 +23,7 @@ from experiment_refrac import (
     load_encoded_domains,
     run_core_methods,
 )
-from model import ENCODER, VAE
+from model import ENCODER
 from ot_util import generate_domains
 from util import get_single_rotate
 from a_star_util import (
@@ -34,6 +34,81 @@ from experiment_new import set_all_seeds
 
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+class RMNISTDecoder(nn.Module):
+    """Decoder architecture matching ../RMNIST/model.py VAE.decoder."""
+
+    def __init__(self, z_dim: int, x_dim: int = 28 * 28) -> None:
+        super().__init__()
+        self.z_dim = int(z_dim)
+        self.decode = nn.Sequential(
+            nn.ConvTranspose2d(z_dim, 64, 3),
+            nn.ReLU(),
+            nn.BatchNorm2d(64),
+            nn.ConvTranspose2d(64, 32, 3),
+            nn.ReLU(),
+            nn.BatchNorm2d(32),
+            nn.ConvTranspose2d(32, 16, 3),
+            nn.ReLU(),
+            nn.BatchNorm2d(16),
+            nn.ConvTranspose2d(16, 8, 3),
+            nn.ReLU(),
+            nn.BatchNorm2d(8),
+        )
+        # 8 x 9 x 9 = 648 after the transposed-conv stack above.
+        self.fc4 = nn.Linear(648, int(x_dim))
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        z = z.reshape(-1, self.z_dim, 1, 1)
+        z = self.decode(z)
+        z = z.reshape(-1, 648)
+        return torch.sigmoid(self.fc4(z))
+
+
+class RMNISTVAE(nn.Module):
+    """VAE architecture matching ../RMNIST/model.py VAE."""
+
+    def __init__(self, x_dim: int, z_dim: int) -> None:
+        super().__init__()
+        self.z_dim = int(z_dim)
+        self.encode = nn.Sequential(
+            nn.Conv2d(1, 8, 3, padding=1),
+            nn.MaxPool2d(2, 2),
+            nn.ReLU(),
+            nn.BatchNorm2d(8),
+            nn.Conv2d(8, 16, 3, padding=1),
+            nn.MaxPool2d(2, 2),
+            nn.ReLU(),
+            nn.BatchNorm2d(16),
+            nn.Conv2d(16, 32, 3, padding=1),
+            nn.MaxPool2d(2, 2),
+            nn.ReLU(),
+            nn.BatchNorm2d(32),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(64),
+            nn.Flatten(),
+            nn.Linear(576, 128),
+            nn.ReLU(),
+        )
+        self.fc1 = nn.Linear(128, z_dim)
+        self.fc2 = nn.Linear(128, z_dim)
+        self.decoder = RMNISTDecoder(z_dim=z_dim, x_dim=x_dim)
+
+    def encoder(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = self.encode(x)
+        return self.fc1(h), self.fc2(h)
+
+    def sampling(self, mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return eps.mul(std).add_(mu)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu, log_var = self.encoder(x)
+        z = self.sampling(mu, log_var)
+        return self.decoder(z), mu, log_var
 
 
 class FeatureToImageVAE(nn.Module):
@@ -48,9 +123,7 @@ class FeatureToImageVAE(nn.Module):
         )
         self.mu = nn.Linear(hidden, latent_dim)
         self.logvar = nn.Linear(hidden, latent_dim)
-        # Reuse the VAE decoder architecture defined in model.py
-        base_vae = VAE(x_dim=image_dim, z_dim=latent_dim, h_dim=hidden)
-        self.image_dec = base_vae.decoder
+        self.image_dec = RMNISTDecoder(z_dim=latent_dim, x_dim=image_dim)
         self.feature_dim = int(feature_dim)
         self.latent_dim = int(latent_dim)
         self.image_dim = int(image_dim)
@@ -271,9 +344,10 @@ def _common_indices_for_class(
 def _vae_checkpoint_path(args: argparse.Namespace, output_dir: str, latent_dim: int) -> str:
     if args.vae_path:
         return args.vae_path
+    ssl_tag = str(getattr(args, "ssl_weight", 0.0)).replace(".", "p")
     return os.path.join(
         output_dir,
-        f"feature_vae_target{args.target_angle}_z{latent_dim}_seed{args.seed}.pt",
+        f"{args.vae_input}_vae_target{args.target_angle}_z{latent_dim}_ssl{ssl_tag}_seed{args.seed}.pt",
     )
 
 
@@ -301,7 +375,7 @@ def train_or_load_vae(
             and feat_dim_ckpt == feature_dim
             and latent_ckpt == latent_dim
             and scope_ckpt == "source_target"
-            and decoder_arch_ckpt == "model.VAE.decoder"
+            and decoder_arch_ckpt == "RMNISTDecoder"
         ):
             vae.load_state_dict(state, strict=True)
             vae.eval()
@@ -423,13 +497,148 @@ def train_or_load_vae(
             "latent_dim": latent_dim,
             "target_angle": args.target_angle,
             "train_scope": "source_target",
-            "decoder_arch": "model.VAE.decoder",
+            "decoder_arch": "RMNISTDecoder",
             "best_val_loss": float(best_val),
         },
         ckpt_path,
     )
     print(f"[VAE] Saved checkpoint: {ckpt_path}")
     vae.eval()
+    return vae
+
+
+def train_or_load_image_vae(
+    args: argparse.Namespace,
+    train_images: torch.Tensor,
+    latent_dim: int,
+    output_dir: str,
+) -> RMNISTVAE:
+    ckpt_path = _vae_checkpoint_path(args, output_dir, latent_dim)
+    vae = RMNISTVAE(x_dim=28 * 28, z_dim=latent_dim).to(DEVICE)
+
+    if os.path.exists(ckpt_path):
+        payload = torch.load(ckpt_path, map_location=DEVICE)
+        state = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
+        kind = payload.get("model_kind") if isinstance(payload, dict) else None
+        latent_ckpt = payload.get("latent_dim") if isinstance(payload, dict) else None
+        scope_ckpt = payload.get("train_scope") if isinstance(payload, dict) else None
+        arch_ckpt = payload.get("arch") if isinstance(payload, dict) else None
+        if (
+            kind == "image_vae"
+            and latent_ckpt == latent_dim
+            and scope_ckpt == "source_target_images"
+            and arch_ckpt == "RMNISTVAE"
+        ):
+            vae.load_state_dict(state, strict=True)
+            vae.eval()
+            print(f"[VAE] Loaded checkpoint: {ckpt_path}")
+            return vae
+        print("[VAE] Existing checkpoint is incompatible with image VAE; retraining.")
+
+    imgs = train_images.detach().cpu().float()
+    n_all = int(imgs.size(0))
+    idx_all = np.arange(n_all)
+    rng = np.random.default_rng(args.seed)
+    rng.shuffle(idx_all)
+    n_val = int(round(n_all * float(args.vae_val_frac)))
+    n_val = min(max(n_val, 1), max(1, n_all - 1))
+    val_idx = idx_all[:n_val]
+    tr_idx = idx_all[n_val:]
+
+    tr_imgs = imgs[tr_idx]
+    va_imgs = imgs[val_idx]
+    train_pairs = TensorDataset(tr_imgs, torch.zeros(len(tr_imgs), dtype=torch.long))
+    val_pairs = TensorDataset(va_imgs, torch.zeros(len(va_imgs), dtype=torch.long))
+
+    train_loader = DataLoader(
+        train_pairs,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_pairs,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        drop_last=False,
+    )
+
+    opt = torch.optim.Adam(vae.parameters(), lr=args.vae_lr)
+    best_val = float("inf")
+    best_state = copy.deepcopy(vae.state_dict())
+    bad_epochs = 0
+
+    for epoch in range(1, args.vae_epochs + 1):
+        vae.train()
+        running = 0.0
+        n_seen = 0
+        for x, _ in train_loader:
+            x = x.to(DEVICE).float()
+            bsz = x.size(0)
+            recon, mu, logvar = vae(x)
+            recon_flat = recon.view(bsz, -1)
+            x_flat = x.view(bsz, -1)
+            bce = F.binary_cross_entropy(recon_flat, x_flat, reduction="sum")
+            kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+            loss = (bce + kld) / max(1, bsz)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            running += float(loss.item()) * bsz
+            n_seen += bsz
+
+        vae.eval()
+        val_sum = 0.0
+        val_n = 0
+        with torch.no_grad():
+            for x, _ in val_loader:
+                x = x.to(DEVICE).float()
+                bsz = x.size(0)
+                recon, mu, logvar = vae(x)
+                recon_flat = recon.view(bsz, -1)
+                x_flat = x.view(bsz, -1)
+                bce = F.binary_cross_entropy(recon_flat, x_flat, reduction="sum")
+                kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+                loss = (bce + kld) / max(1, bsz)
+                val_sum += float(loss.item()) * bsz
+                val_n += bsz
+
+        tr_loss = running / max(1, n_seen)
+        val_loss = val_sum / max(1, val_n)
+        print(f"[VAE-image] epoch={epoch}/{args.vae_epochs} train={tr_loss:.4f} val={val_loss:.4f}")
+
+        if val_loss < (best_val - float(args.vae_min_delta)):
+            best_val = val_loss
+            best_state = copy.deepcopy(vae.state_dict())
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+            if bad_epochs >= int(args.vae_patience):
+                print(
+                    f"[VAE-image] Early stopping at epoch {epoch} "
+                    f"(best_val={best_val:.4f}, patience={args.vae_patience})"
+                )
+                break
+
+    vae.load_state_dict(best_state, strict=True)
+    vae.eval()
+    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+    torch.save(
+        {
+            "model_kind": "image_vae",
+            "state_dict": vae.state_dict(),
+            "latent_dim": latent_dim,
+            "target_angle": args.target_angle,
+            "train_scope": "source_target_images",
+            "arch": "RMNISTVAE",
+            "best_val_loss": float(best_val),
+        },
+        ckpt_path,
+    )
+    print(f"[VAE] Saved checkpoint: {ckpt_path}")
     return vae
 
 
@@ -781,6 +990,24 @@ def run(args: argparse.Namespace) -> None:
     output_dir = _resolve_output_dir(args)
     os.makedirs(output_dir, exist_ok=True)
 
+    # Image-only VAE mode: skip source-model / feature encoding stage entirely.
+    if args.vae_input == "image":
+        if not args.vae_only:
+            raise ValueError(
+                "--vae-input image is currently supported only with --vae-only. "
+                "Use --vae-input feature for full method trajectory generation."
+            )
+        src_trainset = get_single_rotate(False, 0)
+        tgt_trainset = get_single_rotate(False, args.target_angle)
+        latent_dim = args.vae_latent_dim if args.vae_latent_dim is not None else min(512, args.small_dim)
+        src_images = _collect_images_in_order(src_trainset, batch_size=args.batch_size, num_workers=args.num_workers)
+        tgt_images = _collect_images_in_order(tgt_trainset, batch_size=args.batch_size, num_workers=args.num_workers)
+        vae_images = torch.cat([src_images, tgt_images], dim=0)
+        _ = train_or_load_image_vae(args, vae_images, latent_dim, output_dir)
+        print("[Done] VAE-only image mode: reconstruction model trained/loaded. Skipping method runs and trajectory plots.")
+        print(f"[Done] Outputs saved under: {output_dir}")
+        return
+
     # Keep a dedicated args object for qualitative artifacts so we never touch
     # the main experiment model/cache/plot paths.
     args_main = copy.deepcopy(args)
@@ -1044,6 +1271,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--em-select", choices=["bic", "cost", "ll"], default="bic")
     parser.add_argument("--em-ensemble", action="store_true")
     parser.add_argument("--vae-latent-dim", type=int, default=None)
+    parser.add_argument(
+        "--vae-input",
+        choices=["feature", "image"],
+        default="feature",
+        help="VAE input type. 'feature' uses feature-conditioned VAE (full pipeline). "
+             "'image' trains plain image VAE and skips stage-1 when used with --vae-only.",
+    )
     parser.add_argument("--vae-epochs", type=int, default=100)
     parser.add_argument("--vae-lr", type=float, default=1e-3)
     parser.add_argument("--vae-val-frac", type=float, default=0.1, help="Validation fraction for VAE early stopping.")
