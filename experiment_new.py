@@ -4891,6 +4891,12 @@ if __name__ == "__main__":
     parser.add_argument("--label-source", choices=["pseudo", "em"], default="pseudo", help="For self-training, which labels to use for pseudo-labeling")
     parser.add_argument("--em-match",  choices=["pseudo", "prototypes","none"], default="pseudo", help="For self-training, which labels to use for pseudo-labeling")
     parser.add_argument("--em-ensemble", action="store_true", help="Whether to ensemble multiple EM models")
+    parser.add_argument(
+        "--em-bic-delta",
+        type=float,
+        default=10.0,
+        help="BIC trimming threshold for weighted EM ensembles.",
+    )
     parser.add_argument("--em-select", choices=["bic", "cost", "ll"], default="bic", help="Criterion to select best EM model")
     args = parser.parse_args()
     main(args)

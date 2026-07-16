@@ -1991,6 +1991,12 @@ def _append_curves_jsonl(
         "seed": int(getattr(args, "seed", -1)),
         "gt_domains": int(gt_domains),
         "generated_domains": int(generated_domains),
+        "em_match": str(getattr(args, "em_match", "unknown")),
+        "em_select": str(getattr(args, "em_select", "unknown")),
+        "em_ensemble": bool(getattr(args, "em_ensemble", False)),
+        "em_bic_delta": float(getattr(args, "em_bic_delta", 10.0)),
+        "em_seeds": [int(value) for value in getattr(args, "em_seeds", [])],
+        "em_seed_mode": str(getattr(args, "em_seed_mode", "unknown")),
         "elapsed": float(elapsed),
         "methods": methods_payload,
     }
@@ -2961,6 +2967,15 @@ if __name__ == "__main__":
         "--em-ensemble",
         action="store_true",
         help="Whether to ensemble multiple EM models",
+    )
+    parser.add_argument(
+        "--em-bic-delta",
+        type=float,
+        default=10.0,
+        help=(
+            "For EM ensembles, retain fits within this BIC difference of the "
+            "best fit and weight them by exp(-0.5 * delta_BIC)."
+        ),
     )
     parser.add_argument(
         "--em-select",

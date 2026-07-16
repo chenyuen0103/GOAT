@@ -26,6 +26,8 @@ python run_prepared_sweep.py \
   --gt-domains 0 \
   --generated-domains 0 1 2 3 \
   --em-matches prototypes pseudo \
+  --em-ensemble \
+  --em-bic-delta 10 \
   --prepared-artifact-root prepared_artifacts/headline_v1 \
   --log-root logs_prepared_v1 \
   --plot-root plots_prepared_v1
@@ -39,3 +41,8 @@ closed instead of being silently recomputed by a worker.
 Use a new log root whenever the protocol changes. The prepared artifacts reduce
 computation but do not make results from different pseudo-label thresholds, EM
 seed modes, or target-training conventions poolable.
+
+With `--em-ensemble`, mapped EM fits are restricted to
+`BIC - BIC_best <= em_bic_delta`, then averaged with weights proportional to
+`exp(-0.5 * (BIC - BIC_best))`. The default threshold is 10. Aggregation is
+mapping-dependent but reuses the same prepared raw EM fits.

@@ -124,3 +124,77 @@ def test_self_train_can_leave_target_eval_only():
     assert train_curve == []
     assert test_curve == [direct]
     assert predictions.tolist() == [0, 1]
+
+
+def _mapped_em_model(*, bic, posterior, seed):
+    posterior = np.asarray(posterior, dtype=float)
+    return {
+        "cfg": {"seed": seed, "cov_type": "diag", "K": posterior.shape[1]},
+        "em_res": {"gamma": posterior},
+        "final_ll": -float(bic),
+        "bic": float(bic),
+        "cost": 0.0,
+        "mapping": {index: index for index in range(posterior.shape[1])},
+        "mapped_soft": posterior,
+        "labels_mapped": posterior.argmax(axis=1),
+    }
+
+
+def test_em_ensemble_trims_and_weights_by_delta_bic():
+    first = _mapped_em_model(
+        bic=100.0,
+        posterior=[[0.9, 0.1], [0.2, 0.8]],
+        seed=0,
+    )
+    second = _mapped_em_model(
+        bic=102.0,
+        posterior=[[0.6, 0.4], [0.4, 0.6]],
+        seed=1,
+    )
+    rejected = _mapped_em_model(
+        bic=111.0,
+        posterior=[[0.0, 1.0], [1.0, 0.0]],
+        seed=2,
+    )
+    args = argparse.Namespace(
+        em_ensemble=True,
+        em_select="bic",
+        em_bic_delta=10.0,
+    )
+
+    bundle = em_utils.build_em_bundle([first, second, rejected], args)
+
+    weights = np.array([1.0, np.exp(-1.0)])
+    weights /= weights.sum()
+    expected = weights[0] * first["mapped_soft"] + weights[1] * second["mapped_soft"]
+    assert np.allclose(bundle.P_soft, expected)
+    assert bundle.key == "multi_em_bic_weighted"
+    assert bundle.info["criterion"] == "bic_trimmed_weighted_ensemble"
+    assert bundle.info["kept_indices"] == [0, 1]
+    assert bundle.info["anchor_idx"] == 0
+    assert np.allclose(bundle.info["weights"], weights)
+    assert bundle.info["all_bics"] == [100.0, 102.0, 111.0]
+
+
+def test_zero_bic_delta_keeps_only_the_best_fit():
+    best = _mapped_em_model(
+        bic=10.0,
+        posterior=[[0.8, 0.2]],
+        seed=0,
+    )
+    other = _mapped_em_model(
+        bic=10.1,
+        posterior=[[0.1, 0.9]],
+        seed=1,
+    )
+    args = argparse.Namespace(
+        em_ensemble=True,
+        em_select="bic",
+        em_bic_delta=0.0,
+    )
+
+    bundle = em_utils.build_em_bundle([best, other], args)
+
+    assert np.allclose(bundle.P_soft, best["mapped_soft"])
+    assert bundle.info["kept_indices"] == [0]
+    assert bundle.info["weights"] == [1.0]

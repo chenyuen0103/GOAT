@@ -155,30 +155,44 @@ def build_em_bundle(em_models, args):
 
     use_ensemble = bool(args.em_ensemble) and len(em_models) > 1
     if use_ensemble:
-        # Modify the ensemble logic to skip trimming and assign equal weights
-        trimmed = em_models  # Use all models without trimming
-        w = np.ones(len(trimmed)) / len(trimmed)  # Assign equal weights to all models
+        max_delta_bic = float(getattr(args, "em_bic_delta", 10.0))
+        if max_delta_bic < 0:
+            raise ValueError("em_bic_delta must be non-negative")
+        trimmed, w = trim_em_models_by_bic(
+            em_models,
+            max_delta_bic=max_delta_bic,
+        )
 
         P_ens, H_ens = ensemble_posteriors_trimmed(trimmed, w)
         labels_ens = P_ens.argmax(axis=1).astype(int)
-        # Deterministic anchor: top-weight model among trimmed
-        anchor_idx = int(np.argmax(w))
-        anchor = trimmed[anchor_idx]
-        # breakpoint()
+        anchor_trimmed_idx = int(np.argmax(w))
+        anchor = trimmed[anchor_trimmed_idx]
+        kept_indices = [
+            index
+            for index, model in enumerate(em_models)
+            if any(model is kept for kept in trimmed)
+        ]
+        anchor_idx = next(
+            index for index, model in enumerate(em_models) if model is anchor
+        )
         return EMBundle(
-            key="multi_em_trimmed",
+            key="multi_em_bic_weighted",
             em_res=anchor["em_res"],          # carry scaler/PCA/diagnostics from an actual fitted model
             mapping=None,                     # ensemble already in class space; no per-model mapping needed
             labels_em=labels_ens,
             P_soft=P_ens,
             info={
-                "criterion": "bic+trim_ensemble",
+                "criterion": "bic_trimmed_weighted_ensemble",
+                "max_delta_bic": max_delta_bic,
                 "bic_best": float(min(m["bic"] for m in trimmed)),
                 "weights": [float(wi) for wi in w.tolist()],
                 "bics": [float(m["bic"]) for m in trimmed],
+                "all_bics": [float(m["bic"]) for m in em_models],
+                "kept_indices": kept_indices,
                 "anchor_idx": anchor_idx,
                 "anchor_cfg": dict(anchor["cfg"]),
                 "grid_configs": [dict(m["cfg"]) for m in em_models],
+                "mean_posterior_entropy": float(np.mean(H_ens)),
             },
         )
 

@@ -56,6 +56,8 @@ def _common_command(
         str(em_match),
         "--em-select",
         str(args.em_select),
+        "--em-bic-delta",
+        str(args.em_bic_delta),
         "--em-seed-mode",
         str(args.em_seed_mode),
         "--em-seeds",
@@ -174,6 +176,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--label-source", choices=["pseudo", "em"], default="pseudo")
     parser.add_argument("--em-select", choices=["bic", "cost", "ll"], default="bic")
     parser.add_argument("--em-ensemble", action="store_true")
+    parser.add_argument("--em-bic-delta", type=float, default=10.0)
     parser.add_argument("--em-seeds", nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument(
         "--em-seed-mode",

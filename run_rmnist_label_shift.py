@@ -111,6 +111,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--em-match", choices=["prototypes", "pseudo"], default="prototypes")
     parser.add_argument("--em-select", choices=["bic", "cost", "ll"], default="bic")
     parser.add_argument("--em-ensemble", action="store_true")
+    parser.add_argument(
+        "--em-bic-delta",
+        type=float,
+        default=10.0,
+        help="BIC trimming threshold for weighted EM ensembles.",
+    )
     parser.add_argument("--em-seeds", nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument(
         "--em-seed-mode",
@@ -191,6 +197,7 @@ def experiment_config_json(cli: argparse.Namespace) -> str:
         "em_match": str(cli.em_match),
         "em_select": str(cli.em_select),
         "em_ensemble": bool(cli.em_ensemble),
+        "em_bic_delta": float(cli.em_bic_delta),
         "em_seed_offsets": [int(x) for x in cli.em_seeds],
         "em_seed_mode": str(cli.em_seed_mode),
         "em_cov_types": [str(x) for x in cli.em_cov_types],
@@ -374,6 +381,7 @@ def make_experiment_args(cli: argparse.Namespace, *, seed: int, output_dir: Path
         label_source="em",
         em_match=str(cli.em_match),
         em_ensemble=bool(cli.em_ensemble),
+        em_bic_delta=float(cli.em_bic_delta),
         em_select=str(cli.em_select),
         goat_gen_methods="w2",
         interp_class_agnostic=False,
@@ -901,6 +909,7 @@ def run_one(cli: argparse.Namespace, spec: RunSpec, output_dir: Path) -> Tuple[L
         "em_match": str(cli.em_match),
         "em_select": str(cli.em_select),
         "em_ensemble": bool(cli.em_ensemble),
+        "em_bic_delta": float(cli.em_bic_delta),
         "em_seed_offsets_json": json.dumps([int(x) for x in cli.em_seeds]),
         "em_seed_mode": str(cli.em_seed_mode),
         "em_rng_seeds_json": json.dumps(em_rng_seeds),
@@ -1640,6 +1649,7 @@ def write_summary(output_dir: Path) -> None:
         lines.append(
             f"- EM setup: `match={unique_value('em_match')}`, "
             f"`select={unique_value('em_select')}`, `ensemble={unique_value('em_ensemble')}`, "
+            f"`bic_delta={unique_value('em_bic_delta') if 'em_bic_delta' in df.columns else 'legacy'}`, "
             f"seed mode `{em_seed_mode}`, "
             f"seed values `{unique_value('em_seed_offsets_json')}`"
         )

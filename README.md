@@ -227,6 +227,9 @@ The main controls are:
 - `--em-match prototypes`: match EM components to source class prototypes.
 - `--em-match pseudo`: match EM components by agreement with teacher
   pseudo-labels.
+- `--em-ensemble`: discard EM fits more than `--em-bic-delta` above the best
+  BIC, then average retained class posteriors with weights proportional to
+  `exp(-0.5 * delta_BIC)`.
 - `--label-source {pseudo,em}`: choose labels consumed by self-training; this is
   separate from the EM component-mapping rule.
 - `--goat-gen-methods w2,fr,natural`: select interpolation geometries.
@@ -252,6 +255,8 @@ python run_prepared_sweep.py \
   --gt-domains 0 \
   --generated-domains 0 1 2 3 \
   --em-matches prototypes pseudo \
+  --em-ensemble \
+  --em-bic-delta 10 \
   --prepared-artifact-root prepared_artifacts/headline_v1 \
   --log-root logs_prepared_v1 \
   --plot-root plots_prepared_v1 \

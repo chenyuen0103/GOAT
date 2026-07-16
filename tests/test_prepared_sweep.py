@@ -117,6 +117,7 @@ def test_prepared_sweep_plans_one_prep_and_isolated_mapping_workers():
 
     assert len(prepare) == 1
     assert "--prepare-only" in prepare[0]
+    assert "--em-bic-delta" in prepare[0]
     assert "--require-prepared-artifacts" not in prepare[0]
     assert len(workers) == 7  # gen=0 once; gen=1,2,3 under both mappings
     assert all("--require-prepared-artifacts" in command for command in workers)
