@@ -123,13 +123,29 @@ starting a sweep:
 ```bash
 python -c "from goat.core import ArtifactPaths; print(ArtifactPaths.from_env().to_dict())"
 python -c "import torch; print('CUDA:', torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+python scripts/download_datasets.py --dry-run
+python scripts/download_datasets.py
 python run_prepared_sweep.py --dataset mnist --seeds 0 --gt-domains 0 --generated-domains 0 1 --dry-run
 ```
 
 ### Data preparation
 
 The full experiments support `mnist`, `color_mnist`, `portraits`, and
-`covtype`.
+`covtype`. The single dataset bootstrap downloads and prepares everything in
+the paths configured by the Conda environment:
+
+```bash
+# Preview URLs and destinations without downloading.
+python scripts/download_datasets.py --dry-run
+
+# Download MNIST, Portraits, and Covertype; preprocess Portraits.
+python scripts/download_datasets.py
+```
+
+The command is idempotent and reuses complete downloads and processed files.
+Use `--datasets mnist`, `--datasets portraits`, or `--datasets covtype` to fetch
+only selected datasets. Use `--force` to replace cached downloads and rebuild
+processed files.
 
 - **Rotated MNIST:** `torchvision` downloads MNIST automatically into
   `$GOAT_DATA_DIR/mnist`; source checkpoints are stored in
@@ -153,6 +169,10 @@ The full experiments support `mnist`, `color_mnist`, `portraits`, and
 - **Covertype:** download the UCI
   [Covertype dataset](https://archive.ics.uci.edu/dataset/31/covertype) and place
   the uncompressed data file at `$GOAT_DATA_DIR/covtype/covtype.data`.
+
+Run `python scripts/download_datasets.py --help` for all dataset-bootstrap
+options. The script uses the Portraits archive specified by the original
+gradual-domain-adaptation repository and the current UCI Covertype archive.
 
 ## Running experiments
 

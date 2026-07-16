@@ -71,7 +71,11 @@ def save_data(
 def resize_directory(path: str | Path, *, size: int = 32) -> None:
     path = Path(path).expanduser()
     if not path.is_dir():
-        raise FileNotFoundError(f"Portrait class directory not found: {path}")
+        raise FileNotFoundError(
+            f"Portrait class directory not found: {path}. "
+            "Run `python scripts/download_datasets.py --datasets portraits` "
+            "or extract the archive so dataset_32x32 contains M/ and F/."
+        )
     for item in path.iterdir():
         if not item.is_file():
             continue
