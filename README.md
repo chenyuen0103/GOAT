@@ -264,10 +264,39 @@ python run_prepared_sweep.py \
 ```
 
 Remove `--dry-run` to execute it. Batch sweeps skip plots by default; pass
-`--with-plots` for selected runs. After a completed preparation phase, resume
-only the isolated workers with the identical configuration and
-`--skip-prepare`. Missing, corrupt, or mismatched prepared artifacts fail closed
-rather than being silently recomputed.
+`--with-plots` for selected runs. The runner writes a sweep manifest, captures
+each subprocess's stdout/stderr, and atomically marks canonical runs as
+`running`, `completed`, or `failed`. Pass `--resume` to skip completed canonical
+runs or `--force` to replace an exact completed run. After a completed
+preparation phase, run only the isolated workers with the identical
+configuration and `--skip-prepare`. Missing, corrupt, or mismatched prepared
+artifacts fail closed rather than being silently recomputed.
+
+Older `.txt` and `_curves.jsonl` results can be imported without retraining:
+
+```bash
+python aggregate_prepared_sweep.py \
+  --log-root "$LOG_ROOT/headline_bicensemble_v1" \
+  --prepared-artifact-root "$GOAT_PREPARED_ARTIFACT_ROOT/headline_bicensemble_v1" \
+  --dataset mnist --target 45 \
+  --seeds 0 --gt-domains 0 --generated-domains 0 1 \
+  --em-matches prototypes pseudo \
+  --em-ensemble --em-bic-delta 10 \
+  --backfill-legacy
+```
+
+The importer reconstructs BIC retention and weights from checksum-validated raw
+EM artifacts when available. Use the same command with all five seeds and
+`--generated-domains 0 1 2 3` to create and validate the final aggregate.
+
+Generate plots from saved canonical records—without rerunning training—with:
+
+```bash
+python plot_prepared_sweep.py \
+  --log-root "$LOG_ROOT/headline_bicensemble_v1" \
+  --plot-root "$PLOT_ROOT/headline_bicensemble_v1" \
+  --dataset mnist
+```
 
 Use new versioned artifact and log roots whenever the protocol, source model,
 EM options, or pseudo-label threshold changes. See
@@ -295,7 +324,28 @@ to resume an incomplete grid.
 
 Standard runs write logs under `logs_rerun/` and plots under `plots_rerun/`.
 Prepared sweeps use the roots supplied on their command line. Source-model and
-encoded-feature caches are reused when their configuration matches.
+encoded-feature caches are reused when their configuration matches. Each
+prepared worker keeps its legacy summary/curve files and additionally writes:
+
+```text
+<log-root>/
+├── sweep_manifest.json
+├── manifests/<sweep-id>.json
+├── driver/prepare/.../{stdout,stderr}.log
+├── runs/<dataset>/<target>/<seed>/<Gobs>/<Gsyn>/<mapping>/<run-id>/
+│   ├── run.json
+│   ├── methods.csv
+│   ├── curves.json
+│   ├── em_diagnostics.json
+│   ├── stdout.log
+│   ├── stderr.log
+│   └── status.json
+└── aggregate/{runs.csv,summary.csv,validation.json}
+```
+
+The run ID covers the complete material configuration and code state, so
+changing the BIC threshold, EM seeds, mapping, or code revision cannot silently
+overwrite a different canonical result.
 
 The package artifact resolver recognizes:
 

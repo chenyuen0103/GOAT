@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Iterable
 
 from goat.core.io import read_jsonl
+from goat.core.io import read_json
 from goat.core.schema import RunRecord
 
 
@@ -26,6 +27,13 @@ def load_legacy_curve_records(path: str | Path) -> list[dict]:
 
 def load_run_records(path: str | Path, *, dataset: str | None = None) -> list[RunRecord]:
     path = Path(path)
+    if path.name == "run.json":
+        return [RunRecord.from_dict(read_json(path))]
+    if path.is_dir():
+        return [
+            RunRecord.from_dict(read_json(run_path))
+            for run_path in sorted(path.rglob("run.json"))
+        ]
     dataset = dataset or infer_dataset_from_path(path)
     return [
         RunRecord.from_legacy_curve_record(
@@ -42,4 +50,3 @@ def method_names(records: Iterable[RunRecord]) -> list[str]:
     for record in records:
         names.update(record.methods)
     return sorted(names)
-

@@ -64,6 +64,7 @@ from goat.core.artifacts import (
     experiment_cache_dir,
     mnist_model_dir,
 )
+from goat.core.run_outputs import jsonable, utc_now, write_canonical_run_outputs
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -487,6 +488,7 @@ def maybe_cache_source_stats(args, encoded_src):
         }
         store = PreparedArtifactStore(prepared_root)
         artifact_key = store.key(metadata)
+        payload_path, manifest_path, _ = store.paths("source_prototypes", artifact_key)
         with store.lock("source_prototypes", artifact_key):
             source_stats = store.load(
                 "source_prototypes",
@@ -506,6 +508,15 @@ def maybe_cache_source_stats(args, encoded_src):
                 print(f"[EM] Saved prepared source prototypes: {path}")
             else:
                 print(f"[EM] Loaded prepared source prototypes: {artifact_key}")
+        refs = getattr(args, "_prepared_artifact_refs", None)
+        if refs is None:
+            refs = {}
+            args._prepared_artifact_refs = refs
+        refs["source_prototypes"] = {
+            "key": artifact_key,
+            "payload": str(payload_path),
+            "manifest": str(manifest_path),
+        }
     else:
         source_stats = fit_source_gaussian_params(
             X=encoded_src.data,
@@ -564,6 +575,7 @@ def fit_em_bundle_for_dataset(
         return compact_raw_em_models_for_artifact(fitted)
 
     prepared_root = str(getattr(args, "prepared_artifact_root", "") or "").strip()
+    artifact_ref = None
     if prepared_root:
         metadata = {
             "artifact": "raw-em-grid",
@@ -585,6 +597,7 @@ def fit_em_bundle_for_dataset(
         }
         store = PreparedArtifactStore(prepared_root)
         artifact_key = store.key(metadata)
+        payload_path, manifest_path, _ = store.paths("raw_em", artifact_key)
         with store.lock("raw_em", artifact_key):
             raw_models = store.load(
                 "raw_em",
@@ -598,6 +611,17 @@ def fit_em_bundle_for_dataset(
                 print(f"[EM] Saved prepared raw EM artifact: {path}")
             else:
                 print(f"[EM] Loaded prepared raw EM artifact for {description}: {artifact_key}")
+        artifact_ref = {
+            "key": artifact_key,
+            "payload": str(payload_path),
+            "manifest": str(manifest_path),
+            "metadata": metadata,
+        }
+        refs = getattr(args, "_prepared_artifact_refs", None)
+        if refs is None:
+            refs = {}
+            args._prepared_artifact_refs = refs
+        refs[f"raw_em:{description}"] = artifact_ref
     else:
         print(f"[EM] Fitting raw models for {description} ...")
         raw_models = _fit_raw_models()
@@ -619,6 +643,33 @@ def fit_em_bundle_for_dataset(
         )
 
     em_bundle = build_em_bundle(em_models, args)
+    diagnostics = getattr(args, "_em_diagnostics", None)
+    if diagnostics is None:
+        diagnostics = {}
+        args._em_diagnostics = diagnostics
+    diagnostics[str(description)] = jsonable(
+        {
+            "domain": str(description),
+            "mapping_scheme": str(getattr(args, "em_match", "unknown")),
+            "selection_criterion": str(getattr(args, "em_select", "unknown")),
+            "ensemble_enabled": bool(getattr(args, "em_ensemble", False)),
+            "bundle": em_bundle.info,
+            "models": [
+                {
+                    "index": index,
+                    "config": model.get("cfg", {}),
+                    "bic": model.get("bic"),
+                    "final_ll": model.get("final_ll"),
+                    "cost": model.get("cost"),
+                    "mapping": model.get("mapping"),
+                    "evaluation_accuracy": rows[index].get("acc") if index < len(rows) else None,
+                }
+                for index, model in enumerate(em_models)
+            ],
+            "prepared_artifact": artifact_ref,
+            "target_label_accuracy_is_evaluation_only": True,
+        }
+    )
     apply_em_bundle_to_target(em_bundle, encoded_dataset, raw_dataset)
     args._shared_em = em_bundle
     return em_bundle
@@ -2012,6 +2063,7 @@ def log_summary(
     generated_domains: int,
     results: Dict[str, MethodResult],
     elapsed: float,
+    target: Optional[int] = None,
 ):
     """Persist one CSV-style summary row plus one full-curves JSON record (overwrite mode)."""
 
@@ -2057,6 +2109,13 @@ def log_summary(
         generated_domains=generated_domains,
         results=results,
         elapsed=elapsed,
+    )
+    write_canonical_run_outputs(
+        args=args,
+        target=target,
+        results=results,
+        elapsed=elapsed,
+        legacy_log_path=log_path,
     )
 
 # ---------------------------------------------------------------------------
@@ -2326,6 +2385,7 @@ def run_mnist_experiment(target: int, gt_domains: int, generated_domains: int, a
         generated_domains=generated_domains,
         results=results,
         elapsed=time.time() - t0,
+        target=target,
     )
 
     return results
@@ -2477,6 +2537,7 @@ def run_portraits_experiment(gt_domains: int, generated_domains: int, args=None)
         generated_domains=generated_domains,
         results=results,
         elapsed=time.time() - t0,
+        target=None,
     )
 
     return results
@@ -2855,6 +2916,9 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
 
 
 def main(cli_args: argparse.Namespace) -> None:
+    cli_args.run_started_at = utc_now()
+    cli_args._em_diagnostics = {}
+    cli_args._prepared_artifact_refs = {}
     prepared_root = str(getattr(cli_args, "prepared_artifact_root", "") or "").strip()
     if bool(getattr(cli_args, "prepare_only", False)) and not prepared_root:
         raise ValueError("--prepare-only requires --prepared-artifact-root")
@@ -3005,6 +3069,11 @@ if __name__ == "__main__":
         "--prepared-artifact-root",
         default="",
         help="Versioned immutable artifacts shared by isolated sweep workers.",
+    )
+    parser.add_argument(
+        "--run-id",
+        default="",
+        help="Expected canonical run identifier supplied by the sweep orchestrator.",
     )
     parser.add_argument(
         "--prepare-only",

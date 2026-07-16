@@ -173,6 +173,29 @@ their JSON metadata and ensure that it reports `em_ensemble: true`,
 
 ## Next actions
 
+### 0. Pull the output-audit implementation and backfill the canary
+
+The output layer now writes canonical run directories, real CSV tables,
+complete EM diagnostics, captured stdout/stderr, status files, and sweep
+manifests. After pulling the updated repository, import the three completed
+legacy canary records:
+
+```bash
+python aggregate_prepared_sweep.py \
+  --log-root "$LOG_ROOT/headline_bicensemble_v1" \
+  --prepared-artifact-root "$GOAT_PREPARED_ARTIFACT_ROOT/headline_bicensemble_v1" \
+  --dataset mnist --target 45 \
+  --seeds 0 --gt-domains 0 --generated-domains 0 1 \
+  --em-matches prototypes pseudo \
+  --em-ensemble --em-bic-delta 10 \
+  --backfill-legacy
+```
+
+The validation must report `passed: true`, `expected_result_rows: 3`, and
+`actual_result_rows: 3`. Legacy stdout cannot be recovered, but BIC retention
+and ensemble weights are reconstructed from checksum-validated raw EM
+artifacts.
+
 ### 1. Complete seed 0 without repeating its canary workers
 
 The seed-0 prepared EM artifacts are independent of `Gsyn`, so run only the
@@ -191,7 +214,8 @@ python run_prepared_sweep.py \
   --prepared-artifact-root "$GOAT_PREPARED_ARTIFACT_ROOT/headline_bicensemble_v1" \
   --log-root "$LOG_ROOT/headline_bicensemble_v1" \
   --plot-root "$PLOT_ROOT/headline_bicensemble_v1" \
-  --skip-prepare
+  --skip-prepare \
+  --resume
 ```
 
 ### 2. Run seeds 1 through 4
@@ -211,7 +235,8 @@ python run_prepared_sweep.py \
   --em-bic-delta 10 \
   --prepared-artifact-root "$GOAT_PREPARED_ARTIFACT_ROOT/headline_bicensemble_v1" \
   --log-root "$LOG_ROOT/headline_bicensemble_v1" \
-  --plot-root "$PLOT_ROOT/headline_bicensemble_v1"
+  --plot-root "$PLOT_ROOT/headline_bicensemble_v1" \
+  --resume
 ```
 
 Run these commands sequentially on a single GPU unless resource isolation has
@@ -233,6 +258,21 @@ Check that every record has the expected seed, `Gobs`, `Gsyn`, mapping, EM
 ensemble flag, BIC threshold, and method curves. Do not select configurations
 using target test accuracy; target labels are for final evaluation only.
 
+Run the strict validator and aggregator:
+
+```bash
+python aggregate_prepared_sweep.py \
+  --log-root "$LOG_ROOT/headline_bicensemble_v1" \
+  --prepared-artifact-root "$GOAT_PREPARED_ARTIFACT_ROOT/headline_bicensemble_v1" \
+  --dataset mnist --target 45 \
+  --seeds 0 1 2 3 4 --gt-domains 0 --generated-domains 0 1 2 3 \
+  --em-matches prototypes pseudo \
+  --em-ensemble --em-bic-delta 10
+```
+
+It must report 35 expected and 35 actual canonical records with no missing,
+unexpected, or duplicate configurations.
+
 ### 4. Summarize before launching the next benchmark
 
 Produce seed-level and aggregate tables for at least:
@@ -246,6 +286,15 @@ Produce seed-level and aggregate tables for at least:
 - runtime per preparation phase and worker.
 
 Only after checking this table should the same design be applied to Portraits.
+
+Create plots after validation without rerunning adaptation:
+
+```bash
+python plot_prepared_sweep.py \
+  --log-root "$LOG_ROOT/headline_bicensemble_v1" \
+  --plot-root "$PLOT_ROOT/headline_bicensemble_v1" \
+  --dataset mnist
+```
 
 ## Protocol caveats
 
@@ -296,4 +345,3 @@ From `~/GOAT` on the experiment machine, start Codex with:
 codex -C ~/GOAT \
   'Read docs/CODEX_HANDOFF.md, README.md, and docs/prepared_sweeps.md. Inspect git status, the prepared-artifact manifests, and the canary logs on this machine. Continue from Next actions without rerunning completed configurations. Report any discrepancy before launching further jobs.'
 ```
-

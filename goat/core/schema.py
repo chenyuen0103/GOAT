@@ -114,7 +114,11 @@ class MethodResult:
             "st_all_curve",
             "generated_curve",
             "duration_sec",
+            "name",
+            "metrics",
         }
+        metrics = dict(payload.get("metrics") or {})
+        metrics.update({key: payload[key] for key in sorted(metric_keys)})
         return cls(
             name=name,
             train_curve=list(payload.get("train_curve") or []),
@@ -122,28 +126,35 @@ class MethodResult:
             st_curve=list(payload.get("st_curve") or []),
             st_all_curve=list(payload.get("st_all_curve") or []),
             generated_curve=list(payload.get("generated_curve") or []),
-            metrics={key: payload[key] for key in sorted(metric_keys)},
+            metrics=metrics,
             duration_sec=payload.get("duration_sec"),
         )
 
 
 @dataclass(frozen=True)
 class RunRecord:
-    """Canonical JSONL record schema for experiment outputs."""
+    """Canonical record schema for experiment outputs."""
 
     dataset: str
     seed: int
     methods: Mapping[str, MethodResult]
+    run_id: Optional[str] = None
     config: Mapping[str, Any] = field(default_factory=dict)
     metrics: Mapping[str, Any] = field(default_factory=dict)
-    artifacts: Mapping[str, str] = field(default_factory=dict)
+    artifacts: Mapping[str, Any] = field(default_factory=dict)
+    em_diagnostics: Mapping[str, Any] = field(default_factory=dict)
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+    command: Sequence[str] = field(default_factory=list)
+    created_at: Optional[str] = None
+    completed_at: Optional[str] = None
     elapsed_sec: Optional[float] = None
-    schema_version: int = 1
+    schema_version: int = 2
 
     def to_dict(self) -> dict[str, Any]:
         return _clean_dict(
             {
                 "schema_version": self.schema_version,
+                "run_id": self.run_id,
                 "dataset": self.dataset,
                 "seed": self.seed,
                 "config": dict(self.config),
@@ -152,8 +163,35 @@ class RunRecord:
                 },
                 "metrics": dict(self.metrics),
                 "artifacts": dict(self.artifacts),
+                "em_diagnostics": dict(self.em_diagnostics),
+                "provenance": dict(self.provenance),
+                "command": list(self.command),
+                "created_at": self.created_at,
+                "completed_at": self.completed_at,
                 "elapsed_sec": self.elapsed_sec,
             }
+        )
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RunRecord":
+        return cls(
+            run_id=payload.get("run_id"),
+            dataset=str(payload.get("dataset", "unknown")),
+            seed=int(payload.get("seed", 0)),
+            methods={
+                name: MethodResult.from_legacy(name, method_payload)
+                for name, method_payload in (payload.get("methods") or {}).items()
+            },
+            config=dict(payload.get("config") or {}),
+            metrics=dict(payload.get("metrics") or {}),
+            artifacts=dict(payload.get("artifacts") or {}),
+            em_diagnostics=dict(payload.get("em_diagnostics") or {}),
+            provenance=dict(payload.get("provenance") or {}),
+            command=list(payload.get("command") or []),
+            created_at=payload.get("created_at"),
+            completed_at=payload.get("completed_at"),
+            elapsed_sec=payload.get("elapsed_sec", payload.get("elapsed")),
+            schema_version=int(payload.get("schema_version", 1)),
         )
 
     @classmethod
@@ -179,5 +217,5 @@ class RunRecord:
             config=config,
             artifacts=dict(artifacts or {}),
             elapsed_sec=payload.get("elapsed"),
+            schema_version=1,
         )
-

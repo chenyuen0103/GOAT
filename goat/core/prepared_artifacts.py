@@ -86,6 +86,11 @@ class PreparedArtifactStore:
         base = self.root / str(kind) / key
         return base.with_suffix(".pt"), base.with_suffix(".json"), base.with_suffix(".lock")
 
+    def paths(self, kind: str, key: str) -> tuple[Path, Path, Path]:
+        """Return payload, manifest, and lock paths for an artifact key."""
+
+        return self._paths(kind, key)
+
     @contextmanager
     def lock(self, kind: str, key: str) -> Iterator[None]:
         """Serialize preparation of one key while allowing independent keys."""
@@ -163,4 +168,3 @@ class PreparedArtifactStore:
             payload_tmp.unlink(missing_ok=True)
             manifest_tmp.unlink(missing_ok=True)
         return payload_path
-
