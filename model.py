@@ -66,41 +66,6 @@ class Encoder(nn.Module):
         return x
 
 
-# class Classifier(nn.Module):
-#     def __init__(self, backbone, hdim=512, n_class=10, reg=True):
-#         super(Classifier, self).__init__()
-
-#         # self.backbone = backbone
-#         self.backbone = nn.Sequential(
-#             backbone, 
-#             nn.AdaptiveAvgPool2d(output_size=(1, 1)),
-#             nn.Flatten()
-#         )
-#         self.predict = nn.Sequential(
-#             nn.Linear(backbone.out_features, hdim),
-#             nn.BatchNorm1d(hdim),
-#             nn.ReLU(),
-#             nn.Linear(hdim, n_class)
-#         )
-    
-#     def forward(self, x):
-#         x = self.backbone(x)
-#         x = self.predict(x)
-
-#         return x
-    
-#     def get_parameters(self, base_lr=1.0):
-#         """A parameter list which decides optimization hyper-parameters,
-#             such as the relative learning rate of each layer
-#         """
-#         params = [
-#             {"params": self.backbone.parameters(), "lr": 0.1 * base_lr},
-#             {"params": self.predict.parameters(), "lr": 1.0 * base_lr}
-#         ]
-
-#         return params
-
-
 class ENCODER(nn.Module):
     def __init__(self, rgb=False, resnet=False):
         super(ENCODER, self).__init__()
@@ -378,29 +343,6 @@ class GaussianHead(nn.Module):
 
 
 
-# class GaussianClassifier(Classifier):
-#     """
-#     Adds an optional compressor after the encoder:
-#       - fmap encoders (N×C×H×W): Conv1x1 to C_comp, optional AvgPool to shrink H,W
-#       - vector encoders (N×d):   Linear bottleneck to d_comp
-#     Then projects to emb_dim and classifies with a Gaussian head.
-#     """
-#     def __init__(self, encoder, mlp, gaussian_head, normalize=False):
-#         super(GaussianClassifier, self).__init__(encoder, mlp)
-#         # check if the encoder 
-#         # Gaussian head
-#         self.normalize = normalize
-#         self.classifier = gaussian_head
-
-
-#     def forward(self, x):
-#         h = self.encoder(x)
-#         z = self.mlp.features(h)
-#         if self.normalize:
-#             z = nn.functional.normalize(z, dim=1, eps=1e-6)
-#         # breakpoint()
-#         return self.classifier(z)   # logits N×K
-
 
 class GaussianClassifier(nn.Module):
     def __init__(self, encoder, mlp, gaussian_head,
@@ -481,6 +423,13 @@ class VAE(nn.Module):
     def encode(self, x):
         h = self.encoder_net(x)
         return self.fc_mu(h), self.fc_log_var(h)
+
+    # Backward-compatible API used by RMNIST notebooks:
+    # model.encoder(x) -> (mu, log_var)
+    def encoder(self, x):
+        if x.dim() > 2:
+            x = x.view(x.size(0), -1)
+        return self.encode(x)
 
     def reparameterize(self, mu, log_var):
         std = torch.exp(0.5 * log_var)
@@ -574,6 +523,11 @@ class CVAE(nn.Module):
     def encode(self, x):
         h = self.encoder_conv(x).view(x.size(0), -1)
         return self.fc_mu(h), self.fc_log_var(h)
+
+    # Backward-compatible API used by RMNIST notebooks:
+    # model.encoder(x) -> (mu, log_var)
+    def encoder(self, x):
+        return self.encode(x)
 
     def reparameterize(self, mu, log_var):
         std = torch.exp(0.5 * log_var)

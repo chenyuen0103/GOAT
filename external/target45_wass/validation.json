@@ -1,0 +1,41 @@
+{
+  "actual_diagnostic_rows": 210,
+  "actual_per_class_rows": 8400,
+  "actual_result_rows": 840,
+  "delta_p_formula": "1.8 * skew",
+  "delta_p_formula_max_abs_error": 2.220446049250313e-16,
+  "delta_p_formula_ok": true,
+  "diagnostics_csv_exists": true,
+  "diagnostics_csv_nonempty": true,
+  "duplicate_result_rows": 0,
+  "expected_diagnostic_rows": 210,
+  "expected_methods": [
+    "goat",
+    "cgda_fr",
+    "cgda_wass",
+    "cgda_fr_oracle"
+  ],
+  "expected_per_class_rows": 8400,
+  "expected_result_rows": 840,
+  "expected_specs": 210,
+  "figures": {
+    "balanced_risk_vs_delta_p.png": true,
+    "cgda_class_structure_error_vs_delta_p.png": true,
+    "combined_balanced_accuracy_goat_vs_cgda_wass.png": true,
+    "combined_balanced_accuracy_methods_vs_delta_p.png": true,
+    "goat_crossot_vs_delta_p.png": true,
+    "oracle_estimated_gap_vs_delta_p.png": true,
+    "oracle_vs_estimated_cgda_fr.png": true,
+    "rarest_class_recall_vs_delta_p.png": true
+  },
+  "figures_nonempty": true,
+  "missing_diagnostic_row_examples": [],
+  "missing_diagnostic_rows": 0,
+  "missing_result_row_examples": [],
+  "missing_result_rows": 0,
+  "passed": true,
+  "per_class_recall_csv_exists": true,
+  "per_class_recall_csv_nonempty": true,
+  "results_csv_exists": true,
+  "results_csv_nonempty": true
+}

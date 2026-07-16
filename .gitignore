@@ -32,11 +32,27 @@ plots/
 *.data
 plots_old/
 
+# Reorganization-era generated artifacts
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+coverage.xml
+*.coverage
+*.egg-info/
+build/
+dist/
+notebooks/.ipynb_checkpoints/
+*.ckpt
+*.npz
+*.npy
+*.jsonl.tmp
+
 
 *.tex
 figures_main/
 .mplconfig/
 *.txt
+!requirements*.txt
 
 analysis_outputs/
 logs_rerun/

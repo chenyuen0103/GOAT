@@ -13,7 +13,7 @@ gt_domains=(0 1 2 3)
 generated_domains=(0 1 2 3)
 small_dim=2048
 em_select="bic"
-em_match="pseudo"
+em_match="prototypes"
 label_source="pseudo"
 em_ensemble_suffix=""
 
@@ -28,7 +28,7 @@ for s in "${seeds[@]}"; do
           echo "Skip (already ran): $log_path"
           continue
         fi
-        python experiment_refrac.py --plot-root "$PLOT_ROOT" --log-root "$LOG_ROOT" --rotation-angle "$a" --label-source "$label_source" --seed "$s" --gt-domains "$gt" --generated-domains "$gd"
+        python experiment_refrac.py --plot-root "$PLOT_ROOT" --log-root "$LOG_ROOT" --rotation-angle "$a" --label-source "$label_source" --em-match "$em_match" --seed "$s" --gt-domains "$gt" --generated-domains "$gd"
       done
     done
   done

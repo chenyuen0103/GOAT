@@ -6,7 +6,7 @@ PLOT_ROOT="${PLOT_ROOT:-plots_rerun}"
 
 label_sources=(pseudo)
 em_matches=(prototypes)
-seeds=(0 1 2)
+seeds=(0 1 2 3 4)
 gt_domains=(0 1 2 3)
 generated_domains=(0)
 dataset="covtype"
@@ -18,6 +18,34 @@ em_ensemble_suffix=""
 
 # If 1, rerun gen=0 experiments even if logs already exist (old results were saved differently).
 RERUN_GEN0="${RERUN_GEN0:-1}"
+
+clear_seed_cache() {
+  local seed="$1"
+  for ls in "${label_sources[@]}"; do
+    for m in "${em_matches[@]}"; do
+      for gt in "${gt_domains[@]}"; do
+        for gd in "${generated_domains[@]}"; do
+          local log_base="test_acc_dim${small_dim}_int${gt}_gen${gd}_${ls}_${m}_${em_select}${em_ensemble_suffix}.txt"
+          local log_dir="${LOG_ROOT}/${dataset}/s${seed}"
+          local log_path="${log_dir}/${log_base}"
+          local curves_path="${log_path%.txt}_curves.jsonl"
+          rm -f "$log_path" "$curves_path"
+          shopt -s nullglob
+          local bak
+          for bak in "${log_path}.bak."* "${curves_path}.bak."*; do
+            rm -f "$bak"
+          done
+          shopt -u nullglob
+        done
+      done
+    done
+  done
+}
+
+for s in 3 4; do
+  echo "Clearing cache/log artifacts for seed=${s}"
+  clear_seed_cache "$s"
+done
 
 for ls in "${label_sources[@]}"; do
   for m in "${em_matches[@]}"; do

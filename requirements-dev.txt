@@ -1,0 +1,4 @@
+-r requirements-minimal.txt
+pytest>=8
+ruff>=0.5
+

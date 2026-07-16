@@ -119,6 +119,21 @@ def _logs_base_dir(args) -> str:
     return os.path.join(log_root, args.dataset, _seed_tag(args))
 
 
+def _encoded_cache_dir(args, *, target: Optional[int] = None) -> str:
+    """
+    Return encoded-feature cache directory.
+
+    Include seed in non-MNIST cache paths to avoid cross-seed cache reuse, which can
+    mismatch encoded sample order/labels and shift initial test points.
+    """
+    dataset = getattr(args, "dataset", None)
+    if dataset == "mnist":
+        if target is None:
+            raise ValueError("target must be provided for mnist cache path.")
+        return f"cache{args.ssl_weight}/target{target}/small_dim{args.small_dim}/"
+    return f"{dataset}/cache{args.ssl_weight}/{_seed_tag(args)}/small_dim{args.small_dim}/"
+
+
 def _snapshot_target_em_labels(args, target_ds) -> None:
     """Persist canonical target EM labels so later method runs can restore them."""
     if target_ds is None or not hasattr(target_ds, "targets_em"):
@@ -517,6 +532,27 @@ def run_core_methods(
     """Run the standard suite (Ours-FR, Ours-ETA, GOAT, GOAT-Classwise)."""
 
     results: Dict[str, MethodResult] = {}
+    goat_methods_raw = getattr(args, "goat_gen_methods", "w2")
+    goat_methods = []
+    for token in str(goat_methods_raw).split(","):
+        m = token.strip().lower()
+        if not m:
+            continue
+        if m in {"ot", "wasserstein"}:
+            m = "w2"
+        elif m in {"fisher-rao", "fisher_rao"}:
+            m = "fr"
+        elif m in {"eta", "nat", "np", "natureal"}:
+            m = "natural"
+        if m not in {"w2", "fr", "natural"}:
+            raise ValueError(
+                f"Unsupported --goat-gen-methods token '{token}'. "
+                "Allowed: w2, fr, natural."
+            )
+        if m not in goat_methods:
+            goat_methods.append(m)
+    if not goat_methods:
+        goat_methods = ["w2"]
 
     def _clone():
         return copy.deepcopy(ref_model)
@@ -604,32 +640,35 @@ def run_core_methods(
     # ---------------- GOAT / GOAT-Classwise ----------------
     # Only meaningful (and only safe) when we actually generate synthetic domains
     if generated_domains > 0:
-        # GOAT
-        _apply_canonical_target_em(args, tgt_trainset, all_sets=all_sets)
-        _assert_target_em_is_canonical(args, target_ds=tgt_trainset)
-        _assert_target_em_alignment(
-            args,
-            context="run_core_methods/pre-goat",
-            target_ds=tgt_trainset,
-            all_sets=all_sets,
-        )
-        set_all_seeds(args.seed)
-        start = time.time()
-        goat_src = _clone()
-        goat_cp = copy.deepcopy(goat_src)
-        payload = run_goat(
-            goat_cp,
-            goat_src,
-            src_trainset,
-            tgt_trainset,
-            all_sets,
-            deg_idx,
-            generated_domains,
-            epochs=5,
-            target=target_label,
-            args=args,
-        )
-        results["goat"] = _wrap_result("GOAT", payload, time.time() - start, has_em=False)
+        for goat_method in goat_methods:
+            _apply_canonical_target_em(args, tgt_trainset, all_sets=all_sets)
+            _assert_target_em_is_canonical(args, target_ds=tgt_trainset)
+            _assert_target_em_alignment(
+                args,
+                context=f"run_core_methods/pre-goat-{goat_method}",
+                target_ds=tgt_trainset,
+                all_sets=all_sets,
+            )
+            set_all_seeds(args.seed)
+            start = time.time()
+            goat_src = _clone()
+            goat_cp = copy.deepcopy(goat_src)
+            payload = run_goat(
+                goat_cp,
+                goat_src,
+                src_trainset,
+                tgt_trainset,
+                all_sets,
+                deg_idx,
+                generated_domains,
+                epochs=5,
+                target=target_label,
+                args=args,
+                gen_method=goat_method,
+            )
+            key = "goat" if goat_method == "w2" else f"goat_{goat_method}"
+            name = "GOAT" if goat_method == "w2" else f"GOAT-{goat_method.upper()}"
+            results[key] = _wrap_result(name, payload, time.time() - start, has_em=False)
 
         # GOAT-Classwise
         _apply_canonical_target_em(args, tgt_trainset, all_sets=all_sets)
@@ -862,10 +901,10 @@ def run_goat_classwise(
 
         # 2) Encode domains once (encoder → flatten → compressor)
         if args.dataset != "mnist":
-            cache_dir = f"{args.dataset}/cache{args.ssl_weight}/small_dim{args.small_dim}/"
+            cache_dir = _encoded_cache_dir(args)
             plot_dir  = _plots_base_dir(args)
         else:
-            cache_dir = f"cache{args.ssl_weight}/target{target}/small_dim{args.small_dim}/"
+            cache_dir = _encoded_cache_dir(args, target=target)
             plot_dir  = os.path.join(_plots_base_dir(args), f"target{target}")
         os.makedirs(cache_dir, exist_ok=True)
         os.makedirs(plot_dir,  exist_ok=True)
@@ -910,10 +949,10 @@ def run_goat_classwise(
 
     # Plot/cache directories (for synthetic runs only)
     if args.dataset != "mnist":
-        cache_dir = f"{args.dataset}/cache{args.ssl_weight}/small_dim{args.small_dim}/"
+        cache_dir = _encoded_cache_dir(args)
         plot_dir  = _plots_base_dir(args)
     else:
-        cache_dir = f"cache{args.ssl_weight}/target{target}/small_dim{args.small_dim}/"
+        cache_dir = _encoded_cache_dir(args, target=target)
         plot_dir  = os.path.join(_plots_base_dir(args), f"target{target}")
     os.makedirs(cache_dir, exist_ok=True)
     os.makedirs(plot_dir,  exist_ok=True)
@@ -959,12 +998,18 @@ def run_goat_classwise(
     )
 
     for raw_ds, enc_ds in zip(raw_domains, enc_domains):
+        # Prefer EM labels only when they are valid; many raw EncodeDataset instances
+        # carry a default targets_em=-1 placeholder, which breaks class-wise splits.
+        labels_em = None
         if hasattr(raw_ds, "targets_em"):
-            labels_em = torch.as_tensor(raw_ds.targets_em)
-        else:
-            labels_em = torch.as_tensor(raw_ds.targets)
+            raw_em = torch.as_tensor(raw_ds.targets_em).view(-1).long()
+            if raw_em.numel() > 0 and torch.any(raw_em >= 0):
+                labels_em = raw_em
+        if labels_em is None:
+            labels_em = torch.as_tensor(raw_ds.targets).view(-1).long()
+
         enc_ds.targets_em = labels_em.to(enc_ds.data.device)
-        enc_ds.targets    = torch.as_tensor(raw_ds.targets).to(enc_ds.data.device)
+        enc_ds.targets    = torch.as_tensor(raw_ds.targets).view(-1).long().to(enc_ds.data.device)
 
     _assert_target_em_alignment(
         args,
@@ -1188,10 +1233,10 @@ def run_main_algo_cached(
 
     # Cache + plot directories are always ensured per call (plots differ per method)
     if args.dataset != "mnist":
-        cache_dir = f"{args.dataset}/cache{args.ssl_weight}/small_dim{args.small_dim}"
+        cache_dir = _encoded_cache_dir(args).rstrip("/")
         plot_dir = _plots_base_dir(args)
     else:
-        cache_dir = f"cache{args.ssl_weight}/target{target}/small_dim{args.small_dim}/"
+        cache_dir = _encoded_cache_dir(args, target=target)
         plot_dir = os.path.join(_plots_base_dir(args), f"target{target}")
     os.makedirs(cache_dir, exist_ok=True)
     os.makedirs(plot_dir, exist_ok=True)
@@ -1480,9 +1525,36 @@ def _display_name(key: str) -> str:
         "ours_fr": "Ours-FR",
         "ours_eta": "Ours-ETA",
         "goat": "GOAT",
+        "goat_w2": "GOAT-W2",
+        "goat_fr": "GOAT-FR",
+        "goat_natural": "GOAT-NAT",
         "goat_classwise": "GOAT-Classwise",
     }
     return mapping.get(key, key)
+
+
+def _variant_suffix_if_needed(args) -> str:
+    """Append run-variant tags only for class-agnostic interpolation runs."""
+    if not getattr(args, "interp_class_agnostic", False):
+        return ""
+    goat_methods_raw = getattr(args, "goat_gen_methods", "w2")
+    goat_methods = []
+    for token in str(goat_methods_raw).split(","):
+        m = token.strip().lower()
+        if not m:
+            continue
+        if m in {"ot", "wasserstein"}:
+            m = "w2"
+        elif m in {"fisher-rao", "fisher_rao"}:
+            m = "fr"
+        elif m in {"eta", "nat", "np", "natureal"}:
+            m = "natural"
+        if m not in goat_methods:
+            goat_methods.append(m)
+    if not goat_methods:
+        goat_methods = ["w2"]
+    goat_tag = "-".join(goat_methods)
+    return f"_goat{goat_tag}_global"
 
 
 # ---------------- Generic plotting helper: N series + per-method baselines ----------------
@@ -1684,7 +1756,16 @@ def _prepare_plot_kwargs(
 
     os.makedirs(plot_dir, exist_ok=True)
     series, labels = [], []
-    for key in ("ours_fr", "goat", "goat_classwise", "ours_eta"):
+    preferred = ["ours_fr", "goat", "goat_classwise", "ours_eta"]
+    ordered_keys = [k for k in preferred if k in results]
+    extra_keys = sorted(
+        [
+            k
+            for k in results.keys()
+            if k not in ordered_keys and (k.startswith("goat_") or k.startswith("ours_"))
+        ]
+    )
+    for key in ordered_keys + extra_keys:
         if key in results:
             series.append(results[key].test_curve)
             labels.append(_display_name(key))
@@ -1808,9 +1889,14 @@ def log_summary(
     val = _final_value("ours_fr")
     if val is not None:
         parts.append(f"OursFR:{round(val, 2)}")
-    val = _final_value("goat")
-    if val is not None:
-        parts.append(f"GOAT:{round(val, 2)}")
+    for goat_key, goat_label in (
+        ("goat", "GOAT"),
+        ("goat_fr", "GOAT-FR"),
+        ("goat_natural", "GOAT-NAT"),
+    ):
+        val = _final_value(goat_key)
+        if val is not None:
+            parts.append(f"{goat_label}:{round(val, 2)}")
     val = _final_value("goat_classwise")
     if val is not None:
         parts.append(f"GOATCW:{round(val, 2)}")
@@ -1960,7 +2046,7 @@ def run_mnist_experiment(target: int, gt_domains: int, generated_domains: int, a
     src_trainset = get_single_rotate(False, 0)
     tgt_trainset = get_single_rotate(False, target)
     all_sets, deg_idx = _build_rotated_domains(tgt_trainset, target, gt_domains)
-    cache_dir = f"cache{args.ssl_weight}/target{target}/small_dim{args.small_dim}/"
+    cache_dir = _encoded_cache_dir(args, target=target)
 
     # ------------ reference model ------------
     model_cfg = ModelConfig(
@@ -2060,6 +2146,7 @@ def run_mnist_experiment(target: int, gt_domains: int, generated_domains: int, a
         f"test_acc_dim{args.small_dim}_int{gt_domains}_gen{generated_domains}_"
         f"{args.label_source}_{args.em_match}_{args.em_select}"
         f"{'_em-ensemble' if args.em_ensemble else ''}"
+        f"{_variant_suffix_if_needed(args)}"
     )
     plot_filename = f"{base_name}.png"
     log_filename = f"{base_name}.txt"
@@ -2168,7 +2255,7 @@ def run_portraits_experiment(gt_domains: int, generated_domains: int, args=None)
         tgt_trainset=tgt_trainset,
         all_sets=all_sets,
         deg_idx=0,
-        cache_dir=f"portraits/cache{args.ssl_weight}/small_dim{args.small_dim}/",
+        cache_dir=_encoded_cache_dir(args),
         target_label=1,
     )
     attach_shared_pca(args, encoded_intersets)
@@ -2211,6 +2298,7 @@ def run_portraits_experiment(gt_domains: int, generated_domains: int, args=None)
         f"test_acc_dim{args.small_dim}_int{gt_domains}_gen{generated_domains}_"
         f"{args.label_source}_{args.em_match}_{args.em_select}"
         f"{'_em-ensemble' if args.em_ensemble else ''}"
+        f"{_variant_suffix_if_needed(args)}"
     )
 
     # ---------- plot ----------
@@ -2334,7 +2422,7 @@ def run_covtype_experiment(gt_domains: int, generated_domains: int, args=None):
         tgt_trainset=tgt_trainset,
         all_sets=all_sets,
         deg_idx=0,
-        cache_dir=f"covtype/cache{args.ssl_weight}/small_dim{args.small_dim}/",
+        cache_dir=_encoded_cache_dir(args),
         target_label=1,
     )
     attach_shared_pca(args, encoded_intersets)
@@ -2377,6 +2465,7 @@ def run_covtype_experiment(gt_domains: int, generated_domains: int, args=None):
         f"test_acc_dim{args.small_dim}_int{gt_domains}_gen{generated_domains}_"
         f"{args.label_source}_{args.em_match}_{args.em_select}"
         f"{'_em-ensemble' if args.em_ensemble else ''}"
+        f"{_variant_suffix_if_needed(args)}"
     )
 
     # ---------- plot ----------
@@ -2505,7 +2594,7 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
         tgt_trainset=tgt_trainset,
         all_sets=all_sets,
         deg_idx=0,
-        cache_dir=f"color_mnist/cache{args.ssl_weight}/small_dim{args.small_dim}/",
+        cache_dir=_encoded_cache_dir(args),
         target_label=1,
     )
     shared_pca = fit_global_pca(
@@ -2567,7 +2656,8 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
             filename=(
                 f"test_acc_dim{args.small_dim}_int{gt_domains}_gen{generated_domains}_"
                 f"{args.label_source}_{args.em_match}_{args.em_select}"
-                f"{'_em-ensemble' if args.em_ensemble else ''}.png"
+                f"{'_em-ensemble' if args.em_ensemble else ''}"
+                f"{_variant_suffix_if_needed(args)}.png"
             ),
             title=(
                 f"Colored-MNIST: Target Accuracy (ST: {args.label_source}; "
@@ -2588,6 +2678,7 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
             f"test_acc_dim{args.small_dim}_int{gt_domains}_gen{generated_domains}_"
             f"{args.label_source}_{args.em_match}_{args.em_select}"
             f"{'_em-ensemble' if args.em_ensemble else ''}"
+            f"{_variant_suffix_if_needed(args)}"
         )
     )
     log_summary(
@@ -2719,6 +2810,25 @@ if __name__ == "__main__":
         choices=["bic", "cost", "ll"],
         default="bic",
         help="Criterion to select best EM model",
+    )
+    parser.add_argument(
+        "--goat-gen-methods",
+        type=str,
+        default="w2",
+        help=(
+            "Comma-separated GOAT interpolation metrics to compare. "
+            "Allowed: w2, fr, natural. "
+            "Default is 'w2'. The first baseline key 'goat' always corresponds "
+            "to w2 when included."
+        ),
+    )
+    parser.add_argument(
+        "--interp-class-agnostic",
+        action="store_true",
+        help=(
+            "If set, FR/Natural interpolation ignores class labels and fits a single "
+            "global Gaussian per domain in encoded feature space."
+        ),
     )
     args = parser.parse_args()
     main(args)

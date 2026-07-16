@@ -38,7 +38,7 @@ compute_log_path() {
   gt="$(get_arg_value --gt-domains "${argv[@]}" || echo "0")"
   gd="$(get_arg_value --generated-domains "${argv[@]}" || echo "3")"
   label_source="$(get_arg_value --label-source "${argv[@]}" || echo "pseudo")"
-  em_match="$(get_arg_value --em-match "${argv[@]}" || echo "pseudo")"
+  em_match="$(get_arg_value --em-match "${argv[@]}" || echo "prototypes")"
   em_select="$(get_arg_value --em-select "${argv[@]}" || echo "bic")"
   small_dim="$(get_arg_value --small-dim "${argv[@]}" || echo "2048")"
   if has_flag --em-ensemble "${argv[@]}"; then
@@ -71,13 +71,27 @@ if [[ "$input" != "-" && ! -f "$input" ]]; then
   exit 2
 fi
 
+pending_pre_cmds=()
 while IFS= read -r line; do
+  [[ -z "${line//[[:space:]]/}" ]] && continue
+  if [[ "$line" == rm\ -rf* ]]; then
+    pending_pre_cmds+=("$line")
+    continue
+  fi
   [[ "$line" == python\ experiment_refrac.py* ]] || continue
   read -r -a argv <<< "$line"
   log_path="$(compute_log_path "${argv[@]}")"
   if [[ -f "$log_path" ]]; then
     echo "Skip (log exists): $log_path"
+    pending_pre_cmds=()
     continue
+  fi
+  if (( ${#pending_pre_cmds[@]} > 0 )); then
+    for pre_cmd in "${pending_pre_cmds[@]}"; do
+      echo "Pre-run: $pre_cmd"
+      eval "$pre_cmd"
+    done
+    pending_pre_cmds=()
   fi
   echo "Running: $line"
   eval "$line"

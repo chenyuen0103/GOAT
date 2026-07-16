@@ -4,9 +4,9 @@ set -euo pipefail
 LOG_ROOT="${LOG_ROOT:-logs_rerun}"
 PLOT_ROOT="${PLOT_ROOT:-plots_rerun}"
 
-label_sources=(pseudo em)
-em_matches=(prototypes pseudo)
-seeds=(0 1 2)
+label_sources=(pseudo)
+em_matches=(prototypes)
+seeds=(3 4)
 gt_domains=(0 1 2 3)
 generated_domains=(0)
 small_dim=2048
@@ -26,6 +26,36 @@ fi
 
 # If 1, print what would run without executing Python.
 DRY_RUN="${DRY_RUN:-0}"
+
+clear_seed_cache() {
+  local seed="$1"
+  for ls in "${label_sources[@]}"; do
+    for m in "${em_matches[@]}"; do
+      for gt in "${gt_domains[@]}"; do
+        for gd in "${generated_domains[@]}"; do
+          if [[ "$gd" == "0" && ( "$ls" != "pseudo" || "$m" != "prototypes" ) ]]; then
+            continue
+          fi
+          local log_file="test_acc_dim${small_dim}_int${gt}_gen${gd}_${ls}_${m}_${em_select}${em_ensemble_suffix}"
+          local log_path="${LOG_ROOT}/color_mnist/s${seed}/${log_file}.txt"
+          local curves_path="${LOG_ROOT}/color_mnist/s${seed}/${log_file}_curves.jsonl"
+          rm -f "$log_path" "$curves_path"
+          shopt -s nullglob
+          local bak
+          for bak in "${log_path}.bak."* "${curves_path}.bak."*; do
+            rm -f "$bak"
+          done
+          shopt -u nullglob
+        done
+      done
+    done
+  done
+}
+
+for s in 3 4; do
+  echo "Clearing cache/log artifacts for seed=${s}"
+  clear_seed_cache "$s"
+done
 
 is_complete_log() {
   local path="$1"

@@ -1434,6 +1434,7 @@ def run_goat(
     target: int = 60,
     args=None,
     tag: str = None,
+    gen_method: str = "w2",
 ):
     """GOAT-style baseline: direct ST on target vs pooled ST across real domains,
     optionally ST on synthetics generated between consecutive encoded domains.
@@ -1481,13 +1482,80 @@ def run_goat(
         args=args
     )
 
+    # Ensure encoded domains carry valid labels before any parametric generator call.
+    # For non-source domains, prefer EM labels (if valid), then pseudo labels; fail if neither exists.
+    raw_domains = [src_trainset] + all_sets
+    if len(raw_domains) != len(encoded_intersets):
+        raise RuntimeError(
+            f"[run_goat] raw/encoded domains count mismatch: "
+            f"{len(raw_domains)} vs {len(encoded_intersets)}"
+        )
+
+    def _as_long_1d(x):
+        t = x if torch.is_tensor(x) else torch.as_tensor(x)
+        return t.view(-1).long()
+
+    def _valid_nonnegative(x) -> bool:
+        if x is None:
+            return False
+        t = _as_long_1d(x)
+        return t.numel() > 0 and bool(torch.any(t >= 0).item())
+
+    for idx, (raw_ds, enc_ds) in enumerate(zip(raw_domains, encoded_intersets)):
+        is_source = (idx == 0)
+
+        if is_source:
+            if not hasattr(raw_ds, "targets") or raw_ds.targets is None:
+                raise RuntimeError("[run_goat] source domain is missing ground-truth targets.")
+            y_train = _as_long_1d(raw_ds.targets)
+        else:
+            if _valid_nonnegative(getattr(raw_ds, "targets_em", None)):
+                y_train = _as_long_1d(raw_ds.targets_em)
+            elif _valid_nonnegative(getattr(raw_ds, "targets_pseudo", None)):
+                y_train = _as_long_1d(raw_ds.targets_pseudo)
+            else:
+                raise RuntimeError(
+                    f"[run_goat] domain index {idx} has invalid targets_em "
+                    "(all negative or missing) and no usable targets_pseudo."
+                )
+
+        enc_ds.targets_em = y_train.to(enc_ds.data.device)
+        if hasattr(raw_ds, "targets") and raw_ds.targets is not None:
+            enc_ds.targets = _as_long_1d(raw_ds.targets).to(enc_ds.data.device)
+
     # ----- Optionally generate synthetic domains and ST on them -----
     generated_acc = 0.0
     if generated_domains > 0:
+        _method = (gen_method or "w2").lower()
+        if _method in {"w2", "wasserstein", "ot"}:
+            _gen_fn = generate_domains
+        elif _method in {"fr", "fisher-rao", "fisher_rao"}:
+            _gen_fn = generate_fr_domains_between_optimized
+        elif _method in {"natural", "natureal", "eta", "nat", "np"}:
+            _gen_fn = generate_natural_domains_between
+        else:
+            raise ValueError(
+                f"Unknown GOAT gen_method '{gen_method}'. Use one of: "
+                "'w2', 'fr', 'natural'."
+            )
+
         all_domains: List[Dataset] = []
         for i in range(len(encoded_intersets) - 1):
-            # breakpoint()
-            out = generate_domains(generated_domains, encoded_intersets[i], encoded_intersets[i + 1])
+            if _method in {"w2", "wasserstein", "ot"}:
+                out = _gen_fn(
+                    generated_domains,
+                    encoded_intersets[i],
+                    encoded_intersets[i + 1],
+                )
+            else:
+                out = _gen_fn(
+                    generated_domains,
+                    encoded_intersets[i],
+                    encoded_intersets[i + 1],
+                    cov_type="full",
+                    save_path=plot_dir,
+                    args=args,
+                )
             new_domains = out[0]
             first_src_stats = out[2] 
             all_domains += new_domains
@@ -1556,7 +1624,11 @@ def run_goat(
         plot_pca_classes_grid(
             chain_for_plot,
             classes=(3,6, 8, 9) if 'mnist' in args.dataset else (0,1),
-            save_path=os.path.join(plot_dir, f"pca_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_{args.label_source}_{args.em_match}_goat.png"),
+            save_path=os.path.join(
+                plot_dir,
+                f"pca_dim{args.small_dim}_int{args.gt_domains}_gen{args.generated_domains}_"
+                f"{args.label_source}_{args.em_match}_goat_{_method}.png",
+            ),
             label_source='pseudo',
             pseudolabels=last_predictions,  # from self_train
             pca=getattr(args, "shared_pca", None)  # <<— SAME basis
@@ -1783,12 +1855,18 @@ def run_goat_classwise(
         )
 
     for raw_ds, enc_ds in zip(raw_domains, enc_domains):
+        # Prefer EM labels only when they are valid; many raw EncodeDataset instances
+        # carry a default targets_em=-1 placeholder, which breaks class-wise splits.
+        labels_em = None
         if hasattr(raw_ds, "targets_em"):
-            labels_em = torch.as_tensor(raw_ds.targets_em)
-        else:
-            labels_em = torch.as_tensor(raw_ds.targets)
+            raw_em = torch.as_tensor(raw_ds.targets_em).view(-1).long()
+            if raw_em.numel() > 0 and torch.any(raw_em >= 0):
+                labels_em = raw_em
+        if labels_em is None:
+            labels_em = torch.as_tensor(raw_ds.targets).view(-1).long()
+
         enc_ds.targets_em = labels_em.to(enc_ds.data.device)
-        enc_ds.targets    = torch.as_tensor(raw_ds.targets).to(enc_ds.data.device)
+        enc_ds.targets    = torch.as_tensor(raw_ds.targets).view(-1).long().to(enc_ds.data.device)
 
     # Attach pseudo-labels on target
     setattr(args, "_cached_pseudolabels", pseudolabels)
@@ -2174,19 +2252,16 @@ def run_main_algo(
     # Ensure EVERY encoded domain has .targets_em before calling generators
     for ds in encoded_intersets:
         if getattr(ds, "targets_em", None) is not None:
-            breakpoint()
             continue
 
         if getattr(ds, "targets", None) is not None:
             t = ds.targets
             ds.targets_em = t.clone().long() if torch.is_tensor(t) else torch.as_tensor(t, dtype=torch.long)
-            breakpoint()
             continue
 
         if getattr(ds, "targets_pseudo", None) is not None:
             t = ds.targets_pseudo
             ds.targets_em = t.clone().long() if torch.is_tensor(t) else torch.as_tensor(t, dtype=torch.long)
-            breakpoint()
             continue
 
         raise ValueError(
@@ -2256,7 +2331,6 @@ def run_main_algo(
         raise ValueError(f"Unknown gen_method '{gen_method}'. Use 'fr' or 'natural'.")
 
     for i in range(len(encoded_intersets) - 1):
-        breakpoint()
         out = _gen_fn(
             generated_domains,
             encoded_intersets[i],

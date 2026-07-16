@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+from goat.experiments.rmnist_label_shift import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

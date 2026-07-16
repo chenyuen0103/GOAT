@@ -2188,15 +2188,25 @@ def generate_natural_domains_between(
     if ys is None:
         raise ValueError("Source dataset must provide targets for class statistics.")
 
-    # choose EM labels or pseudolabels
+    # choose target labels with robust fallback:
+    # valid targets_em (>=0) -> targets -> pseudolabels
+    ytem = None
     if hasattr(dataset_t, "targets_em") and dataset_t.targets_em is not None:
-        ytem = dataset_t.targets_em
-    elif pseudolabels is not None:
+        cand = dataset_t.targets_em
+        cand_t = cand if torch.is_tensor(cand) else torch.as_tensor(cand)
+        if cand_t.numel() > 0 and torch.any(cand_t.view(-1) >= 0):
+            ytem = cand
+    if ytem is None and pseudolabels is not None:
         ytem = pseudolabels
-    elif hasattr(dataset_t, "targets_pseudo") and dataset_t.targets_pseudo is not None:
+    if ytem is None and hasattr(dataset_t, "targets_pseudo") and dataset_t.targets_pseudo is not None:
         ytem = dataset_t.targets_pseudo
-    else:
-        raise ValueError("Target dataset must provide targets_em or pseudolabels.")
+    if ytem is None and hasattr(dataset_t, "targets") and dataset_t.targets is not None:
+        ytem = dataset_t.targets
+    if ytem is None:
+        raise ValueError(
+            "Target dataset must provide usable labels: "
+            "targets_em (with at least one non-negative value), pseudolabels, or targets."
+        )
 
     # device and dtype normalization
     prefer_gpu = torch.cuda.is_available()
@@ -2213,13 +2223,19 @@ def generate_natural_domains_between(
             t = t.to(device=device, non_blocking=True)
         return t
 
+    class_agnostic = bool(getattr(args, "interp_class_agnostic", False))
+
     Zs = _to(xs)
     Zt = _to(xt)
     Ys = _to(ys).long().view(-1)
     Yt_em = _to(ytem).long().view(-1)
 
-    mask_s = Ys >= 0
-    mask_t = Yt_em >= 0
+    if class_agnostic:
+        mask_s = torch.ones_like(Ys, dtype=torch.bool)
+        mask_t = torch.ones_like(Yt_em, dtype=torch.bool)
+    else:
+        mask_s = Ys >= 0
+        mask_t = Yt_em >= 0
     if mask_s.sum() != Ys.numel():
         print(f"[generate_nat] Dropping {(~mask_s).sum().item()} source samples with negative labels.")
     if mask_t.sum() != Yt_em.numel():
@@ -2228,6 +2244,10 @@ def generate_natural_domains_between(
     Yt_em = Yt_em[mask_t]
     Zs = Zs[mask_s]
     Zt = Zt[mask_t]
+
+    if class_agnostic:
+        Ys = torch.zeros_like(Ys)
+        Yt_em = torch.zeros_like(Yt_em)
 
     if Ys.numel() == 0:
         return [], torch.empty(0, dtype=torch.long), {}
@@ -2582,7 +2602,22 @@ def generate_fr_domains_between_optimized(
     Xt = xt if torch.is_tensor(xt) else torch.as_tensor(xt, device=device)
     Ys = ys if torch.is_tensor(ys) else torch.as_tensor(ys, device=device, dtype=torch.long)
     # EM labels are required
-    Yt = dataset_t.targets_em if torch.is_tensor(dataset_t.targets_em) else torch.as_tensor(dataset_t.targets_em, device=device, dtype=torch.long)
+    yt_attr = None
+    if hasattr(dataset_t, "targets_em") and dataset_t.targets_em is not None:
+        cand = dataset_t.targets_em
+        cand_t = cand if torch.is_tensor(cand) else torch.as_tensor(cand, device=device, dtype=torch.long)
+        if cand_t.numel() > 0 and torch.any(cand_t.view(-1) >= 0):
+            yt_attr = cand
+    if yt_attr is None and hasattr(dataset_t, "targets_pseudo") and dataset_t.targets_pseudo is not None:
+        yt_attr = dataset_t.targets_pseudo
+    if yt_attr is None and hasattr(dataset_t, "targets") and dataset_t.targets is not None:
+        yt_attr = dataset_t.targets
+    if yt_attr is None:
+        raise ValueError(
+            "Target dataset must provide usable labels: "
+            "targets_em (with at least one non-negative value), targets_pseudo, or targets."
+        )
+    Yt = yt_attr if torch.is_tensor(yt_attr) else torch.as_tensor(yt_attr, device=device, dtype=torch.long)
 
     if Ys.numel() == 0:
         return [], np.empty((0,), dtype=np.int64), {}
@@ -2992,23 +3027,31 @@ def generate_fr_domains_between_optimized(
         return [], np.empty((0,), dtype=np.int64), {}
 
     fp_dtype = torch.float32 if Xs.dtype in (torch.float16, torch.float32, torch.bfloat16) else Xs.dtype
+    class_agnostic = bool(getattr(args, "interp_class_agnostic", False))
+
     Xs = Xs.to(device=device, dtype=fp_dtype, non_blocking=True)
     Xt = Xt.to(device=device, dtype=fp_dtype, non_blocking=True)
     Ys = Ys.to(device=device, dtype=torch.long, non_blocking=True).view(-1)
     Yt = Yt.to(device=device, dtype=torch.long, non_blocking=True).view(-1)
 
-    mask_s = Ys >= 0
-    mask_t = Yt >= 0
+    if class_agnostic:
+        mask_s = torch.ones_like(Ys, dtype=torch.bool)
+        mask_t = torch.ones_like(Yt, dtype=torch.bool)
+    else:
+        mask_s = Ys >= 0
+        mask_t = Yt >= 0
     if mask_s.sum() != Ys.numel():
-        breakpoint()
         print(f"[generate_fr] Dropping {(~mask_s).sum().item()} source samples with negative labels.")
     if mask_t.sum() != Yt.numel():
-        breakpoint()
         print(f"[generate_fr] Dropping {(~mask_t).sum().item()} target samples with negative labels.")
     Ys = Ys[mask_s]
     Yt = Yt[mask_t]
     Xs = Xs[mask_s]
     Xt = Xt[mask_t]
+
+    if class_agnostic:
+        Ys = torch.zeros_like(Ys)
+        Yt = torch.zeros_like(Yt)
 
     if Ys.numel() == 0 or Yt.numel() == 0:
         print("[generate_fr] Warning: one endpoint has zero valid samples after filtering; skipping generation.")

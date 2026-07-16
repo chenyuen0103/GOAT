@@ -27,7 +27,7 @@ DATASETS = {
 # Main text: hardest regime and selected degrees for Rotated MNIST
 MAIN_GT = 0
 MAIN_GEN_ORDER = [0, 1, 2, 3]
-ROT_MNIST_MAIN_DEGREES = [30, 45, 90]
+ROT_MNIST_MAIN_DEGREES = [30, 45, 60]
 
 # Parse gt/gen from filename: test_acc_dim2048_int3_gen2_....
 NAME_RE = re.compile(r"test_acc_dim\d+_int(\d+)_gen(\d+)_")
@@ -58,15 +58,15 @@ REPORT_EM_SELECT_SUBSTR = "bic"
 APPENDIX_COMPARISON_GROUPS: List[Dict[str, object]] = [
     {
         "name": "goat_vs_wass",
-        "title": "GOAT vs C2GDA-Wass (marginal vs conditional interpolation)",
+        "title": r"GOAT vs \ouralgo-Wass (marginal vs conditional interpolation)",
         "label_suffix": "goat-vs-wass",
-        "methods": [("goat", "GOAT"), ("goatcw", "C2GDA-Wass")],
+        "methods": [("goat", "GOAT"), ("goatcw", r"\ouralgo-Wass")],
     },
     {
-        "name": "c2gda_variants",
-        "title": "C2GDA variants (conditional interpolation family)",
-        "label_suffix": "c2gda-variants",
-        "methods": [("goatcw", "C2GDA-Wass"), ("eta", "C2GDA-Nat"), ("ours_fr", "C2GDA-FR")],
+        "name": "ouralgo_variants",
+        "title": r"\ouralgo variants (conditional interpolation family)",
+        "label_suffix": "ouralgo-variants",
+        "methods": [("goatcw", "Wass"), ("eta", "Nat"), ("ours_fr", "FR")],
     },
 ]
 
@@ -533,7 +533,7 @@ def _panel_minipage(
     methods: List[Tuple[str, str]],
     tabcolsep_pt: int,
     arraystretch: float,
-    gen_header: str = "\\# gen.",
+    gen_header: str = "$\\# G_{\\text{syn}}$",
 ) -> str:
     r"""
     One panel as a minipage containing a fixed-height title and a width-filled tabular*.
@@ -637,7 +637,7 @@ def make_main_table_gt0_grid_2x3(df_all_long: pd.DataFrame) -> str:
                           TABCOLSEP_MAIN, ARRAYSTRETCH_MAIN)
     p12 = _panel_minipage("Rotated MNIST (degree $=45^\\circ$)", rot_panels.get(45, pd.DataFrame()), gens, METHODS,
                           TABCOLSEP_MAIN, ARRAYSTRETCH_MAIN)
-    p21 = _panel_minipage("Rotated MNIST (degree $=90^\\circ$)", rot_panels.get(90, pd.DataFrame()), gens, METHODS,
+    p21 = _panel_minipage("Rotated MNIST (degree $=60^\\circ$)", rot_panels.get(60, pd.DataFrame()), gens, METHODS,
                           TABCOLSEP_MAIN, ARRAYSTRETCH_MAIN)
     p22 = _panel_minipage("Portraits", portraits, gens, METHODS, TABCOLSEP_MAIN, ARRAYSTRETCH_MAIN)
     p31 = _panel_minipage("Covtype", covtype, gens, METHODS, TABCOLSEP_MAIN, ARRAYSTRETCH_MAIN)
@@ -668,13 +668,81 @@ def make_main_table_gt0_grid_2x3(df_all_long: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
+def make_main_tables_gt0_by_group_2x3(df_all_long: pd.DataFrame) -> str:
+    r"""
+    Main-text composite tables, arranged as 2 columns x 3 rows for GT=MAIN_GT,
+    with one table per requested comparison group.
+    """
+    if df_all_long.empty:
+        return "% No data found.\n"
+
+    df = df_all_long[df_all_long["gt"] == MAIN_GT].copy()
+    if df.empty:
+        return f"% No data for G_gt={MAIN_GT}.\n"
+
+    existing_gens = sorted(df["gen"].unique())
+    gens = [g for g in MAIN_GEN_ORDER if g in existing_gens] + [
+        g for g in existing_gens if g not in MAIN_GEN_ORDER
+    ]
+
+    rot = df[df["dataset"] == "rotated_mnist"]
+    rot_panels: Dict[int, pd.DataFrame] = {deg: rot[rot["degree"] == deg] for deg in ROT_MNIST_MAIN_DEGREES}
+    portraits = df[df["dataset"] == "portraits"]
+    covtype = df[df["dataset"] == "covtype"]
+    color_mnist = df[df["dataset"] == "colored_mnist"]
+
+    chunks: List[str] = []
+    for group in APPENDIX_COMPARISON_GROUPS:
+        methods = group["methods"]  # type: ignore[assignment]
+        group_title = str(group["title"])
+        label_suffix = str(group["label_suffix"])
+
+        p11 = _panel_minipage("Rotated MNIST (degree $=30^\\circ$)", rot_panels.get(30, pd.DataFrame()), gens, methods,
+                              TABCOLSEP_MAIN, ARRAYSTRETCH_MAIN)  # type: ignore[arg-type]
+        p12 = _panel_minipage("Rotated MNIST (degree $=45^\\circ$)", rot_panels.get(45, pd.DataFrame()), gens, methods,
+                              TABCOLSEP_MAIN, ARRAYSTRETCH_MAIN)  # type: ignore[arg-type]
+        p21 = _panel_minipage("Rotated MNIST (degree $=60^\\circ$)", rot_panels.get(60, pd.DataFrame()), gens, methods,
+                              TABCOLSEP_MAIN, ARRAYSTRETCH_MAIN)  # type: ignore[arg-type]
+        p22 = _panel_minipage("Portraits", portraits, gens, methods, TABCOLSEP_MAIN, ARRAYSTRETCH_MAIN)  # type: ignore[arg-type]
+        p31 = _panel_minipage("Covtype", covtype, gens, methods, TABCOLSEP_MAIN, ARRAYSTRETCH_MAIN)  # type: ignore[arg-type]
+        p32 = _panel_minipage("Color MNIST", color_mnist, gens, methods, TABCOLSEP_MAIN, ARRAYSTRETCH_MAIN)  # type: ignore[arg-type]
+
+        chunks.append("% ----------------------------")
+        chunks.append(f"% Main grid for G_{{\\text{{obs}}}} = {MAIN_GT} ({group_title})")
+        chunks.append("% ----------------------------")
+        chunks.append("\\begin{table*}[t]")
+        chunks.append("\\footnotesize")
+        chunks.append("\\centering")
+        chunks.append(
+            "\\caption{"
+            + group_title
+            + ": target accuracy (\\%) in the hardest regime when no intermediate domains are given, "
+            "varying the number of generated intermediate domains $G_{\\text{syn}}$.}"
+        )
+        chunks.append(f"\\label{{tab:main-gt{MAIN_GT}-{label_suffix}-gen-sweep-grid}}")
+
+        chunks.append("\\setlength{\\tabcolsep}{0pt}")
+        chunks.append("\\renewcommand{\\arraystretch}{1.0}")
+        chunks.append(
+            "\\begin{tabular*}{\\textwidth}{@{}c@{\\hspace{0.03\\textwidth}}c@{}}"
+        )
+        chunks.append(p11 + " & " + p12 + " \\\\[" + ROW_VGAP + "]")
+        chunks.append(p21 + " & " + p22 + " \\\\[" + ROW_VGAP + "]")
+        chunks.append(p31 + " & " + p32 + " \\\\")
+        chunks.append("\\end{tabular*}")
+        chunks.append("\\end{table*}")
+        chunks.append("")
+
+    return "\n".join(chunks)
+
+
 # ----------------------------
 # APPENDIX TABLES: ONE 2x3 GRID PER G_gt
 # ----------------------------
 def make_appendix_tables_by_gt_2x3(df_all_long: pd.DataFrame) -> str:
     r"""
     Appendix: for each G_gt value, produce ONE table* that has the same 2x3 panel layout
-    as the main table (RotMNIST 30/45/90, Portraits, Covtype, ColorMNIST), with rows over #gen.
+    as the main table (RotMNIST 30/45/60, Portraits, Covtype, ColorMNIST), with rows over #gen.
     """
     if df_all_long.empty:
         return "% No appendix tables (no data).\n"
@@ -719,8 +787,8 @@ def make_appendix_tables_by_gt_2x3(df_all_long: pd.DataFrame) -> str:
                 APPENDIX_ARRAYSTRETCH,
             )
             p21 = _panel_minipage(
-                "Rotated MNIST (degree $=90^\\circ$)",
-                rot_panels.get(90, pd.DataFrame()),
+                "Rotated MNIST (degree $=60^\\circ$)",
+                rot_panels.get(60, pd.DataFrame()),
                 gens,
                 methods,  # type: ignore[arg-type]
                 APPENDIX_TABCOLSEP,
@@ -752,7 +820,7 @@ def make_appendix_tables_by_gt_2x3(df_all_long: pd.DataFrame) -> str:
             )
 
             chunks.append("% ----------------------------")
-            chunks.append(f"% Appendix grid for G_gt = {int(gt)} ({group_title})")
+            chunks.append(f"% Appendix grid for G_{{\\text{{obs}}}} = {int(gt)} ({group_title})")
             chunks.append("% ----------------------------")
             chunks.append("\\begin{table*}[t]")
             chunks.append("\\small")
@@ -762,7 +830,7 @@ def make_appendix_tables_by_gt_2x3(df_all_long: pd.DataFrame) -> str:
                 + group_title
                 + ": target accuracy (\\%) "
                 + _gt_caption_phrase(int(gt))
-                + ", varying the number of generated intermediate domains \\# gen. "
+                + ", varying the number of generated intermediate domains $\\# G_{\\text{syn}}$. "
                 "The mean and standard deviation are computed over runs.}"
             )
             chunks.append(f"\\label{{tab:app-gt{int(gt)}-{label_suffix}-gen-sweep-grid}}")
@@ -861,7 +929,7 @@ def _plot_method_family(df_all_long: pd.DataFrame, family: Dict[str, object], ou
         ax.set_title(panel_title, fontsize=11)
         ax.grid(True, axis="y", alpha=0.25, linewidth=0.8)
         ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-        ax.set_xlabel("$G_{gen}$")
+        ax.set_xlabel("$G_{\\mathrm{syn}}$")
         ax.set_ylabel("Target acc. (%)")
         if plotted == 0:
             ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
@@ -872,7 +940,7 @@ def _plot_method_family(df_all_long: pd.DataFrame, family: Dict[str, object], ou
     handles, labels = axes_arr[0].get_legend_handles_labels() if len(axes_arr) > 0 else ([], [])
     if handles:
         fig.legend(handles, labels, loc="upper center", ncol=len(handles), frameon=False, bbox_to_anchor=(0.5, 1.02))
-    fig.suptitle(f"{title} (main text, $G_{{gt}}={MAIN_GT}$)", y=1.06, fontsize=14, fontweight="bold")
+    fig.suptitle(f"{title} (main text, $G_{{\\mathrm{{obs}}}}={MAIN_GT}$)", y=1.06, fontsize=14, fontweight="bold")
     fig.tight_layout()
     os.makedirs(out_dir, exist_ok=True)
     png_path = os.path.join(out_dir, outfile + ".png")
@@ -921,8 +989,11 @@ def generate_tables(log_bases: Optional[List[str]] = None) -> Dict[str, str]:
     df_all_detailed = pd.concat(dfs_detailed, ignore_index=True) if dfs_detailed else pd.DataFrame()
     df_selected_long = build_selected_seed_long(df_all_detailed)
 
-    main_tex = _latex_preamble_comment() + "\n" + make_main_table_gt0_grid_2x3(df_selected_long)
-    appendix_tex = _latex_preamble_comment() + "\n" + make_appendix_tables_by_gt_2x3(df_selected_long)
+    main_tex_body = make_main_tables_gt0_by_group_2x3(df_selected_long)
+    appendix_tex_body = make_appendix_tables_by_gt_2x3(df_selected_long)
+    main_tex = _latex_preamble_comment() + "\n" + main_tex_body
+    appendix_tex = _latex_preamble_comment() + "\n" + appendix_tex_body
+    combined_appendix_tex = _latex_preamble_comment() + "\n" + main_tex_body + "\n\n" + appendix_tex_body
 
     raw_dump = ""
     if not df_selected_long.empty:
@@ -938,6 +1009,7 @@ def generate_tables(log_bases: Optional[List[str]] = None) -> Dict[str, str]:
     return {
         "main_tables_tex": main_tex,
         "appendix_tables_tex": appendix_tex,
+        "combined_appendix_tables_tex": combined_appendix_tex,
         "raw_dump_txt": raw_dump,
         "plot_paths_txt": "\n".join(plots),
         "results_detailed_csv": detailed_csv.to_csv(index=False),
@@ -957,11 +1029,8 @@ if __name__ == "__main__":
     log_bases = [x.strip() for x in args.log_bases.split(",") if x.strip()]
     out = generate_tables(log_bases=log_bases)
 
-    with open("tables_main.tex", "w", encoding="utf-8") as f:
-        f.write(out["main_tables_tex"] + "\n")
-        
     with open("tables_appendix.tex", "w", encoding="utf-8") as f:
-        f.write(out["appendix_tables_tex"] + "\n")
+        f.write(out["combined_appendix_tables_tex"] + "\n")
 
     with open("tables_debug_dump.txt", "w", encoding="utf-8") as f:
         f.write(out["raw_dump_txt"] + "\n")
@@ -977,6 +1046,6 @@ if __name__ == "__main__":
         f.write(out["plot_paths_txt"] + "\n")
 
     print(
-        "Wrote: tables_main.tex, tables_appendix.tex, tables_debug_dump.txt, "
+        "Wrote: tables_appendix.tex, tables_debug_dump.txt, "
         "results_all_with_settings.csv, results_summary_by_settings.csv, figures_main/*"
     )

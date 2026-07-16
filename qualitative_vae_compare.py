@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import os
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
@@ -11,6 +13,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from matplotlib import colors as mcolors
+from matplotlib.patches import Rectangle
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data import TensorDataset
 
@@ -154,6 +158,228 @@ class FeatureToImageVAE(nn.Module):
         return self.decode(z)
 
 
+@dataclass
+class ScreenshotStyle:
+    source_panel: str = "#f5f5f5"
+    target_panel: str = "#f5f5f5"
+    mid_panel: str = "#f7f7f7"
+    shade_groups: bool = True
+    tile_border: str = "#1f1f1f"
+    tile_border_lw: float = 1.2
+    header_fontsize: int = 14
+    header_weight: str = "normal"
+    header_fontfamily: str = "serif"
+    header_min_fontsize: int = 9
+    header_max_fontsize: int = 20
+    header_autofit: bool = True
+    title_fontsize: int = 15
+    title_weight: str = "normal"
+    title_fontfamily: str = "serif"
+    intermediate_gradient: bool = False
+    intermediate_gradient_gamma: float = 1.0
+    intermediate_gradient_steps: int = 400
+    dpi: int = 300
+
+
+def _to_numpy_images(x: torch.Tensor | np.ndarray) -> np.ndarray:
+    if torch.is_tensor(x):
+        x = x.detach().cpu().float().numpy()
+    x = np.asarray(x)
+    if x.ndim == 4:
+        x = x[:, 0]
+    if x.ndim != 3:
+        raise ValueError(f"Expected (N,1,H,W) or (N,H,W), got {x.shape}")
+    return np.clip(x, 0.0, 1.0)
+
+
+def save_screenshot_style_grid(
+    save_path: str,
+    source_imgs: torch.Tensor | np.ndarray,
+    inter_imgs_list: Sequence[torch.Tensor | np.ndarray],
+    target_imgs: torch.Tensor | np.ndarray,
+    *,
+    headers: Tuple[str, str, str] = ("Source", "Generated Intermediate", "Target"),
+    plot_title: str = "",
+    style: ScreenshotStyle = ScreenshotStyle(),
+    tile_size_in: float = 0.40,
+    h_gap_in: float = 0.07,
+    v_gap_in: float = 0.07,
+    group_gap_in: float = 0.20,
+    top_header_in: float = 0.38,
+    pad_left_in: float = 0.16,
+    pad_right_in: float = 0.16,
+    pad_bottom_in: float = 0.14,
+    tint_intermediate: bool = False,
+    save_pdf_copy: bool = True,
+) -> None:
+    src = _to_numpy_images(source_imgs)
+    tgt = _to_numpy_images(target_imgs)
+    inters = [_to_numpy_images(z) for z in inter_imgs_list]
+    n_rows = src.shape[0]
+    if tgt.shape[0] != n_rows:
+        raise ValueError(f"source N={n_rows}, target N={tgt.shape[0]}")
+    for k, arr in enumerate(inters):
+        if arr.shape[0] != n_rows:
+            raise ValueError(f"inter[{k}] N={arr.shape[0]} != {n_rows}")
+
+    n_inter = len(inters)
+    n_cols_total = 1 + n_inter + 1
+    width_in = (
+        pad_left_in
+        + pad_right_in
+        + n_cols_total * tile_size_in
+        + (n_cols_total - 1) * h_gap_in
+        + 2 * group_gap_in
+    )
+    height_in = (
+        pad_bottom_in
+        + top_header_in
+        + n_rows * tile_size_in
+        + (n_rows - 1) * v_gap_in
+    )
+
+    fig = plt.figure(figsize=(width_in, height_in), dpi=style.dpi)
+    fig.patch.set_facecolor("white")
+
+    def xin(v: float) -> float:
+        return v / width_in
+
+    def yin(v: float) -> float:
+        return v / height_in
+
+    x0 = pad_left_in
+    src_x0 = x0
+    src_x1 = src_x0 + tile_size_in
+    inter_x0 = src_x1 + h_gap_in + group_gap_in
+    inter_w = n_inter * tile_size_in + max(0, n_inter - 1) * h_gap_in
+    inter_x1 = inter_x0 + inter_w
+    tgt_x0 = inter_x1 + h_gap_in + group_gap_in
+    tgt_x1 = tgt_x0 + tile_size_in
+
+    tiles_y0 = pad_bottom_in
+    tiles_y1 = tiles_y0 + (n_rows * tile_size_in + (n_rows - 1) * v_gap_in)
+
+    ax_bg = fig.add_axes([0, 0, 1, 1], zorder=0)
+    ax_bg.axis("off")
+
+    def add_panel(xl: float, xr: float, color: str) -> None:
+        ax_bg.add_patch(
+            Rectangle(
+                (xin(xl - 0.08), yin(tiles_y0 - 0.08)),
+                xin((xr - xl) + 0.16),
+                yin((tiles_y1 - tiles_y0) + 0.16),
+                facecolor=color,
+                edgecolor="none",
+                zorder=0,
+            )
+        )
+
+    def add_gradient_panel(xl: float, xr: float, left_color: str, right_color: str) -> None:
+        w = max(32, int(style.intermediate_gradient_steps))
+        gamma = max(1e-3, float(style.intermediate_gradient_gamma))
+        c0 = np.asarray(mcolors.to_rgb(left_color), dtype=np.float32)[None, None, :]
+        c1 = np.asarray(mcolors.to_rgb(right_color), dtype=np.float32)[None, None, :]
+        t = np.linspace(0.0, 1.0, w, dtype=np.float32) ** gamma
+        t = t[None, :, None]
+        grad = (1.0 - t) * c0 + t * c1  # (1, W, 3)
+        ax_bg.imshow(
+            grad,
+            extent=(
+                xin(xl - 0.08),
+                xin(xr + 0.08),
+                yin(tiles_y0 - 0.08),
+                yin(tiles_y1 + 0.08),
+            ),
+            origin="lower",
+            aspect="auto",
+            zorder=0,
+        )
+
+    if style.shade_groups:
+        add_panel(src_x0, src_x1, style.source_panel)
+        if tint_intermediate and n_inter > 0:
+            if style.intermediate_gradient:
+                add_gradient_panel(inter_x0, inter_x1, style.source_panel, style.target_panel)
+            else:
+                add_panel(inter_x0, inter_x1, style.mid_panel)
+        add_panel(tgt_x0, tgt_x1, style.target_panel)
+
+    # Header boxes (one per group) prevent cross-group text overlap.
+    hy0 = tiles_y1 + 0.03
+    hh = max(0.16, top_header_in - 0.05)
+
+    def _fit_fs(text: str, width_inches: float) -> float:
+        if not style.header_autofit:
+            return float(style.header_fontsize)
+        chars = max(1, len(text))
+        # Heuristic: average glyph width ~0.62 * fontsize points.
+        # Convert inches to points (72/in) and reserve small padding.
+        max_pts = max(1.0, (width_inches * 72.0 - 10.0) / (0.62 * chars))
+        fs = min(float(style.header_fontsize), max_pts, float(style.header_max_fontsize))
+        return max(float(style.header_min_fontsize), fs)
+
+    # pick one common fontsize based on smallest group width
+    group_widths = [src_x1 - src_x0, inter_x1 - inter_x0, tgt_x1 - tgt_x0]
+    min_group_w = min(group_widths)
+    common_fs = _fit_fs(max(headers, key=len), min_group_w) if style.header_autofit else float(style.header_fontsize)
+
+    def _header(xl: float, xr: float, text: str) -> None:
+        ax_h = fig.add_axes([xin(xl), yin(hy0), xin(max(1e-6, xr - xl)), yin(hh)], zorder=3)
+        ax_h.axis("off")
+        ax_h.text(
+            0.5, 0.08, text,
+            transform=ax_h.transAxes,
+            ha="center", va="bottom",
+            fontsize=common_fs,
+            fontweight=style.header_weight,
+            fontfamily=style.header_fontfamily,
+            clip_on=False,   # <- prevents cutting
+        )
+
+    _header(src_x0, src_x1, headers[0])
+    _header(inter_x0, inter_x1, headers[1])
+    _header(tgt_x0, tgt_x1, headers[2])
+    if str(plot_title).strip():
+        fig.suptitle(
+            str(plot_title),
+            fontsize=style.title_fontsize,
+            fontweight=style.title_weight,
+            fontfamily=style.title_fontfamily,
+            y=0.995,
+        )
+
+    col_xs: List[float] = [src_x0]
+    for j in range(n_inter):
+        col_xs.append(inter_x0 + j * (tile_size_in + h_gap_in))
+    col_xs.append(tgt_x0)
+
+    for r in range(n_rows):
+        y_in = tiles_y1 - tile_size_in - r * (tile_size_in + v_gap_in)
+        for c in range(n_cols_total):
+            x_in = col_xs[c]
+            ax = fig.add_axes([xin(x_in), yin(y_in), xin(tile_size_in), yin(tile_size_in)], zorder=2)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(True)
+                spine.set_linewidth(style.tile_border_lw)
+                spine.set_edgecolor(style.tile_border)
+            if c == 0:
+                img = src[r]
+            elif c == n_cols_total - 1:
+                img = tgt[r]
+            else:
+                img = inters[c - 1][r]
+            ax.imshow(img, cmap="gray", vmin=0.0, vmax=1.0, interpolation="nearest")
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path, bbox_inches="tight", pad_inches=0.02)
+    if save_pdf_copy:
+        pdf_path = os.path.splitext(save_path)[0] + ".pdf"
+        fig.savefig(pdf_path, bbox_inches="tight", pad_inches=0.02)
+    plt.close(fig)
+
+
 def _ensure_default_args(args: argparse.Namespace) -> argparse.Namespace:
     defaults = {
         "dataset": "mnist",
@@ -192,18 +418,48 @@ def _get_label_tensor(ds: Dataset, use_em: bool) -> torch.Tensor:
     raise ValueError("Dataset has no valid labels.")
 
 
-def _subset_domain_by_class(ds: Dataset, cls: int, use_em: bool) -> Optional[DomainDataset]:
+def _domain_weight_tensor(ds: Dataset) -> torch.Tensor:
+    if hasattr(ds, "weight") and ds.weight is not None:
+        return torch.as_tensor(ds.weight).float().view(-1)
+    n = len(ds.data) if hasattr(ds, "data") else len(ds)
+    return torch.ones(int(n), dtype=torch.float32)
+
+
+def _subset_domain_by_class(
+    ds: Dataset,
+    cls: int,
+    use_em: bool,
+    min_count: int = 1,
+    confidence_quantile: float = 0.0,
+) -> Tuple[Optional[DomainDataset], Dict[str, object]]:
     y = _get_label_tensor(ds, use_em=use_em)
     if not hasattr(ds, "data"):
-        return None
+        return None, {"status": "missing_data", "count": 0}
     x = ds.data if torch.is_tensor(ds.data) else torch.as_tensor(ds.data)
+    w = _domain_weight_tensor(ds)
     mask = y == int(cls)
-    if mask.sum().item() == 0:
-        return None
-    x_c = x[mask]
-    y_c = y[mask]
-    w_c = torch.ones(len(y_c), dtype=torch.float32)
-    return DomainDataset(x_c, w_c, y_c, y_c)
+    n_before = int(mask.sum().item())
+    if n_before == 0:
+        return None, {"status": "no_class_data", "count": 0}
+
+    idx = torch.where(mask)[0]
+    if float(confidence_quantile) > 0.0:
+        q = float(np.clip(confidence_quantile, 0.0, 0.99))
+        w_cls = w[idx]
+        thr = float(torch.quantile(w_cls, q).item())
+        idx = idx[w_cls >= thr]
+
+    n_after = int(idx.numel())
+    if n_after < int(min_count):
+        return None, {"status": "below_min_count", "count": n_after, "count_before": n_before}
+
+    x_c = x[idx]
+    y_c = y[idx]
+    w_c = w[idx].float().cpu()
+    return (
+        DomainDataset(x_c, w_c, y_c, y_c),
+        {"status": "ok", "count": n_after, "count_before": n_before},
+    )
 
 
 def _merge_class_chains(class_chains: List[List[DomainDataset]]) -> List[DomainDataset]:
@@ -235,7 +491,7 @@ def extract_method_domains(
     args: argparse.Namespace,
     encoded_domains: Sequence[Dataset],
     generated_domains: int,
-) -> Dict[str, List[Dataset]]:
+) -> Tuple[Dict[str, List[Dataset]], List[Dict[str, object]]]:
     if generated_domains <= 0:
         raise ValueError(
             "generated_domains must be > 0 for qualitative intermediate comparison."
@@ -254,6 +510,7 @@ def extract_method_domains(
     k_classes = int(
         torch.as_tensor(encoded_domains[0].targets).max().item()
     ) + 1
+    classwise_quality_report: List[Dict[str, object]] = []
 
     for i in range(n_pairs):
         left = encoded_domains[i]
@@ -270,16 +527,52 @@ def extract_method_domains(
 
         class_chains: List[List[DomainDataset]] = []
         for c in range(k_classes):
-            src_c = _subset_domain_by_class(left, c, use_em=(i > 0))
-            tgt_c = _subset_domain_by_class(right, c, use_em=True)
+            src_c, src_info = _subset_domain_by_class(
+                left,
+                c,
+                use_em=(i > 0),
+                min_count=args.cw_min_class_count,
+                confidence_quantile=args.cw_confidence_quantile,
+            )
+            tgt_c, tgt_info = _subset_domain_by_class(
+                right,
+                c,
+                use_em=True,
+                min_count=args.cw_min_class_count,
+                confidence_quantile=args.cw_confidence_quantile,
+            )
+            row = {
+                "pair_idx": i,
+                "class_id": c,
+                "src_status": src_info.get("status"),
+                "tgt_status": tgt_info.get("status"),
+                "src_count": int(src_info.get("count", 0)),
+                "tgt_count": int(tgt_info.get("count", 0)),
+            }
             if src_c is None or tgt_c is None:
+                row["used"] = 0
+                classwise_quality_report.append(row)
                 continue
             chain_c, _, _ = generate_domains(generated_domains, src_c, tgt_c)
+            alpha = float(np.clip(args.cw_prototype_shrink, 0.0, 1.0))
+            if alpha > 0.0 and len(chain_c) > 0:
+                proto_l = src_c.data.float().mean(dim=0, keepdim=True).cpu()
+                proto_r = tgt_c.data.float().mean(dim=0, keepdim=True).cpu()
+                denom = max(1, len(chain_c) - 1)
+                for step_idx, ds in enumerate(chain_c):
+                    t = float(step_idx) / float(denom)
+                    target_proto = (1.0 - t) * proto_l + t * proto_r
+                    x = ds.data if torch.is_tensor(ds.data) else torch.as_tensor(ds.data)
+                    x = x.float().cpu()
+                    ds.data = ((1.0 - alpha) * x + alpha * target_proto).float().cpu()
             for ds in chain_c:
                 labels = torch.full((len(ds.targets),), c, dtype=torch.long)
                 ds.targets = labels.clone()
                 ds.targets_em = labels.clone()
             class_chains.append(chain_c)
+            row["used"] = 1
+            row["proto_shrink"] = alpha
+            classwise_quality_report.append(row)
         merged = _merge_class_chains(class_chains)
         methods["goat_classwise"].extend(merged[:-1])
 
@@ -301,7 +594,7 @@ def extract_method_domains(
         )
         methods["ours_eta"].extend(nat_chain[:-1])
 
-    return methods
+    return methods, classwise_quality_report
 
 
 def _labels_for_domain(ds: Dataset) -> torch.Tensor:
@@ -312,12 +605,33 @@ def _labels_for_domain(ds: Dataset) -> torch.Tensor:
     return torch.full((len(ds.data),), -1, dtype=torch.long)
 
 
+def _pick_indices(
+    candidates: np.ndarray,
+    n: int,
+    seed: int,
+    strategy: str = "random",
+    scores: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    candidates = np.asarray(candidates, dtype=np.int64)
+    if len(candidates) == 0 or n <= 0:
+        return np.array([], dtype=np.int64)
+    n = min(int(n), len(candidates))
+    if strategy == "confidence" and scores is not None:
+        scores = np.asarray(scores, dtype=np.float64)
+        order = np.lexsort((candidates, -scores))  # high score first, stable on index
+        picked = candidates[order[:n]]
+        return np.sort(picked.astype(np.int64))
+    rng = np.random.default_rng(seed)
+    return np.sort(rng.choice(candidates, size=n, replace=False).astype(np.int64))
+
+
 def _common_indices_for_class(
     trajectory_chains: Dict[str, Sequence[Dataset]],
     methods: Sequence[str],
     cls: int,
     n_samples: int,
     seed: int,
+    sample_selection: str = "random",
 ) -> np.ndarray:
     check_domains: List[Dataset] = []
     for m in methods:
@@ -335,10 +649,81 @@ def _common_indices_for_class(
     if len(idx) == 0:
         return idx
 
-    n = min(n_samples, len(idx))
-    rng = np.random.default_rng(seed + 9000 + int(cls))
-    picked = np.sort(rng.choice(idx, size=n, replace=False))
-    return picked.astype(np.int64)
+    score_arr = None
+    if sample_selection == "confidence":
+        score_arr = np.zeros(len(idx), dtype=np.float64)
+        for ds in check_domains:
+            w = _domain_weight_tensor(ds).cpu().numpy()[:min_len]
+            score_arr += w[idx]
+        score_arr /= max(1, len(check_domains))
+    return _pick_indices(
+        candidates=idx,
+        n=n_samples,
+        seed=seed + 9000 + int(cls),
+        strategy=sample_selection,
+        scores=score_arr,
+    )
+
+
+def _expand_indices(
+    idx: np.ndarray,
+    n_samples: int,
+    seed: int,
+) -> np.ndarray:
+    """Expand to n_samples with replacement when needed (if idx is non-empty)."""
+    idx = np.asarray(idx, dtype=np.int64)
+    if len(idx) == 0:
+        return idx
+    if len(idx) >= int(n_samples):
+        return idx[: int(n_samples)]
+    rng = np.random.default_rng(seed)
+    extra = rng.choice(idx, size=int(n_samples - len(idx)), replace=True).astype(np.int64)
+    return np.concatenate([idx, extra], axis=0)
+
+
+def _per_method_indices_for_class(
+    trajectory_chains: Dict[str, Sequence[Dataset]],
+    methods: Sequence[str],
+    cls: int,
+    n_samples: int,
+    seed: int,
+    sample_selection: str = "random",
+) -> Dict[str, np.ndarray]:
+    out: Dict[str, np.ndarray] = {}
+    for m in methods:
+        chain = trajectory_chains[m]
+        min_len = min(len(ds.data) for ds in chain) if chain else 0
+        if min_len <= 0:
+            out[m] = np.array([], dtype=np.int64)
+            continue
+        mask = np.ones(min_len, dtype=bool)
+        for ds in chain:
+            y = _labels_for_domain(ds).cpu().numpy()[:min_len]
+            mask &= (y == int(cls))
+        idx = np.where(mask)[0]
+        if len(idx) == 0:
+            out[m] = np.array([], dtype=np.int64)
+            continue
+        score_arr = None
+        if sample_selection == "confidence":
+            score_arr = np.zeros(len(idx), dtype=np.float64)
+            for ds in chain:
+                w = _domain_weight_tensor(ds).cpu().numpy()[:min_len]
+                score_arr += w[idx]
+            score_arr /= max(1, len(chain))
+        picked = _pick_indices(
+            candidates=idx,
+            n=min(int(n_samples), len(idx)),
+            seed=seed + 9100 + int(cls) + (hash(m) % 1000),
+            strategy=sample_selection,
+            scores=score_arr,
+        )
+        if len(picked) < int(n_samples):
+            rng = np.random.default_rng(seed + 9199 + int(cls) + (hash(m) % 1000))
+            extra = rng.choice(picked, size=int(n_samples - len(picked)), replace=True).astype(np.int64)
+            picked = np.concatenate([picked, extra], axis=0)
+        out[m] = picked.astype(np.int64)
+    return out
 
 
 def _vae_checkpoint_path(args: argparse.Namespace, output_dir: str, latent_dim: int) -> str:
@@ -363,7 +748,7 @@ def train_or_load_vae(
     vae = FeatureToImageVAE(feature_dim=feature_dim, latent_dim=latent_dim, image_dim=28 * 28).to(DEVICE)
 
     if os.path.exists(ckpt_path):
-        payload = torch.load(ckpt_path, map_location=DEVICE)
+        payload = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
         state = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
         kind = payload.get("model_kind") if isinstance(payload, dict) else None
         feat_dim_ckpt = payload.get("feature_dim") if isinstance(payload, dict) else None
@@ -517,7 +902,7 @@ def train_or_load_image_vae(
     vae = RMNISTVAE(x_dim=28 * 28, z_dim=latent_dim).to(DEVICE)
 
     if os.path.exists(ckpt_path):
-        payload = torch.load(ckpt_path, map_location=DEVICE)
+        payload = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
         state = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
         kind = payload.get("model_kind") if isinstance(payload, dict) else None
         latent_ckpt = payload.get("latent_dim") if isinstance(payload, dict) else None
@@ -656,6 +1041,7 @@ def _collect_step_images(
     step: int,
     n_samples: int,
     seed: int,
+    sample_selection: str = "random",
 ) -> Tuple[Dict[str, torch.Tensor], np.ndarray]:
     lengths = []
     for m in methods:
@@ -665,9 +1051,22 @@ def _collect_step_images(
     if min_len <= 0:
         raise ValueError(f"No data available for step {step}.")
 
-    n = min(n_samples, min_len)
-    rng = np.random.default_rng(seed + 1000 + step)
-    idx = np.sort(rng.choice(min_len, size=n, replace=False))
+    candidates = np.arange(min_len, dtype=np.int64)
+    score_arr = None
+    if sample_selection == "confidence":
+        score_arr = np.zeros(min_len, dtype=np.float64)
+        for m in methods:
+            ds = method_domains[m][step]
+            w = _domain_weight_tensor(ds).cpu().numpy()[:min_len]
+            score_arr += w
+        score_arr /= max(1, len(methods))
+    idx = _pick_indices(
+        candidates=candidates,
+        n=min(n_samples, min_len),
+        seed=seed + 1000 + step,
+        strategy=sample_selection,
+        scores=score_arr,
+    )
 
     out: Dict[str, torch.Tensor] = {}
     for m in methods:
@@ -776,6 +1175,7 @@ def _sample_common_indices_for_trajectories(
     methods: Sequence[str],
     n_samples: int,
     seed: int,
+    sample_selection: str = "random",
 ) -> np.ndarray:
     """Pick one shared index set valid for all methods and all trajectory columns."""
     lengths: List[int] = []
@@ -787,10 +1187,24 @@ def _sample_common_indices_for_trajectories(
     if min_len <= 0:
         raise RuntimeError("Cannot sample trajectory indices: no common valid length.")
 
-    n = min(n_samples, min_len)
-    rng = np.random.default_rng(seed + 4242)
-    idx = np.sort(rng.choice(min_len, size=n, replace=False))
-    return idx
+    candidates = np.arange(min_len, dtype=np.int64)
+    score_arr = None
+    if sample_selection == "confidence":
+        score_arr = np.zeros(min_len, dtype=np.float64)
+        total = 0
+        for m in methods:
+            for ds in trajectory_chains[m]:
+                w = _domain_weight_tensor(ds).cpu().numpy()[:min_len]
+                score_arr += w
+                total += 1
+        score_arr /= max(1, total)
+    return _pick_indices(
+        candidates=candidates,
+        n=min(n_samples, min_len),
+        seed=seed + 4242,
+        strategy=sample_selection,
+        scores=score_arr,
+    )
 
 
 def build_labeled_trajectory_chain(
@@ -883,8 +1297,9 @@ def save_all_methods_class_trajectory_grid(
     vae: FeatureToImageVAE,
     indices: np.ndarray,
     class_id: int,
+    per_method_indices: Optional[Dict[str, np.ndarray]] = None,
 ) -> None:
-    if len(indices) == 0:
+    if len(indices) == 0 and not per_method_indices:
         return
     n_methods = len(methods)
     n_rows = n_methods
@@ -898,10 +1313,24 @@ def save_all_methods_class_trajectory_grid(
 
     for m_idx, m in enumerate(methods):
         chain = trajectory_chains[m]
+        idx_m = indices
+        if per_method_indices is not None:
+            idx_m = per_method_indices.get(m, np.array([], dtype=np.int64))
+        if len(idx_m) == 0:
+            for c in range(n_cols):
+                ax = axes[m_idx, c]
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.text(0.5, 0.5, "no class sample", ha="center", va="center", fontsize=8)
+                for spine in ax.spines.values():
+                    spine.set_visible(True)
+                    spine.set_linewidth(0.8)
+                    spine.set_color("#202020")
+            continue
         for c in range(n_cols):
             ds = chain[c]
             feat = ds.data if torch.is_tensor(ds.data) else torch.as_tensor(ds.data)
-            decoded = decode_features(vae, feat[indices])
+            decoded = decode_features(vae, feat[idx_m])
             strip = _to_strip(decoded)
             ax = axes[m_idx, c]
             ax.imshow(strip, cmap="gray", vmin=0.0, vmax=1.0, aspect="auto")
@@ -912,7 +1341,7 @@ def save_all_methods_class_trajectory_grid(
                 spine.set_linewidth(0.8)
                 spine.set_color("#202020")
             # Sample separators inside each strip (every 28 px).
-            for k in range(1, len(indices)):
+            for k in range(1, len(idx_m)):
                 ax.axvline(28 * k - 0.5, color="#f3f3f3", lw=0.8, alpha=0.9)
             if m_idx == 0:
                 title_fc = "#fdebd0" if trajectory_is_synth[c] else "#e8f1fb"
@@ -941,14 +1370,25 @@ def save_all_methods_class_trajectory_grid(
         fontweight="bold",
         y=0.995,
     )
-    fig.text(
-        0.5,
-        0.01,
-        f"Shared sample indices (same for all methods/columns): {indices.tolist()}",
-        ha="center",
-        va="bottom",
-        fontsize=10,
-    )
+    if per_method_indices is None:
+        fig.text(
+            0.5,
+            0.01,
+            f"Shared sample indices (same for all methods/columns): {indices.tolist()}",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+        )
+    else:
+        summary = ", ".join([f"{display_names[m]}={per_method_indices.get(m, np.array([],dtype=np.int64)).tolist()}" for m in methods])
+        fig.text(
+            0.5,
+            0.01,
+            f"Per-method class indices: {summary}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+        )
     fig.tight_layout(rect=(0.02, 0.04, 1.0, 0.96))
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     fig.savefig(save_path, dpi=400, bbox_inches="tight")
@@ -977,6 +1417,239 @@ def _collect_images_in_order(dataset: Dataset, batch_size: int, num_workers: int
     return torch.cat(imgs, dim=0)
 
 
+def _save_classwise_quality_report(
+    report_rows: Sequence[Dict[str, object]],
+    save_path: str,
+) -> None:
+    if not report_rows:
+        return
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    keys = sorted({k for r in report_rows for k in r.keys()})
+    with open(save_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        for r in report_rows:
+            w.writerow(r)
+
+
+@torch.no_grad()
+def _evaluate_semantic_consistency(
+    classifier: nn.Module,
+    vae: FeatureToImageVAE,
+    method_domains: Dict[str, List[Dataset]],
+    max_steps: int,
+    sample_selection: str,
+    seed: int,
+    max_samples_per_step: int,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    by_step_rows: List[Dict[str, object]] = []
+    summary_acc: Dict[str, List[float]] = {k: [] for k in method_domains.keys()}
+
+    classifier.eval()
+    for method, domains in method_domains.items():
+        n_steps = min(max_steps, len(domains))
+        for step in range(n_steps):
+            ds = domains[step]
+            x = ds.data if torch.is_tensor(ds.data) else torch.as_tensor(ds.data)
+            y = _labels_for_domain(ds).long().view(-1)
+            n_all = min(len(x), len(y))
+            if n_all <= 0:
+                by_step_rows.append(
+                    {"method": method, "step": step, "n": 0, "acc": float("nan"), "mean_conf": float("nan")}
+                )
+                continue
+
+            n_take = min(int(max_samples_per_step), n_all)
+            candidates = np.arange(n_all, dtype=np.int64)
+            scores = None
+            if sample_selection == "confidence":
+                scores = _domain_weight_tensor(ds).cpu().numpy()[:n_all]
+            idx = _pick_indices(
+                candidates=candidates,
+                n=n_take,
+                seed=seed + 7700 + step + (hash(method) % 1000),
+                strategy=sample_selection,
+                scores=scores,
+            )
+            if len(idx) == 0:
+                by_step_rows.append(
+                    {"method": method, "step": step, "n": 0, "acc": float("nan"), "mean_conf": float("nan")}
+                )
+                continue
+
+            feats = x[idx]
+            y_true = y[idx].to(DEVICE)
+            imgs = decode_features(vae, feats).to(DEVICE)
+            logits = classifier(imgs)
+            probs = torch.softmax(logits, dim=1)
+            conf, pred = probs.max(dim=1)
+            acc = float((pred == y_true).float().mean().item())
+            mean_conf = float(conf.mean().item())
+
+            by_step_rows.append(
+                {
+                    "method": method,
+                    "step": int(step),
+                    "n": int(len(idx)),
+                    "acc": acc,
+                    "mean_conf": mean_conf,
+                }
+            )
+            summary_acc[method].append(acc)
+
+    summary_rows: List[Dict[str, object]] = []
+    for method, vals in summary_acc.items():
+        arr = np.asarray(vals, dtype=np.float64)
+        summary_rows.append(
+            {
+                "method": method,
+                "n_steps": int(len(vals)),
+                "mean_acc": float(np.nanmean(arr)) if len(arr) else float("nan"),
+                "std_acc": float(np.nanstd(arr)) if len(arr) else float("nan"),
+            }
+        )
+    return by_step_rows, summary_rows
+
+
+def _save_rows_csv(rows: Sequence[Dict[str, object]], save_path: str) -> None:
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    keys = sorted({k for r in rows for k in r.keys()})
+    with open(save_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
+def _pack_domain(ds: Dataset) -> Dict[str, torch.Tensor]:
+    x = ds.data if torch.is_tensor(ds.data) else torch.as_tensor(ds.data)
+    y = _labels_for_domain(ds)
+    yem = (
+        torch.as_tensor(ds.targets_em).long().view(-1)
+        if hasattr(ds, "targets_em") and ds.targets_em is not None
+        else y.clone()
+    )
+    w = _domain_weight_tensor(ds)
+    return {
+        "data": x.detach().cpu().float(),
+        "targets": y.detach().cpu().long(),
+        "targets_em": yem.detach().cpu().long(),
+        "weight": w.detach().cpu().float(),
+    }
+
+
+def _save_trajectory_cache(
+    output_dir: str,
+    args: argparse.Namespace,
+    method_domains: Dict[str, List[Dataset]],
+    trajectory_chains: Dict[str, Sequence[Dataset]],
+    trajectory_labels: Sequence[str],
+    trajectory_is_synth: Sequence[bool],
+    shared_idx: np.ndarray,
+    classwise_report: Sequence[Dict[str, object]],
+) -> str:
+    payload = {
+        "meta": {
+            "target_angle": int(args.target_angle),
+            "seed": int(args.seed),
+            "generated_domains": int(args.generated_domains),
+            "sample_selection": str(getattr(args, "sample_selection", "random")),
+            "class_plot_num_images": int(getattr(args, "class_plot_num_images", 10)),
+        },
+        "trajectory_labels": list(trajectory_labels),
+        "trajectory_is_synth": list(bool(v) for v in trajectory_is_synth),
+        "shared_idx": np.asarray(shared_idx, dtype=np.int64),
+        "classwise_report": list(classwise_report),
+        "method_domains": {
+            m: [_pack_domain(ds) for ds in chain]
+            for m, chain in method_domains.items()
+        },
+        "trajectory_chains": {
+            m: [_pack_domain(ds) for ds in chain]
+            for m, chain in trajectory_chains.items()
+        },
+    }
+    save_path = os.path.join(output_dir, "trajectory_cache.pt")
+    torch.save(payload, save_path)
+    return save_path
+
+
+def _unpack_domain(payload: Dict[str, torch.Tensor]) -> DomainDataset:
+    return DomainDataset(
+        payload["data"].detach().cpu().float(),
+        payload["weight"].detach().cpu().float().view(-1),
+        payload["targets"].detach().cpu().long().view(-1),
+        payload["targets_em"].detach().cpu().long().view(-1),
+    )
+
+
+def _load_trajectory_cache(cache_path: str) -> Dict[str, object]:
+    payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+    required = {"method_domains", "trajectory_chains", "trajectory_labels", "trajectory_is_synth", "shared_idx"}
+    missing = required - set(payload.keys())
+    if missing:
+        raise RuntimeError(f"Invalid trajectory cache at {cache_path}; missing keys: {sorted(missing)}")
+
+    method_domains = {
+        m: [_unpack_domain(ds) for ds in chain]
+        for m, chain in payload["method_domains"].items()
+    }
+    trajectory_chains = {
+        m: [_unpack_domain(ds) for ds in chain]
+        for m, chain in payload["trajectory_chains"].items()
+    }
+    return {
+        "method_domains": method_domains,
+        "trajectory_chains": trajectory_chains,
+        "trajectory_labels": list(payload["trajectory_labels"]),
+        "trajectory_is_synth": [bool(v) for v in payload["trajectory_is_synth"]],
+        "shared_idx": np.asarray(payload["shared_idx"], dtype=np.int64),
+        "classwise_report": list(payload.get("classwise_report", [])),
+        "meta": dict(payload.get("meta", {})),
+    }
+
+
+def _load_feature_vae_for_plotting(
+    args: argparse.Namespace,
+    output_dir: str,
+    feature_dim: int,
+) -> FeatureToImageVAE:
+    if args.vae_path:
+        ckpt_path = args.vae_path
+    else:
+        if args.vae_latent_dim is None:
+            raise ValueError(
+                "In --load-trajectory-cache mode, provide --vae-path or --vae-latent-dim so VAE can be loaded."
+            )
+        ckpt_path = _vae_checkpoint_path(args, output_dir, int(args.vae_latent_dim))
+
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"VAE checkpoint not found: {ckpt_path}")
+
+    payload = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+    state = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
+    latent_ckpt = payload.get("latent_dim") if isinstance(payload, dict) else None
+    feature_dim_ckpt = payload.get("feature_dim") if isinstance(payload, dict) else None
+    latent_dim = int(args.vae_latent_dim) if args.vae_latent_dim is not None else int(latent_ckpt)
+
+    if feature_dim_ckpt is not None and int(feature_dim_ckpt) != int(feature_dim):
+        raise RuntimeError(
+            f"VAE feature_dim mismatch: ckpt={feature_dim_ckpt} vs cache={feature_dim}"
+        )
+    if latent_ckpt is not None and int(latent_ckpt) != int(latent_dim):
+        raise RuntimeError(
+            f"VAE latent_dim mismatch: ckpt={latent_ckpt} vs requested={latent_dim}"
+        )
+
+    vae = FeatureToImageVAE(feature_dim=int(feature_dim), latent_dim=int(latent_dim), image_dim=28 * 28).to(DEVICE)
+    vae.load_state_dict(state, strict=True)
+    vae.eval()
+    print(f"[VAE] Loaded checkpoint: {ckpt_path}")
+    return vae
+
+
 def run(args: argparse.Namespace) -> None:
     args = _ensure_default_args(args)
     set_all_seeds(args.seed)
@@ -989,6 +1662,207 @@ def run(args: argparse.Namespace) -> None:
 
     output_dir = _resolve_output_dir(args)
     os.makedirs(output_dir, exist_ok=True)
+
+    # Cache-only mode: do not train/generate models/domains; only load and plot.
+    if args.load_trajectory_cache:
+        if args.semantic_eval:
+            raise ValueError(
+                "--semantic-eval is unsupported with --load-trajectory-cache because it needs a teacher model."
+            )
+        cache_path = args.trajectory_cache_path.strip() if args.trajectory_cache_path else os.path.join(output_dir, "trajectory_cache.pt")
+        if not os.path.exists(cache_path):
+            raise FileNotFoundError(f"Trajectory cache not found: {cache_path}")
+
+        cache_obj = _load_trajectory_cache(cache_path)
+        method_domains = cache_obj["method_domains"]
+        trajectory_chains = cache_obj["trajectory_chains"]
+        trajectory_labels = cache_obj["trajectory_labels"]
+        trajectory_is_synth = cache_obj["trajectory_is_synth"]
+        shared_idx = cache_obj["shared_idx"]
+        classwise_report = cache_obj["classwise_report"]
+        print(f"[Trajectory] Loaded cache: {cache_path}")
+
+        trajectory_methods = ("goat", "goat_classwise", "ours_fr", "ours_eta")
+        n_steps_by_method = {k: len(method_domains[k]) for k in trajectory_methods}
+        min_steps = min(n_steps_by_method.values())
+        if args.max_steps is not None:
+            min_steps = min(min_steps, args.max_steps)
+        if min_steps <= 0:
+            raise RuntimeError("Trajectory cache is empty.")
+        for m in trajectory_methods:
+            method_domains[m] = method_domains[m][:min_steps]
+
+        feature_dim = int(method_domains["goat"][0].data.shape[1])
+        vae = _load_feature_vae_for_plotting(args, output_dir, feature_dim=feature_dim)
+
+        src_trainset = get_single_rotate(False, 0)
+        tgt_trainset = get_single_rotate(False, args.target_angle)
+        save_endpoint_grid(
+            os.path.join(output_dir, "endpoints_source_target.png"),
+            src_trainset,
+            tgt_trainset,
+            n_samples=args.samples_per_step,
+            seed=args.seed,
+        )
+
+        group_a = ("GOAT", "C2GDA-Wass")
+        map_a = {"GOAT": "goat", "C2GDA-Wass": "goat_classwise"}
+        for step in range(min_steps):
+            decoded, idx = _collect_step_images(
+                vae,
+                methods=[map_a[m] for m in group_a],
+                method_domains=method_domains,
+                step=step,
+                n_samples=args.samples_per_step,
+                seed=args.seed,
+                sample_selection=args.sample_selection,
+            )
+            renamed = {m: decoded[map_a[m]] for m in group_a}
+            save_comparison_grid(
+                os.path.join(output_dir, f"compare_goat_vs_goatcw_step{step}.png"),
+                methods=group_a,
+                decoded=renamed,
+                step=step,
+            )
+            print(f"[Save] Group A step {step}, sampled idx={idx.tolist()}")
+
+        summary_steps = list(range(min_steps))
+        save_summary_grid(
+            os.path.join(output_dir, "compare_goat_vs_goatcw_summary.png"),
+            methods=group_a,
+            method_domains={k: method_domains[v] for k, v in map_a.items()},
+            vae=vae,
+            steps=summary_steps,
+        )
+
+        group_b = ("C2GDA-Wass", "C2GDA-FR", "C2GDA-Nat")
+        map_b = {"C2GDA-Wass": "goat_classwise", "C2GDA-FR": "ours_fr", "C2GDA-Nat": "ours_eta"}
+        for step in range(min_steps):
+            decoded, idx = _collect_step_images(
+                vae,
+                methods=[map_b[m] for m in group_b],
+                method_domains=method_domains,
+                step=step,
+                n_samples=args.samples_per_step,
+                seed=args.seed,
+                sample_selection=args.sample_selection,
+            )
+            renamed = {m: decoded[map_b[m]] for m in group_b}
+            save_comparison_grid(
+                os.path.join(output_dir, f"compare_goatcw_oursfr_oursnat_step{step}.png"),
+                methods=group_b,
+                decoded=renamed,
+                step=step,
+            )
+            print(f"[Save] Group B step {step}, sampled idx={idx.tolist()}")
+
+        save_summary_grid(
+            os.path.join(output_dir, "compare_goatcw_oursfr_oursnat_summary.png"),
+            methods=group_b,
+            method_domains={k: method_domains[v] for k, v in map_b.items()},
+            vae=vae,
+            steps=summary_steps,
+        )
+
+        np.save(os.path.join(output_dir, "trajectory_indices.npy"), shared_idx)
+        print(f"[Trajectory] Shared indices: {shared_idx.tolist()}")
+
+        display_names = {
+            "goat": "GOAT",
+            "goat_classwise": "C2GDA-Wass",
+            "ours_fr": "C2GDA-FR",
+            "ours_eta": "C2GDA-Nat",
+        }
+        for m in trajectory_methods:
+            save_method_trajectory_grid(
+                os.path.join(output_dir, f"trajectory_{m}.png"),
+                method_name=display_names[m],
+                trajectory_domains=trajectory_chains[m],
+                trajectory_labels=trajectory_labels,
+                vae=vae,
+                indices=shared_idx,
+            )
+
+        n_classes = int(_labels_for_domain(trajectory_chains["goat"][0]).max().item()) + 1
+        n_class_imgs = max(1, int(args.class_plot_num_images))
+        skipped_by_threshold = 0
+        used_fallback = 0
+        for cls in range(n_classes):
+            class_idx = _common_indices_for_class(
+                trajectory_chains=trajectory_chains,
+                methods=trajectory_methods,
+                cls=cls,
+                n_samples=n_class_imgs,
+                seed=args.seed,
+                sample_selection=args.sample_selection,
+            )
+            if len(class_idx) >= int(args.min_class_plot_indices):
+                class_idx = _expand_indices(class_idx, n_class_imgs, seed=args.seed + 12000 + cls)
+                for img_i, idx_val in enumerate(class_idx[:n_class_imgs]):
+                    save_all_methods_class_trajectory_grid(
+                        save_path=os.path.join(output_dir, f"trajectory_all_methods_class{cls}_img{img_i}.pdf"),
+                        methods=trajectory_methods,
+                        display_names=display_names,
+                        trajectory_chains=trajectory_chains,
+                        trajectory_labels=trajectory_labels,
+                        trajectory_is_synth=trajectory_is_synth,
+                        vae=vae,
+                        indices=np.array([int(idx_val)], dtype=np.int64),
+                        class_id=cls,
+                    )
+                print(f"[Trajectory] class {cls}: saved {n_class_imgs} files with shared indices.")
+                continue
+
+            per_method_idx = _per_method_indices_for_class(
+                trajectory_chains=trajectory_chains,
+                methods=trajectory_methods,
+                cls=cls,
+                n_samples=n_class_imgs,
+                seed=args.seed,
+                sample_selection=args.sample_selection,
+            )
+            non_empty = sum(1 for m in trajectory_methods if len(per_method_idx.get(m, [])) > 0)
+            if non_empty == 0:
+                skipped_by_threshold += 1
+                print(
+                    f"[Trajectory] class {cls}: skipped "
+                    f"(shared_idx={len(class_idx)}, per_method_nonempty=0)."
+                )
+                continue
+            used_fallback += 1
+            for img_i in range(n_class_imgs):
+                pm_one: Dict[str, np.ndarray] = {}
+                for m in trajectory_methods:
+                    arr = per_method_idx.get(m, np.array([], dtype=np.int64))
+                    if len(arr) == 0:
+                        pm_one[m] = np.array([], dtype=np.int64)
+                    else:
+                        pm_one[m] = np.array([int(arr[img_i])], dtype=np.int64)
+                save_all_methods_class_trajectory_grid(
+                    save_path=os.path.join(output_dir, f"trajectory_all_methods_class{cls}_img{img_i}.pdf"),
+                    methods=trajectory_methods,
+                    display_names=display_names,
+                    trajectory_chains=trajectory_chains,
+                    trajectory_labels=trajectory_labels,
+                    trajectory_is_synth=trajectory_is_synth,
+                    vae=vae,
+                    indices=np.array([], dtype=np.int64),
+                    class_id=cls,
+                    per_method_indices=pm_one,
+                )
+            print(f"[Trajectory] class {cls}: saved {n_class_imgs} files with per-method fallback indices.")
+
+        if skipped_by_threshold > 0:
+            print(f"[Trajectory] skipped {skipped_by_threshold} classes by minimum-index threshold.")
+        if used_fallback > 0:
+            print(f"[Trajectory] used per-method fallback for {used_fallback} classes.")
+        if classwise_report:
+            report_path = os.path.join(output_dir, "classwise_quality_report.csv")
+            _save_classwise_quality_report(classwise_report, report_path)
+            print(f"[Classwise] report refreshed: {report_path}")
+
+        print(f"[Done] Outputs saved under: {output_dir}")
+        return
 
     # Image-only VAE mode: skip source-model / feature encoding stage entirely.
     if args.vae_input == "image":
@@ -1071,51 +1945,142 @@ def run(args: argparse.Namespace) -> None:
     vae_features = torch.cat([source_features.detach().cpu().float(), target_features.detach().cpu().float()], dim=0)
     vae_trainset = TensorDataset(vae_images, torch.zeros(len(vae_images), dtype=torch.long))
 
-    _ = train_or_load_vae(args, vae_trainset, vae_features, latent_dim, output_dir)
+    vae = train_or_load_vae(args, vae_trainset, vae_features, latent_dim, output_dir)
     if args.vae_only:
         print("[Done] VAE-only mode: reconstruction model trained/loaded. Skipping method runs and trajectory plots.")
         print(f"[Done] Outputs saved under: {output_dir}")
         return
 
-    teacher = copy.deepcopy(ref_model).to(DEVICE).eval()
-    _em_bundles, _em_accs, _ = build_em_bundles_for_chain(
-        args_main,
-        raw_domains=raw_domains,
-        encoded_domains=encoded_domains,
-        domain_keys=angle_keys,
-        teacher_model=teacher,
-        n_classes=10,
-        description_prefix="qual-mnist-angle-",
-    )
+    teacher: Optional[nn.Module] = None
+    method_domains: Dict[str, List[Dataset]]
+    trajectory_chains: Dict[str, List[Dataset]]
+    trajectory_labels: List[str]
+    trajectory_is_synth: List[bool]
+    classwise_report: List[Dict[str, object]]
+    shared_idx: np.ndarray
+    trajectory_methods = ("goat", "goat_classwise", "ours_fr", "ours_eta")
 
-    print("[Run] Running standard methods through run_core_methods for consistency...")
-    # Method internals write plots/caches under args.dataset; switch to an
-    # isolated namespace to avoid overwriting main experiment artifacts.
-    method_args = copy.deepcopy(args_main)
-    method_args.dataset = artifact_tag
-    results = run_core_methods(
-        method_args,
-        ref_model=ref_model,
-        src_trainset=src_trainset,
-        tgt_trainset=tgt_trainset,
-        all_sets=all_sets,
-        deg_idx=deg_idx,
-        generated_domains=args.generated_domains,
-        target_label=args.target_angle,
-    )
-    for k in ("goat", "goat_classwise", "ours_fr", "ours_eta"):
-        if k in results and results[k].test_curve:
-            print(f"[Run] {k}: final test={results[k].test_curve[-1]:.2f}")
+    cache_path = args.trajectory_cache_path.strip() if args.trajectory_cache_path else ""
+    if not cache_path:
+        cache_path = os.path.join(output_dir, "trajectory_cache.pt")
+    loaded_cache = False
+    if args.load_trajectory_cache and os.path.exists(cache_path):
+        cache_obj = _load_trajectory_cache(cache_path)
+        method_domains = cache_obj["method_domains"]
+        shared_idx = cache_obj["shared_idx"]
+        classwise_report = cache_obj["classwise_report"]
+        cached_generated = int(cache_obj.get("meta", {}).get("generated_domains", args.generated_domains))
+        loaded_cache = True
+        print(f"[Trajectory] Loaded cache: {cache_path}")
+        n_steps_by_method = {k: len(v) for k, v in method_domains.items()}
+        min_steps = min(n_steps_by_method.values())
+        if args.max_steps is not None:
+            min_steps = min(min_steps, args.max_steps)
+        if min_steps <= 0:
+            raise RuntimeError("Trajectory cache is empty.")
+        for m in trajectory_methods:
+            method_domains[m] = method_domains[m][:min_steps]
 
-    method_domains = extract_method_domains(method_args, encoded_domains, args.generated_domains)
-    n_steps_by_method = {k: len(v) for k, v in method_domains.items()}
-    print(f"[Run] Extracted synthetic steps per method: {n_steps_by_method}")
-    min_steps = min(n_steps_by_method.values())
-    if args.max_steps is not None:
-        min_steps = min(min_steps, args.max_steps)
-    if min_steps <= 0:
-        raise RuntimeError("No synthetic intermediate steps were produced.")
-    vae = train_or_load_vae(args, vae_trainset, vae_features, latent_dim, output_dir)
+        trajectory_chains = {}
+        trajectory_labels = []
+        trajectory_is_synth = []
+        for m in trajectory_methods:
+            chain, labels, is_synth = build_labeled_trajectory_chain(
+                encoded_domains=encoded_domains,
+                method_synth_domains=method_domains[m],
+                generated_domains=cached_generated,
+            )
+            trajectory_chains[m] = chain
+            if not trajectory_labels:
+                trajectory_labels = labels
+                trajectory_is_synth = is_synth
+    else:
+        teacher = copy.deepcopy(ref_model).to(DEVICE).eval()
+        _em_bundles, _em_accs, _ = build_em_bundles_for_chain(
+            args_main,
+            raw_domains=raw_domains,
+            encoded_domains=encoded_domains,
+            domain_keys=angle_keys,
+            teacher_model=teacher,
+            n_classes=10,
+            description_prefix="qual-mnist-angle-",
+        )
+
+        print("[Run] Running standard methods through run_core_methods for consistency...")
+        # Method internals write plots/caches under args.dataset; switch to an
+        # isolated namespace to avoid overwriting main experiment artifacts.
+        method_args = copy.deepcopy(args_main)
+        method_args.dataset = artifact_tag
+        results = run_core_methods(
+            method_args,
+            ref_model=ref_model,
+            src_trainset=src_trainset,
+            tgt_trainset=tgt_trainset,
+            all_sets=all_sets,
+            deg_idx=deg_idx,
+            generated_domains=args.generated_domains,
+            target_label=args.target_angle,
+        )
+        for k in ("goat", "goat_classwise", "ours_fr", "ours_eta"):
+            if k in results and results[k].test_curve:
+                print(f"[Run] {k}: final test={results[k].test_curve[-1]:.2f}")
+
+        method_domains, classwise_report = extract_method_domains(
+            method_args, encoded_domains, args.generated_domains
+        )
+        report_path = os.path.join(output_dir, "classwise_quality_report.csv")
+        _save_classwise_quality_report(classwise_report, report_path)
+        used = sum(int(r.get("used", 0)) for r in classwise_report)
+        total = len(classwise_report)
+        print(f"[Classwise] usable class-pairs: {used}/{total}; report saved: {report_path}")
+        n_steps_by_method = {k: len(v) for k, v in method_domains.items()}
+        print(f"[Run] Extracted synthetic steps per method: {n_steps_by_method}")
+        min_steps = min(n_steps_by_method.values())
+        if args.max_steps is not None:
+            min_steps = min(min_steps, args.max_steps)
+        if min_steps <= 0:
+            raise RuntimeError("No synthetic intermediate steps were produced.")
+
+        trajectory_chains = {}
+        trajectory_labels = []
+        trajectory_is_synth = []
+        for m in trajectory_methods:
+            chain, labels, is_synth = build_labeled_trajectory_chain(
+                encoded_domains=encoded_domains,
+                method_synth_domains=method_domains[m][:min_steps],
+                generated_domains=args.generated_domains,
+            )
+            trajectory_chains[m] = chain
+            if not trajectory_labels:
+                trajectory_labels = labels
+                trajectory_is_synth = is_synth
+
+        shared_idx = _sample_common_indices_for_trajectories(
+            trajectory_chains=trajectory_chains,
+            methods=trajectory_methods,
+            n_samples=args.samples_per_step,
+            seed=args.seed,
+            sample_selection=args.sample_selection,
+        )
+
+    if args.semantic_eval:
+        if teacher is None:
+            teacher = copy.deepcopy(ref_model).to(DEVICE).eval()
+        sem_by_step, sem_summary = _evaluate_semantic_consistency(
+            classifier=teacher,
+            vae=vae,
+            method_domains=method_domains,
+            max_steps=min_steps,
+            sample_selection=args.sample_selection,
+            seed=args.seed,
+            max_samples_per_step=args.semantic_eval_samples,
+        )
+        sem_step_path = os.path.join(output_dir, "class_consistency_by_step.csv")
+        sem_sum_path = os.path.join(output_dir, "class_consistency_summary.csv")
+        _save_rows_csv(sem_by_step, sem_step_path)
+        _save_rows_csv(sem_summary, sem_sum_path)
+        print(f"[Semantic] Saved: {sem_step_path}")
+        print(f"[Semantic] Saved: {sem_sum_path}")
 
     save_endpoint_grid(
         os.path.join(output_dir, "endpoints_source_target.png"),
@@ -1125,8 +2090,8 @@ def run(args: argparse.Namespace) -> None:
         seed=args.seed,
     )
 
-    group_a = ("GOAT", "GOATCW")
-    map_a = {"GOAT": "goat", "GOATCW": "goat_classwise"}
+    group_a = ("GOAT", "C2GDA-Wass")
+    map_a = {"GOAT": "goat", "C2GDA-Wass": "goat_classwise"}
     for step in range(min_steps):
         decoded, idx = _collect_step_images(
             vae,
@@ -1135,6 +2100,7 @@ def run(args: argparse.Namespace) -> None:
             step=step,
             n_samples=args.samples_per_step,
             seed=args.seed,
+            sample_selection=args.sample_selection,
         )
         renamed = {m: decoded[map_a[m]] for m in group_a}
         save_comparison_grid(
@@ -1154,8 +2120,8 @@ def run(args: argparse.Namespace) -> None:
         steps=summary_steps,
     )
 
-    group_b = ("GOATCW", "OURS-FR", "OURS-Nat")
-    map_b = {"GOATCW": "goat_classwise", "OURS-FR": "ours_fr", "OURS-Nat": "ours_eta"}
+    group_b = ("C2GDA-Wass", "C2GDA-FR", "C2GDA-Nat")
+    map_b = {"C2GDA-Wass": "goat_classwise", "C2GDA-FR": "ours_fr", "C2GDA-Nat": "ours_eta"}
     for step in range(min_steps):
         decoded, idx = _collect_step_images(
             vae,
@@ -1164,6 +2130,7 @@ def run(args: argparse.Namespace) -> None:
             step=step,
             n_samples=args.samples_per_step,
             seed=args.seed,
+            sample_selection=args.sample_selection,
         )
         renamed = {m: decoded[map_b[m]] for m in group_b}
         save_comparison_grid(
@@ -1183,37 +2150,26 @@ def run(args: argparse.Namespace) -> None:
     )
 
     # Fixed-index trajectories: same indices across all methods/domains.
-    trajectory_methods = ("goat", "goat_classwise", "ours_fr", "ours_eta")
-    trajectory_chains: Dict[str, List[Dataset]] = {}
-    trajectory_labels: Optional[List[str]] = None
-    trajectory_is_synth: Optional[List[bool]] = None
-    for m in trajectory_methods:
-        chain, labels, is_synth = build_labeled_trajectory_chain(
-            encoded_domains=encoded_domains,
-            method_synth_domains=method_domains[m][:min_steps],
-            generated_domains=args.generated_domains,
-        )
-        trajectory_chains[m] = chain
-        if trajectory_labels is None:
-            trajectory_labels = labels
-            trajectory_is_synth = is_synth
-
-    assert trajectory_labels is not None and trajectory_is_synth is not None
-
-    shared_idx = _sample_common_indices_for_trajectories(
-        trajectory_chains=trajectory_chains,
-        methods=trajectory_methods,
-        n_samples=args.samples_per_step,
-        seed=args.seed,
-    )
     np.save(os.path.join(output_dir, "trajectory_indices.npy"), shared_idx)
     print(f"[Trajectory] Shared indices: {shared_idx.tolist()}")
+    if (not loaded_cache) and args.save_trajectory_cache:
+        saved_cache = _save_trajectory_cache(
+            output_dir=output_dir,
+            args=args,
+            method_domains=method_domains,
+            trajectory_chains=trajectory_chains,
+            trajectory_labels=trajectory_labels,
+            trajectory_is_synth=trajectory_is_synth,
+            shared_idx=shared_idx,
+            classwise_report=classwise_report,
+        )
+        print(f"[Trajectory] Saved cache: {saved_cache}")
 
     display_names = {
         "goat": "GOAT",
-        "goat_classwise": "GOATCW",
-        "ours_fr": "OURS-FR",
-        "ours_eta": "OURS-Nat",
+        "goat_classwise": "C2GDA-Wass",
+        "ours_fr": "C2GDA-FR",
+        "ours_eta": "C2GDA-Nat",
     }
     for m in trajectory_methods:
         save_method_trajectory_grid(
@@ -1227,29 +2183,79 @@ def run(args: argparse.Namespace) -> None:
 
     # Combined figure per class: all methods in the same grid.
     n_classes = int(torch.as_tensor(encoded_domains[0].targets).max().item()) + 1
+    n_class_imgs = max(1, int(args.class_plot_num_images))
+    skipped_by_threshold = 0
+    used_fallback = 0
     for cls in range(n_classes):
         class_idx = _common_indices_for_class(
             trajectory_chains=trajectory_chains,
             methods=trajectory_methods,
             cls=cls,
-            n_samples=1,
+            n_samples=n_class_imgs,
             seed=args.seed,
+            sample_selection=args.sample_selection,
         )
-        if len(class_idx) == 0:
-            print(f"[Trajectory] class {cls}: skipped (no common indices across all methods/steps).")
+        if len(class_idx) >= int(args.min_class_plot_indices):
+            class_idx = _expand_indices(class_idx, n_class_imgs, seed=args.seed + 12000 + cls)
+            for img_i, idx_val in enumerate(class_idx[:n_class_imgs]):
+                save_all_methods_class_trajectory_grid(
+                    save_path=os.path.join(output_dir, f"trajectory_all_methods_class{cls}_img{img_i}.pdf"),
+                    methods=trajectory_methods,
+                    display_names=display_names,
+                    trajectory_chains=trajectory_chains,
+                    trajectory_labels=trajectory_labels,
+                    trajectory_is_synth=trajectory_is_synth,
+                    vae=vae,
+                    indices=np.array([int(idx_val)], dtype=np.int64),
+                    class_id=cls,
+                )
+            print(f"[Trajectory] class {cls}: saved {n_class_imgs} files with shared indices.")
             continue
-        save_all_methods_class_trajectory_grid(
-            save_path=os.path.join(output_dir, f"trajectory_all_methods_class{cls}.png"),
-            methods=trajectory_methods,
-            display_names=display_names,
+
+        # Fallback: allow per-method class indices so every class can be visualized.
+        per_method_idx = _per_method_indices_for_class(
             trajectory_chains=trajectory_chains,
-            trajectory_labels=trajectory_labels,
-            trajectory_is_synth=trajectory_is_synth,
-            vae=vae,
-            indices=class_idx,
-            class_id=cls,
+            methods=trajectory_methods,
+            cls=cls,
+            n_samples=n_class_imgs,
+            seed=args.seed,
+            sample_selection=args.sample_selection,
         )
-        print(f"[Trajectory] class {cls}: saved with indices {class_idx.tolist()}")
+        non_empty = sum(1 for m in trajectory_methods if len(per_method_idx.get(m, [])) > 0)
+        if non_empty == 0:
+            skipped_by_threshold += 1
+            print(
+                f"[Trajectory] class {cls}: skipped "
+                f"(shared_idx={len(class_idx)}, per_method_nonempty=0)."
+            )
+            continue
+        used_fallback += 1
+        for img_i in range(n_class_imgs):
+            pm_one: Dict[str, np.ndarray] = {}
+            for m in trajectory_methods:
+                arr = per_method_idx.get(m, np.array([], dtype=np.int64))
+                if len(arr) == 0:
+                    pm_one[m] = np.array([], dtype=np.int64)
+                else:
+                    pm_one[m] = np.array([int(arr[img_i])], dtype=np.int64)
+            save_all_methods_class_trajectory_grid(
+                save_path=os.path.join(output_dir, f"trajectory_all_methods_class{cls}_img{img_i}.pdf"),
+                methods=trajectory_methods,
+                display_names=display_names,
+                trajectory_chains=trajectory_chains,
+                trajectory_labels=trajectory_labels,
+                trajectory_is_synth=trajectory_is_synth,
+                vae=vae,
+                indices=np.array([], dtype=np.int64),
+                class_id=cls,
+                per_method_indices=pm_one,
+            )
+        print(f"[Trajectory] class {cls}: saved {n_class_imgs} files with per-method fallback indices.")
+
+    if skipped_by_threshold > 0:
+        print(f"[Trajectory] skipped {skipped_by_threshold} classes by minimum-index threshold.")
+    if used_fallback > 0:
+        print(f"[Trajectory] used per-method fallback for {used_fallback} classes.")
 
     print(f"[Done] Outputs saved under: {output_dir}")
 
@@ -1285,12 +2291,76 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae-min-delta", type=float, default=1e-3, help="Minimum validation-loss improvement to reset patience.")
     parser.add_argument("--vae-path", type=str, default="")
     parser.add_argument("--samples-per-step", type=int, default=16)
+    parser.add_argument(
+        "--sample-selection",
+        choices=["random", "confidence"],
+        default="random",
+        help="How to choose plotted sample indices: random or highest-confidence by domain weights.",
+    )
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--output-dir", type=str, default="")
+    parser.add_argument(
+        "--cw-min-class-count",
+        type=int,
+        default=100,
+        help="Minimum per-class sample count required in both adjacent domains for classwise OT.",
+    )
+    parser.add_argument(
+        "--cw-confidence-quantile",
+        type=float,
+        default=0.0,
+        help="Drop low-confidence per-class samples below this weight quantile (0 disables).",
+    )
+    parser.add_argument(
+        "--cw-prototype-shrink",
+        type=float,
+        default=0.0,
+        help="Prototype shrink factor in [0,1] for classwise synthetic features.",
+    )
+    parser.add_argument(
+        "--min-class-plot-indices",
+        type=int,
+        default=1,
+        help="Skip class trajectory figure if common fixed indices across methods are below this threshold.",
+    )
+    parser.add_argument(
+        "--class-plot-num-images",
+        type=int,
+        default=10,
+        help="Number of per-class trajectory files to save (trajectory_all_methods_class{c}_img{i}.pdf).",
+    )
+    parser.add_argument(
+        "--semantic-eval",
+        action="store_true",
+        help="Evaluate class-semantic consistency on decoded synthetic domains and save CSV reports.",
+    )
+    parser.add_argument(
+        "--semantic-eval-samples",
+        type=int,
+        default=1024,
+        help="Max samples per method/step used in semantic consistency evaluation.",
+    )
     parser.add_argument(
         "--vae-only",
         action="store_true",
         help="Train/load the feature-to-image VAE only, then exit before EM/method trajectory generation.",
+    )
+    parser.add_argument(
+        "--save-trajectory-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save serialized synthetic trajectory domains for fast future re-plotting.",
+    )
+    parser.add_argument(
+        "--load-trajectory-cache",
+        action="store_true",
+        help="Load precomputed trajectory cache and skip synthetic-domain generation.",
+    )
+    parser.add_argument(
+        "--trajectory-cache-path",
+        type=str,
+        default="",
+        help="Optional path to trajectory cache .pt file (default: <output-dir>/trajectory_cache.pt).",
     )
     return parser.parse_args()
 

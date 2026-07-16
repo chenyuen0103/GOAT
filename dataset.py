@@ -45,6 +45,84 @@ class EncodeDataset(Dataset):
         return self.data[idx], self.targets[idx]
 
 
+class StratifiedSubset(Dataset):
+    """Subset wrapper that preserves class targets for experiment diagnostics."""
+
+    def __init__(self, dataset, indices, targets=None):
+        self.dataset = dataset
+        self.indices = np.asarray(indices, dtype=np.int64)
+
+        if targets is None:
+            if not hasattr(dataset, "targets"):
+                raise AttributeError("dataset must expose .targets or targets must be provided")
+            targets = dataset.targets
+        targets_np = np.asarray(
+            targets.cpu().numpy() if torch.is_tensor(targets) else targets,
+            dtype=np.int64,
+        )
+        self.targets = torch.as_tensor(targets_np[self.indices], dtype=torch.long)
+        self.targets_em = -1 * torch.ones(len(self.indices), dtype=torch.long)
+        self.targets_pseudo = None
+        self.transform = getattr(dataset, "transform", None)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        return self.dataset[int(self.indices[idx])]
+
+
+def stratified_subset(dataset, class_counts, seed=0, replace=False, shuffle=True):
+    """
+    Return a StratifiedSubset with exactly the requested per-class counts.
+
+    Args:
+        dataset: Dataset exposing .targets, e.g. MNIST or a rotated MNIST dataset.
+        class_counts: Mapping or sequence of requested counts by class id.
+        seed: RNG seed used for within-class sampling and final order shuffle.
+        replace: Allow sampling more examples than available in a class.
+        shuffle: Shuffle the concatenated class-stratified indices.
+    """
+
+    if not hasattr(dataset, "targets"):
+        raise AttributeError("stratified_subset requires a dataset with .targets")
+
+    raw_targets = dataset.targets
+    targets = np.asarray(
+        raw_targets.cpu().numpy() if torch.is_tensor(raw_targets) else raw_targets,
+        dtype=np.int64,
+    )
+    rng = np.random.default_rng(seed)
+
+    if isinstance(class_counts, dict):
+        items = sorted((int(k), int(v)) for k, v in class_counts.items())
+    else:
+        items = [(int(k), int(v)) for k, v in enumerate(class_counts)]
+
+    selected = []
+    for cls, count in items:
+        if count <= 0:
+            continue
+        candidates = np.flatnonzero(targets == cls)
+        if candidates.size == 0:
+            raise ValueError(f"class {cls} has no examples in dataset")
+        if count > candidates.size and not replace:
+            raise ValueError(
+                f"requested {count} examples for class {cls}, "
+                f"but only {candidates.size} are available"
+            )
+        selected.append(rng.choice(candidates, size=count, replace=replace))
+
+    if selected:
+        indices = np.concatenate(selected).astype(np.int64)
+    else:
+        indices = np.empty((0,), dtype=np.int64)
+    if shuffle and indices.size:
+        rng.shuffle(indices)
+
+    return StratifiedSubset(dataset, indices, targets=targets)
+
+
 """
     Make portraits dataset
 """

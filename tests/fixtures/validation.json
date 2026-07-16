@@ -1,0 +1,12 @@
+{
+  "actual_result_rows": 630,
+  "duplicate_result_rows": 0,
+  "expected_methods": [
+    "goat",
+    "cgda_fr",
+    "cgda_fr_oracle"
+  ],
+  "expected_result_rows": 630,
+  "missing_result_rows": 0,
+  "passed": true
+}
