@@ -7,6 +7,7 @@ from dataset import *
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+from goat.core.artifacts import mnist_data_root
 
 
 from PIL import Image
@@ -47,9 +48,12 @@ def get_single_rotate(train, angle, dataset="mnist", encoder=None):
     transform = Compose([ToTensor(), RandomRotation((angle, angle))])
 
     if dataset == "mnist":
-        # uncomment the following line if MNIST is not downloaded
-        # dataset = datasets.MNIST(root="/data/mnist/", train=train, download=True, transform=transform)
-        dataset = datasets.MNIST(root="/data/common/yuenchen", train=train, download=True, transform=transform)
+        dataset = datasets.MNIST(
+            root=str(mnist_data_root()),
+            train=train,
+            download=True,
+            transform=transform,
+        )
 
     if encoder is not None:
         dataset = get_encoded_dataset(encoder, dataset)

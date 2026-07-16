@@ -59,6 +59,11 @@ from goat.core.prepared_artifacts import (
     fingerprint_encoded_dataset,
     metadata_fingerprint,
 )
+from goat.core.artifacts import (
+    dataset_model_dir,
+    experiment_cache_dir,
+    mnist_model_dir,
+)
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -135,19 +140,16 @@ def _encoded_cache_dir(args, *, target: Optional[int] = None) -> str:
     Include seed in non-MNIST cache paths to avoid cross-seed cache reuse, which can
     mismatch encoded sample order/labels and shift initial test points.
     """
-    dataset = getattr(args, "dataset", None)
-    model_token = str(getattr(args, "_encoder_cache_token", "unversioned"))
-    if dataset == "mnist":
-        if target is None:
-            raise ValueError("target must be provided for mnist cache path.")
-        return (
-            f"cache{args.ssl_weight}/target{target}/prepared_v1/{model_token}/"
-            f"small_dim{args.small_dim}/"
+    return str(
+        experiment_cache_dir(
+            dataset=str(getattr(args, "dataset", "unknown")),
+            ssl_weight=float(args.ssl_weight),
+            seed=int(getattr(args, "seed", 0)),
+            model_token=str(getattr(args, "_encoder_cache_token", "unversioned")),
+            small_dim=int(args.small_dim),
+            gt_domains=int(getattr(args, "gt_domains", 0)),
+            target=target,
         )
-    gt_tag = f"gt{int(getattr(args, 'gt_domains', 0))}"
-    return (
-        f"{dataset}/cache{args.ssl_weight}/{_seed_tag(args)}/prepared_v1/"
-        f"{model_token}/{gt_tag}/small_dim{args.small_dim}/"
     )
 
 
@@ -2182,9 +2184,9 @@ def run_mnist_experiment(target: int, gt_domains: int, generated_domains: int, a
         mode="mnist",
         n_class=10,
         epochs=10,
-        model_path=os.path.join(
-            "/data/common/yuenchen/GDA/mnist_models/",
-            f"src0_tgt{target}_ssl{args.ssl_weight}_dim{args.small_dim}.pth",
+        model_path=str(
+            mnist_model_dir()
+            / f"src0_tgt{target}_ssl{args.ssl_weight}_dim{args.small_dim}.pth"
         ),
         compress=True,
         in_dim=25088,
@@ -2352,7 +2354,7 @@ def run_portraits_experiment(gt_domains: int, generated_domains: int, args=None)
     src_trainset = EncodeDataset(tr_x, tr_y.astype(int), transforms)
     tgt_trainset = EncodeDataset(ts_x, ts_y.astype(int), transforms)
 
-    model_dir = f"portraits/cache{args.ssl_weight}/"
+    model_dir = dataset_model_dir("portraits", f"portraits/cache{args.ssl_weight}")
     model_cfg = ModelConfig(
         encoder_builder=ENCODER,
         mode="portraits",
@@ -2515,7 +2517,7 @@ def run_covtype_experiment(gt_domains: int, generated_domains: int, args=None):
     if enc_out_dim < args.small_dim:
         args.small_dim = enc_out_dim
 
-    model_dir = f"covtype/cache{args.ssl_weight}/"
+    model_dir = dataset_model_dir("covtype", f"covtype/cache{args.ssl_weight}")
     model_cfg = ModelConfig(
         encoder_builder=MLP_Encoder,
         mode="covtype",
@@ -2701,7 +2703,7 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
     if enc_out_dim < args.small_dim:
         args.small_dim = enc_out_dim
 
-    model_dir = f"color_mnist/cache{args.ssl_weight}"
+    model_dir = dataset_model_dir("color_mnist", f"color_mnist/cache{args.ssl_weight}")
     model_cfg = ModelConfig(
         encoder_builder=ENCODER,
         mode="mnist",

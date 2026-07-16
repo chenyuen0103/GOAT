@@ -64,6 +64,7 @@ import numpy as np
 
 from em_utils import *
 from check_dist import *
+from goat.core.artifacts import dataset_model_dir, mnist_model_dir
 # -------------------------------------------------------------
 # Global config / utilities
 # -------------------------------------------------------------
@@ -3724,7 +3725,7 @@ def print_em_model_accuracies(em_models, true_labels):
 def run_mnist_experiment(target: int, gt_domains: int, generated_domains: int, args=None):
     src_trainset = get_single_rotate(False, 0)
     tgt_trainset = get_single_rotate(False, target)
-    model_dir = f"/data/common/yuenchen/GDA/mnist_models/"
+    model_dir = mnist_model_dir()
 
     # ---- (A) Train / load compressed source model ----
     encoder = ENCODER().to(device)
@@ -3737,7 +3738,7 @@ def run_mnist_experiment(target: int, gt_domains: int, generated_domains: int, a
         mode="mnist",
         encoder=encoder,
         epochs=10,
-        model_path=f"{model_dir}/{model_name_smalldim}",
+        model_path=str(model_dir / model_name_smalldim),
         target_dataset=tgt_trainset,
         force_recompute=False,
         compress=True,
@@ -4137,7 +4138,7 @@ def run_portraits_experiment(gt_domains: int, generated_domains: int, args=None)
     tgt_trainset = EncodeDataset(ts_x, ts_y.astype(int), transforms)
 
     # Train/load source model; also build a compressed variant for stable embedding space
-    model_dir = f"portraits/cache{args.ssl_weight}/"
+    model_dir = dataset_model_dir("portraits", f"portraits/cache{args.ssl_weight}")
     os.makedirs(model_dir, exist_ok=True)
     model_name_smalldim= f"ssl{args.ssl_weight}_dim{args.small_dim}.pth"
     source_model = get_source_model(
@@ -4336,7 +4337,7 @@ def run_covtype_experiment(gt_domains: int, generated_domains: int, args=None):
 
     # ----- Model (compressed) -----
     encoder = MLP_Encoder().to(device)
-    model_dir = f"covtype/cache{args.ssl_weight}/"
+    model_dir = dataset_model_dir("covtype", f"covtype/cache{args.ssl_weight}")
     os.makedirs(model_dir, exist_ok=True)
     def infer_encoder_out_dim(encoder, example, device):
         encoder = encoder.to(device).eval()
@@ -4621,7 +4622,7 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
     # enc_out_dim = infer_encoder_out_dim(encoder, _ex, device)
     if enc_out_dim < args.small_dim:
         args.small_dim = enc_out_dim
-    model_dir = f"color_mnist/cache{args.ssl_weight}"
+    model_dir = dataset_model_dir("color_mnist", f"color_mnist/cache{args.ssl_weight}")
     os.makedirs(model_dir, exist_ok=True)
 
     

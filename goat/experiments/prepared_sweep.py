@@ -189,7 +189,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--em-pca-dims", nargs="+", default=["none"])
     parser.add_argument("--pseudo-confidence-q", type=float, default=0.9)
     parser.add_argument("--goat-gen-methods", default="w2")
-    parser.add_argument("--prepared-artifact-root", default="prepared_artifacts")
+    parser.add_argument(
+        "--prepared-artifact-root",
+        default=os.environ.get("GOAT_PREPARED_ARTIFACT_ROOT", "prepared_artifacts"),
+    )
     parser.add_argument("--log-root", default=os.environ.get("LOG_ROOT", "logs_rerun"))
     parser.add_argument("--plot-root", default=os.environ.get("PLOT_ROOT", "plots_rerun"))
     parser.add_argument("--legacy-module", default="experiment_refrac.py")

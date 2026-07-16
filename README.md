@@ -30,7 +30,7 @@ GOAT/
 ├── dataset.py, model.py       # datasets and model definitions
 ├── em_utils.py                # EM fitting and cluster-to-class mappings
 ├── da_algo.py, a_star_util.py # adaptation and path-generation algorithms
-├── scripts/                   # thin command-line wrappers around `goat`
+├── scripts/                   # Conda setup and thin command-line wrappers
 ├── docs/                      # artifact and reproducibility notes
 ├── tests/                     # lightweight and regression tests
 └── legacy/                    # notes for compatibility entry points
@@ -43,22 +43,36 @@ package.
 ## Setup
 
 Run commands from the repository root. Python 3.9 or 3.10 is recommended for
-the legacy TensorFlow 2.14/PyTorch 2.2 dependency baseline.
+the legacy TensorFlow 2.14/PyTorch 2.2 dependency baseline. With Conda already
+installed and initialized, the setup script creates or updates an environment
+named `goat`:
 
 ```bash
 git clone https://github.com/chenyuen0103/GOAT.git
 cd GOAT
 
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements-gpu.txt
+bash scripts/setup_env.sh
+conda activate goat
 ```
 
-`requirements-gpu.txt` installs the dependencies needed by the full experiment
-scripts, including TensorFlow (used by the dataset code) and PyTorch. On a GPU
-machine, ensure that the installed PyTorch build is compatible with the local
-CUDA driver.
+The default profile installs `requirements-gpu.txt`, including TensorFlow (used
+by the dataset code) and PyTorch. Useful setup variants are:
+
+```bash
+# Include test/lint dependencies and verify the repository.
+bash scripts/setup_env.sh --dev --test
+
+# Install only the lightweight package/analysis dependencies.
+bash scripts/setup_env.sh --minimal
+
+# Inspect all environment-changing commands without executing them.
+bash scripts/setup_env.sh --dev --dry-run
+```
+
+Use `--name` and `--python` to override the environment name and Python
+version. On a GPU machine, ensure that the installed PyTorch build matches the
+local CUDA driver. When the default PyPI build is unsuitable, pass the matching
+PyTorch wheel index through `--torch-index-url URL` or `TORCH_INDEX_URL`.
 
 Other dependency sets are available for narrower use cases:
 
@@ -68,13 +82,48 @@ Other dependency sets are available for narrower use cases:
   packages; it is retained for provenance and is not the recommended portable
   installation path.
 
-For development, install the experiment and test dependencies and run the test
-suite:
+Run `bash scripts/setup_env.sh --help` for every setup option. The script is
+idempotent: it reuses an existing named Conda environment and refreshes its pip
+dependencies instead of deleting it.
+
+### New-machine setup under `/project/yuen_chen`
+
+For the second machine, use `/project/yuen_chen` as the persistent artifact
+root. This creates separate data, model, cache, and output directories and
+stores their locations in the Conda environment:
 
 ```bash
-python -m pip install -r requirements-gpu.txt
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
+bash scripts/setup_env.sh \
+  --project-root /project/yuen_chen \
+  --dev \
+  --test
+conda activate goat
+```
+
+The resulting layout is:
+
+```text
+/project/yuen_chen/
+├── data/
+│   ├── mnist/
+│   ├── portraits/dataset_32x32/{M,F}/
+│   └── covtype/covtype.data
+├── models/
+├── cache/{goat,keras,prepared}/
+└── outputs/{logs,plots}/
+```
+
+The setup persists `GOAT_DATA_DIR`, `GOAT_MODEL_DIR`, `GOAT_CACHE_DIR`,
+`GOAT_PREPARED_ARTIFACT_ROOT`, `GOAT_OUTPUT_DIR`, `LOG_ROOT`, `PLOT_ROOT`, and
+`KERAS_HOME` with
+`conda env config vars`; a Codex agent does not need to re-export them in each
+shell. After activation, verify the resolved paths and accelerator before
+starting a sweep:
+
+```bash
+python -c "from goat.core import ArtifactPaths; print(ArtifactPaths.from_env().to_dict())"
+python -c "import torch; print('CUDA:', torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+python run_prepared_sweep.py --dataset mnist --seeds 0 --gt-domains 0 --generated-domains 0 1 --dry-run
 ```
 
 ### Data preparation
@@ -82,28 +131,28 @@ python -m pytest -q
 The full experiments support `mnist`, `color_mnist`, `portraits`, and
 `covtype`.
 
-- **Rotated MNIST:** `torchvision` downloads MNIST automatically. The current
-  legacy loader stores it under `/data/common/yuenchen`, and the RMNIST runner
-  stores source checkpoints under `/data/common/yuenchen/GDA/mnist_models`.
-  Ensure those locations exist and are writable, create suitable symlinks, or
-  change the historical paths in `util.py` and `experiment_refrac.py` before
-  running on another machine.
-- **Color-shift MNIST:** Keras downloads MNIST automatically into its normal
-  user cache.
+- **Rotated MNIST:** `torchvision` downloads MNIST automatically into
+  `$GOAT_DATA_DIR/mnist`; source checkpoints are stored in
+  `$GOAT_MODEL_DIR/mnist`. Without these variables, the historical Euler paths
+  remain the backward-compatible defaults.
+- **Color-shift MNIST:** Keras downloads MNIST automatically into `$KERAS_HOME`
+  (or its normal user cache when that variable is unset).
 - **Portraits:** download the
   [aligned portraits archive](https://www.dropbox.com/s/ubjjoo0b2wz4vgz/faces_aligned_small_mirrored_co_aligned_cropped_cleaned.tar.gz?dl=0)
   used by
   [gradual_domain_adaptation](https://github.com/p-lambda/gradual_domain_adaptation),
-  extract its `M` and `F` directories into `dataset_32x32/`, and run:
+  extract its `M` and `F` directories into
+  `$GOAT_DATA_DIR/portraits/dataset_32x32/`, and run:
 
   ```bash
   python create_dataset.py
   ```
 
-  This creates `dataset_32x32.mat` in the repository root.
+  This creates `$GOAT_DATA_DIR/portraits/dataset_32x32.mat`. Without
+  `GOAT_DATA_DIR`, both input and output retain their repository-root defaults.
 - **Covertype:** download the UCI
   [Covertype dataset](https://archive.ics.uci.edu/dataset/31/covertype) and place
-  the uncompressed data file at `covtype.data` in the repository root.
+  the uncompressed data file at `$GOAT_DATA_DIR/covtype/covtype.data`.
 
 ## Running experiments
 
@@ -226,14 +275,18 @@ encoded-feature caches are reused when their configuration matches.
 The package artifact resolver recognizes:
 
 - `GOAT_DATA_DIR`: raw/processed data root (default `data/`).
+- `GOAT_MODEL_DIR`: source-checkpoint root (default `models/` for package code;
+  legacy experiment defaults are preserved when unset).
 - `GOAT_CACHE_DIR`: package cache root (default `cache0.1/`).
+- `GOAT_PREPARED_ARTIFACT_ROOT`: immutable prepared-sweep artifact root
+  (default `prepared_artifacts/`).
 - `GOAT_OUTPUT_DIR`: base output directory (default: repository root).
 - `LOG_ROOT`: log root (default `logs_rerun/`).
 - `PLOT_ROOT`: plot root (default `plots_rerun/`).
 
-The root-level legacy scripts still contain some historical repo-relative and
-absolute paths, including the RMNIST paths noted above; the environment
-variables do not override every legacy path yet. More detail is available in
+Dataset and source-checkpoint paths used by the current refactored experiments
+honor these overrides. Older archival entry points may still contain historical
+paths. More detail is available in
 [`docs/artifacts.md`](docs/artifacts.md) and
 [`docs/reproducible_runs.md`](docs/reproducible_runs.md).
 

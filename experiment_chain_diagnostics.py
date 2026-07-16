@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from goat.core.artifacts import mnist_model_dir
 
 try:
     import torch
@@ -587,7 +588,7 @@ def prepare_mnist(args) -> PreparedMNIST:
         model_path = str(args.source_model_path)
     else:
         model_name = f"src0_tgt{args.target}_ssl{args.ssl_weight}_dim{args.small_dim}.pth"
-        model_dir = str(getattr(args, "source_model_dir", "/data/common/yuenchen/GDA/mnist_models/"))
+        model_dir = str(getattr(args, "source_model_dir", None) or mnist_model_dir())
         model_path = os.path.join(model_dir, model_name)
     encoder = ENCODER().to(device)
     source_model = get_source_model(
@@ -774,7 +775,7 @@ def parse_args():
     p.add_argument("--source_epochs", type=int, default=10)
     p.add_argument("--force_recompute_source", action="store_true")
     p.add_argument("--force_recompute_encode", action="store_true")
-    p.add_argument("--source_model_dir", type=str, default="/data/common/yuenchen/GDA/mnist_models/")
+    p.add_argument("--source_model_dir", type=str, default=str(mnist_model_dir()))
     p.add_argument("--source_model_path", type=str, default=None)
 
     # Logging

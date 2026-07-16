@@ -1,65 +1,119 @@
-from PIL import Image
-import os
-from shutil import copyfile
-import numpy as np
+from __future__ import annotations
+
+import argparse
+import pickle
+from pathlib import Path
+from typing import Sequence
+
 import numpy as np
 import scipy.io
-import pickle
+from PIL import Image
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
+from goat.core.artifacts import portraits_data_file, portraits_raw_dir
 
-image_options = {
-    'batch_size': 100,
-    'class_mode': 'binary',
-    'color_mode': 'grayscale',
+
+IMAGE_OPTIONS = {
+    "batch_size": 100,
+    "class_mode": "binary",
+    "color_mode": "grayscale",
 }
 
 
-def save_data(data_dir='dataset_32x32', save_file='dataset_32x32.mat', target_size=(32, 32)):
-    Xs, Ys = [], []
-    datagen = ImageDataGenerator(rescale=1./255)
+def save_data(
+    data_dir: str | Path,
+    save_file: str | Path,
+    *,
+    stats_file: str | Path,
+    target_size: tuple[int, int] = (32, 32),
+) -> None:
+    data_dir = Path(data_dir).expanduser()
+    save_file = Path(save_file).expanduser()
+    stats_file = Path(stats_file).expanduser()
+    save_file.parent.mkdir(parents=True, exist_ok=True)
+    stats_file.parent.mkdir(parents=True, exist_ok=True)
+
+    xs, ys = [], []
+    datagen = ImageDataGenerator(rescale=1.0 / 255)
     data_generator = datagen.flow_from_directory(
-        data_dir, shuffle=False, target_size=target_size, **image_options)
+        str(data_dir),
+        shuffle=False,
+        target_size=target_size,
+        **IMAGE_OPTIONS,
+    )
     while True:
         next_x, next_y = next(data_generator)
-        Xs.append(next_x)
-        Ys.append(next_y)
+        xs.append(next_x)
+        ys.append(next_y)
         if data_generator.batch_index == 0:
             break
-    Xs = np.concatenate(Xs)
-    Ys = np.concatenate(Ys)
-    filenames = [f[2:] for f in data_generator.filenames]
-    assert(len(set(filenames)) == len(filenames))
-    filenames_idx = list(zip(filenames, range(len(filenames))))
-    filenames_idx = [(f, i) for f, i in zip(filenames, range(len(filenames)))]
-                     # if f[5:8] == 'Cal' or f[5:8] == 'cal']
-    indices = [i for f, i in sorted(filenames_idx)]
-    genders = np.array([f[:1] for f in data_generator.filenames])[indices]
-    binary_genders = (genders == 'F')
-    pickle.dump(binary_genders, open('portraits_gender_stats', "wb"))
-    print("computed gender stats")
-    # gender_stats = utils.rolling_average(binary_genders, 500)
-    # print(filenames)
-    # sort_indices = np.argsort(filenames)
-    # We need to sort only by year, and not have correlation with state.
-    # print state stats? print gender stats? print school stats?
-    # E.g. if this changes a lot by year, then we might want to do some grouping.
-    # Maybe print out number per year, and then we can decide on a grouping? Or algorithmically decide?
-    Xs = Xs[indices]
-    Ys = Ys[indices]
-    scipy.io.savemat('./' + save_file, mdict={'Xs': Xs, 'Ys': Ys})
 
-# Resize images.
-def resize(path, size=64):
-    dirs = os.listdir(path)
-    for item in dirs:
-        if os.path.isfile(path+item):
-            im = Image.open(path+item)
-            f, e = os.path.splitext(path+item)
-            imResize = im.resize((size,size), Image.LANCZOS)
-            imResize.save(f + '.png', 'PNG')
+    xs_array = np.concatenate(xs)
+    ys_array = np.concatenate(ys)
+    filenames = [filename[2:] for filename in data_generator.filenames]
+    if len(set(filenames)) != len(filenames):
+        raise ValueError("Portrait filenames must be unique after removing class prefixes")
 
-for folder in ['./dataset_32x32/M/', './dataset_32x32/F/']:
-    resize(folder, size=32)
+    indices = [index for _, index in sorted(zip(filenames, range(len(filenames))))]
+    genders = np.asarray([filename[:1] for filename in data_generator.filenames])[indices]
+    binary_genders = genders == "F"
+    with stats_file.open("wb") as handle:
+        pickle.dump(binary_genders, handle)
+    print(f"Saved gender statistics to {stats_file}")
 
-save_data(data_dir='dataset_32x32', save_file='dataset_32x32.mat', target_size=(32,32))
+    scipy.io.savemat(
+        str(save_file),
+        mdict={"Xs": xs_array[indices], "Ys": ys_array[indices]},
+    )
+    print(f"Saved processed portraits to {save_file}")
+
+
+def resize_directory(path: str | Path, *, size: int = 32) -> None:
+    path = Path(path).expanduser()
+    if not path.is_dir():
+        raise FileNotFoundError(f"Portrait class directory not found: {path}")
+    for item in path.iterdir():
+        if not item.is_file():
+            continue
+        with Image.open(item) as image:
+            resized = image.resize((size, size), Image.LANCZOS)
+            resized.save(item.with_suffix(".png"), "PNG")
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    default_output = portraits_data_file()
+    parser = argparse.ArgumentParser(description="Prepare the aligned Portraits dataset.")
+    parser.add_argument(
+        "--input-dir",
+        default=str(portraits_raw_dir()),
+        help="Directory containing the extracted M/ and F/ folders.",
+    )
+    parser.add_argument(
+        "--output-file",
+        default=str(default_output),
+        help="Destination .mat file consumed by GOAT.",
+    )
+    parser.add_argument(
+        "--stats-file",
+        default=str(default_output.parent / "portraits_gender_stats"),
+    )
+    parser.add_argument("--size", type=int, default=32)
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    input_dir = Path(args.input_dir).expanduser()
+    for class_name in ("M", "F"):
+        resize_directory(input_dir / class_name, size=args.size)
+    save_data(
+        input_dir,
+        args.output_file,
+        stats_file=args.stats_file,
+        target_size=(args.size, args.size),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

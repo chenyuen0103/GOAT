@@ -7,6 +7,7 @@ from scipy import ndimage
 import pandas as pd
 import os; os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 from tensorflow.keras.datasets import mnist
+from goat.core.artifacts import covtype_data_file, portraits_data_file
 
 
 class DomainDataset(Dataset):
@@ -137,12 +138,13 @@ def split_sizes(array, sizes):
     return np.split(array, indices)
 
 
-def load_portraits_data(load_file='dataset_32x32.mat'):
-    data = scipy.io.loadmat('./' + load_file)
+def load_portraits_data(load_file=None):
+    load_path = portraits_data_file() if load_file is None else load_file
+    data = scipy.io.loadmat(str(load_path))
     return data['Xs'], data['Ys'][0]
 
 def make_portraits_data(n_src_tr, n_src_val, n_inter, n_target_unsup, n_trg_val, n_trg_tst,
-                        load_file='dataset_32x32.mat'):
+                        load_file=None):
     xs, ys = load_portraits_data(load_file)
     src_end = n_src_tr + n_src_val
     inter_end = src_end + n_inter
@@ -201,8 +203,9 @@ def load_covtype_data(load_file, normalize=True):
     return xs, ys
 
 def make_cov_data(n_src_tr, n_src_val, n_inter, n_target_unsup, n_trg_val, n_trg_tst,
-                  load_file="covtype.data", normalize=True):
-    xs, ys = load_covtype_data(load_file)
+                  load_file=None, normalize=True):
+    load_path = covtype_data_file() if load_file is None else load_file
+    xs, ys = load_covtype_data(load_path)
     return make_data(n_src_tr, n_src_val, n_inter, n_target_unsup, n_trg_val, n_trg_tst, xs, ys)
 
 
