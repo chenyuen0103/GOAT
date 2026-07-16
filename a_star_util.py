@@ -2560,7 +2560,7 @@ def inv_via_scaling(S: torch.Tensor, alpha= None):
 
 
 @torch.no_grad()
-def generate_fr_domains_between_optimized(
+def _generate_fr_domains_between_optimized_legacy(
     n_inter: int,
     dataset_s,
     dataset_t,
@@ -2573,6 +2573,9 @@ def generate_fr_domains_between_optimized(
     args=None
 ):
     """
+    Legacy CPU implementation retained for reference. The public
+    ``generate_fr_domains_between_optimized`` implementation is defined below.
+
     Generate intermediate domains along the *true* Fisher–Rao geodesic between
     class-conditional Gaussians:
       Full-cov:  Σ(t) = Σ_s^{1/2} (Σ_s^{-1/2} Σ_t Σ_s^{-1/2})^t Σ_s^{1/2}

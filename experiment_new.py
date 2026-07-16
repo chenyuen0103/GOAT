@@ -1464,23 +1464,42 @@ def run_goat(
     os.makedirs(plot_dir,  exist_ok=True)
 
 
-    # ----- Encode all domains (unchanged functional flow) -----
-    e_src, e_tgt, encoded_intersets = encode_all_domains(
-        src_trainset,
-        tgt_trainset,
-        all_sets,
-        deg_idx,
-        nn.Sequential(
-            source_model.encoder,
-            nn.Flatten(start_dim=1),
-            getattr(source_model, 'compressor', nn.Identity())
-        ),
-        cache_dir,
-        target,
-        # Recompute to avoid using stale caches with mismatched dimensions
-        force_recompute=True,
-        args=args
-    )
+    # ----- Consume prepared encodings without sharing mutable label state -----
+    def _fresh_encoded_view(ds):
+        view = copy.copy(ds)
+        for field in ("targets", "targets_em", "targets_pseudo", "soft_targets_em"):
+            if not hasattr(ds, field):
+                continue
+            value = getattr(ds, field)
+            if torch.is_tensor(value):
+                value = value.detach().clone()
+            elif isinstance(value, np.ndarray):
+                value = value.copy()
+            setattr(view, field, value)
+        # Feature tensors are preparation outputs and are treated as read-only.
+        return view
+
+    prepared = getattr(args, "_prepared_encoded_intersets", None)
+    if prepared is not None and len(prepared) == len(all_sets) + 1:
+        encoded_intersets = [_fresh_encoded_view(ds) for ds in prepared]
+        e_src, e_tgt = encoded_intersets[0], encoded_intersets[-1]
+        print("[run_goat] Reusing prepared encoded features with fresh dataset views.")
+    else:
+        e_src, e_tgt, encoded_intersets = encode_all_domains(
+            src_trainset,
+            tgt_trainset,
+            all_sets,
+            deg_idx,
+            nn.Sequential(
+                source_model.encoder,
+                nn.Flatten(start_dim=1),
+                getattr(source_model, 'compressor', nn.Identity())
+            ),
+            cache_dir,
+            target,
+            force_recompute=False,
+            args=args
+        )
 
     # Ensure encoded domains carry valid labels before any parametric generator call.
     # For non-source domains, prefer EM labels (if valid), then pseudo labels; fail if neither exists.
@@ -1553,7 +1572,7 @@ def run_goat(
                     encoded_intersets[i],
                     encoded_intersets[i + 1],
                     cov_type="full",
-                    save_path=plot_dir,
+                    save_path=None if bool(getattr(args, "no_plots", False)) else plot_dir,
                     args=args,
                 )
             new_domains = out[0]
@@ -1570,6 +1589,9 @@ def run_goat(
             use_labels=getattr(args, "use_labels", False),
             return_stats=True
         )
+
+        if bool(getattr(args, "no_plots", False)):
+            return train_acc_by_domain, test_acc_by_domain, st_acc, st_acc_all, generated_acc
 
         # _save_list(os.path.join(plot_dir, "goat_train_acc_by_domain.json"), train_acc_by_domain)
         # _save_list(os.path.join(plot_dir, "goat_test_acc_by_domain.json"),  test_acc_by_domain)

@@ -112,8 +112,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--em-select", choices=["bic", "cost", "ll"], default="bic")
     parser.add_argument("--em-ensemble", action="store_true")
     parser.add_argument("--em-seeds", nargs="+", type=int, default=[0, 1, 2])
+    parser.add_argument(
+        "--em-seed-mode",
+        choices=["offset", "absolute"],
+        default="offset",
+        help="Offset EM seeds by the experiment seed, or preserve legacy absolute seeds.",
+    )
     parser.add_argument("--em-cov-types", nargs="+", default=["diag"], choices=["diag", "full"])
     parser.add_argument("--em-pca-dims", nargs="+", default=["none"], help="Use integers or 'none'.")
+    parser.add_argument(
+        "--target-step",
+        choices=["train", "eval-only"],
+        default="train",
+        help=(
+            "Whether the real target is also the final self-training domain. "
+            "Use 'eval-only' for an interpolation-geometry ablation."
+        ),
+    )
     parser.add_argument("--ot-solver", choices=["emd", "sinkhorn"], default="emd")
     parser.add_argument("--sinkhorn-reg", type=float, default=1.0)
     parser.add_argument("--force-recompute", action="store_true")
@@ -156,6 +171,37 @@ def parse_pca_dims(values: Sequence[str]) -> List[Optional[int]]:
         else:
             out.append(int(text))
     return out
+
+
+def experiment_config_json(cli: argparse.Namespace) -> str:
+    """Canonical configuration used to distinguish resumable sweep rows."""
+    payload = {
+        "source_n": int(cli.source_n),
+        "target_n": int(cli.target_n),
+        "source_split": str(cli.source_split),
+        "target_split": str(cli.target_split),
+        "small_dim": int(cli.small_dim),
+        "source_epochs": int(cli.source_epochs),
+        "adapt_epochs": int(cli.adapt_epochs),
+        "generated_domains": int(cli.generated_domains),
+        "batch_size": int(cli.batch_size),
+        "lr": float(cli.lr),
+        "ssl_weight": float(cli.ssl_weight),
+        "pseudo_confidence_q": float(cli.pseudo_confidence_q),
+        "em_match": str(cli.em_match),
+        "em_select": str(cli.em_select),
+        "em_ensemble": bool(cli.em_ensemble),
+        "em_seed_offsets": [int(x) for x in cli.em_seeds],
+        "em_seed_mode": str(cli.em_seed_mode),
+        "em_cov_types": [str(x) for x in cli.em_cov_types],
+        "em_pca_dims": parse_pca_dims(cli.em_pca_dims),
+        "ot_solver": str(cli.ot_solver),
+        "sinkhorn_reg": float(cli.sinkhorn_reg),
+        "target_step": str(cli.target_step),
+        "include_cgda_wass": bool(cli.include_cgda_wass),
+        "include_oracle_cgda": bool(cli.include_oracle_cgda),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 def uniform_prior(n_classes: int = N_CLASSES) -> np.ndarray:
@@ -335,6 +381,7 @@ def make_experiment_args(cli: argparse.Namespace, *, seed: int, output_dir: Path
         em_K_list=[N_CLASSES],
         em_cov_types=list(cli.em_cov_types),
         em_seeds=[int(x) for x in cli.em_seeds],
+        em_seed_mode=str(cli.em_seed_mode),
         em_pca_dims=parse_pca_dims(cli.em_pca_dims),
     )
 
@@ -446,7 +493,11 @@ def compute_ot_diagnostic(e_src, e_tgt, *, solver: str, sinkhorn_reg: float) -> 
 
 def fit_target_em_without_labels(exp_args, ref_model, e_src, e_tgt, tgt_trainset):
     if exp_args.em_match == "prototypes":
-        exp_args._cached_source_stats = fit_source_gaussian_params(X=e_src.data, y=e_src.targets)
+        exp_args._cached_source_stats = fit_source_gaussian_params(
+            X=e_src.data,
+            y=e_src.targets,
+            covariance="none",
+        )
     else:
         with torch.no_grad():
             pseudo_labels, _ = get_pseudo_labels(
@@ -468,6 +519,7 @@ def fit_target_em_without_labels(exp_args, ref_model, e_src, e_tgt, tgt_trainset
         reg=1e-4,
         max_iter=300,
         rng_base=int(exp_args.seed),
+        seed_mode=str(exp_args.em_seed_mode),
         args=exp_args,
     )
     bundle = build_em_bundle(em_models, exp_args)
@@ -641,6 +693,7 @@ def run_method_self_train(
     domains: Sequence,
     label_source: str,
     seed: int,
+    train_on_target: bool,
 ) -> Dict[str, object]:
     set_all_seeds(int(seed))
     payload = self_train(
@@ -649,6 +702,7 @@ def run_method_self_train(
         list(domains),
         epochs=int(getattr(exp_args, "adapt_epochs", 5)),
         label_source=label_source,
+        train_on_target=bool(train_on_target),
         return_stats=False,
     )
     direct_acc, final_acc, train_curve, test_curve, last_pred = payload
@@ -746,6 +800,7 @@ def run_one(cli: argparse.Namespace, spec: RunSpec, output_dir: Path) -> Tuple[L
         domains=goat_domains,
         label_source="pseudo",
         seed=spec.seed,
+        train_on_target=(cli.target_step == "train"),
     )
 
     # CGDA-FR: target EM is fit and mapped without target labels.
@@ -758,6 +813,14 @@ def run_one(cli: argparse.Namespace, spec: RunSpec, output_dir: Path) -> Tuple[L
         n_classes=N_CLASSES,
         rarest_class=rarest_class,
     )
+    em_label_metrics = classification_metrics(
+        e_tgt.targets,
+        em_bundle.labels_em,
+        n_classes=N_CLASSES,
+        rarest_class=rarest_class,
+    )
+    em_grid_configs = list((em_bundle.info or {}).get("grid_configs", []))
+    em_rng_seeds = [int(cfg["rng_seed"]) for cfg in em_grid_configs if "rng_seed" in cfg]
 
     cgda_wass_metrics = None
     if bool(cli.include_cgda_wass):
@@ -774,6 +837,7 @@ def run_one(cli: argparse.Namespace, spec: RunSpec, output_dir: Path) -> Tuple[L
             domains=cgda_wass_domains,
             label_source="em",
             seed=spec.seed,
+            train_on_target=(cli.target_step == "train"),
         )
 
     fr_stats_path = output_dir / "domain_stats" / f"{tag}_cgda_fr_stats.npz"
@@ -791,6 +855,7 @@ def run_one(cli: argparse.Namespace, spec: RunSpec, output_dir: Path) -> Tuple[L
         domains=fr_domains,
         label_source="em",
         seed=spec.seed,
+        train_on_target=(cli.target_step == "train"),
     )
 
     oracle_metrics = None
@@ -813,6 +878,7 @@ def run_one(cli: argparse.Namespace, spec: RunSpec, output_dir: Path) -> Tuple[L
             domains=oracle_domains,
             label_source="em",
             seed=spec.seed,
+            train_on_target=(cli.target_step == "train"),
         )
 
     common = {
@@ -823,11 +889,28 @@ def run_one(cli: argparse.Namespace, spec: RunSpec, output_dir: Path) -> Tuple[L
         "seed": int(spec.seed),
         "source_n": int(cli.source_n),
         "target_n": int(cli.target_n),
+        "source_split": str(cli.source_split),
+        "target_split": str(cli.target_split),
         "small_dim": int(cli.small_dim),
         "generated_domains": int(cli.generated_domains),
         "source_epochs": int(cli.source_epochs),
         "adapt_epochs": int(cli.adapt_epochs),
+        "target_step": str(cli.target_step),
         "majority_class": int(spec.majority_class),
+        "experiment_config_json": experiment_config_json(cli),
+        "em_match": str(cli.em_match),
+        "em_select": str(cli.em_select),
+        "em_ensemble": bool(cli.em_ensemble),
+        "em_seed_offsets_json": json.dumps([int(x) for x in cli.em_seeds]),
+        "em_seed_mode": str(cli.em_seed_mode),
+        "em_rng_seeds_json": json.dumps(em_rng_seeds),
+        "em_cov_types_json": json.dumps([str(x) for x in cli.em_cov_types]),
+        "em_pca_dims_json": json.dumps(parse_pca_dims(cli.em_pca_dims)),
+        "em_bundle_info_json": json.dumps(em_bundle.info or {}, sort_keys=True),
+        "em_cluster_to_class_mapping_json": json.dumps(
+            {} if em_bundle.mapping is None else {int(k): int(v) for k, v in em_bundle.mapping.items()},
+            sort_keys=True,
+        ),
         "source_prior_requested": json.dumps(src_prior_requested.tolist()),
         "target_prior_requested": json.dumps(tgt_prior_requested.tolist()),
         "source_counts_json": json.dumps(src_counts.astype(int).tolist()),
@@ -845,6 +928,11 @@ def run_one(cli: argparse.Namespace, spec: RunSpec, output_dir: Path) -> Tuple[L
         "cgda_cluster_accuracy": float(cluster_recovery["accuracy"]),
         "cgda_cluster_per_class_recall": json.dumps(cluster_recovery["per_class_recall"]),
         "cgda_cluster_hungarian_mapping": json.dumps(cluster_recovery["mapping"], sort_keys=True),
+        "cgda_em_label_accuracy": float(em_label_metrics["accuracy"]),
+        "cgda_em_label_balanced_accuracy": float(em_label_metrics["balanced_accuracy"]),
+        "cgda_em_label_balanced_error": float(1.0 - em_label_metrics["balanced_accuracy"]),
+        "cgda_em_label_minority_recall": float(em_label_metrics["minority_recall"]),
+        "cgda_em_label_per_class_recall": json.dumps(em_label_metrics["per_class_recall"]),
     }
 
     method_rows: List[Dict] = []
@@ -1010,6 +1098,10 @@ def already_completed(output_dir: Path, spec: RunSpec, cli: argparse.Namespace) 
     df = pd.read_csv(results_path)
     if df.empty:
         return False
+    if "experiment_config_json" not in df.columns:
+        # Legacy rows do not record enough knobs to resume safely.
+        return False
+    expected_config = experiment_config_json(cli)
     mask = (
         (df["condition"] == spec.condition)
         & (df["source_angle"] == int(spec.source_angle))
@@ -1020,6 +1112,7 @@ def already_completed(output_dir: Path, spec: RunSpec, cli: argparse.Namespace) 
         & (df["source_n"] == int(cli.source_n))
         & (df["target_n"] == int(cli.target_n))
         & (df["small_dim"] == int(cli.small_dim))
+        & (df["experiment_config_json"].astype(str) == expected_config)
     )
     done_methods = set(df.loc[mask, "method"].astype(str))
     expected = {"goat", "cgda_fr"}
@@ -1479,13 +1572,18 @@ def write_summary(output_dir: Path) -> None:
     if df.empty:
         return
     def unique_value(column: str) -> str:
+        def _format(value) -> str:
+            if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, (bool, np.bool_)):
+                numeric = float(value)
+                return str(int(numeric)) if numeric.is_integer() else str(value)
+            return str(value)
+
         vals = sorted(pd.Series(df[column]).dropna().unique().tolist())
         if not vals:
             return "unknown"
         if len(vals) == 1:
-            val = vals[0]
-            return str(int(val)) if float(val).is_integer() else str(val)
-        return ", ".join(str(int(v)) if float(v).is_integer() else str(v) for v in vals)
+            return _format(vals[0])
+        return ", ".join(_format(value) for value in vals)
 
     def mean_at(method: str, condition: str, skew: float, column: str) -> Optional[float]:
         part = df[
@@ -1532,7 +1630,19 @@ def write_summary(output_dir: Path) -> None:
     lines.append(f"- Seeds: {df['seed'].nunique()} (`{unique_value('seed')}`)")
     lines.append(f"- Source/target samples per setting: {unique_value('source_n')} / {unique_value('target_n')}")
     lines.append(f"- Encoder setup: `small_dim={unique_value('small_dim')}`, `source_epochs={unique_value('source_epochs')}`")
-    lines.append(f"- Adaptation setup: `generated_domains={unique_value('generated_domains')}`, `adapt_epochs={unique_value('adapt_epochs')}`")
+    target_step = unique_value("target_step") if "target_step" in df.columns else "legacy-unspecified"
+    lines.append(
+        f"- Adaptation setup: `generated_domains={unique_value('generated_domains')}`, "
+        f"`adapt_epochs={unique_value('adapt_epochs')}`, `target_step={target_step}`"
+    )
+    if "em_match" in df.columns:
+        em_seed_mode = unique_value("em_seed_mode") if "em_seed_mode" in df.columns else "legacy-absolute"
+        lines.append(
+            f"- EM setup: `match={unique_value('em_match')}`, "
+            f"`select={unique_value('em_select')}`, `ensemble={unique_value('em_ensemble')}`, "
+            f"seed mode `{em_seed_mode}`, "
+            f"seed values `{unique_value('em_seed_offsets_json')}`"
+        )
     lines.append(f"- Methods: {methods}")
     lines.append("")
     lines.append("Completed outputs:")
@@ -1712,11 +1822,16 @@ def write_summary(output_dir: Path) -> None:
                     )
         cgda_wass = df[df["method"] == "cgda_wass"].copy()
         combined_wass = cgda_wass[cgda_wass["condition"] == "combined"]
-        if not combined_wass.empty and combined_wass["cgda_class_structure_error"].nunique() > 1:
-            corr = combined_wass["balanced_risk"].corr(combined_wass["cgda_class_structure_error"])
+        em_error_col = (
+            "cgda_em_label_balanced_error"
+            if "cgda_em_label_balanced_error" in combined_wass.columns
+            else "cgda_class_structure_error"
+        )
+        if not combined_wass.empty and combined_wass[em_error_col].nunique() > 1:
+            corr = combined_wass["balanced_risk"].corr(combined_wass[em_error_col])
             lines.append(
                 "For CGDA-Wass in combined shift, balanced risk correlated with shared "
-                f"class-structure error at r={fmt(float(corr))}, so failures should be "
+                f"mapped-EM-label error at r={fmt(float(corr))}, so failures should be "
                 "read through target class-recovery quality rather than a pooled-OT channel."
             )
 
@@ -1753,13 +1868,23 @@ def write_summary(output_dir: Path) -> None:
 
     lines.append("")
     lines.append("## 4. When does CGDA fail?")
-    label_err_0 = mean_at("cgda_fr", "label", 0.0, "cgda_class_structure_error")
-    label_err_hi = mean_at("cgda_fr", "label", 0.9, "cgda_class_structure_error")
-    combined_err_0 = mean_at("cgda_fr", "combined", 0.0, "cgda_class_structure_error")
-    combined_err_hi = mean_at("cgda_fr", "combined", 0.9, "cgda_class_structure_error")
+    em_error_col = (
+        "cgda_em_label_balanced_error"
+        if "cgda_em_label_balanced_error" in df.columns
+        else "cgda_class_structure_error"
+    )
+    em_error_name = (
+        "Mapped-EM-label balanced error"
+        if em_error_col == "cgda_em_label_balanced_error"
+        else "Oracle-aligned cluster error"
+    )
+    label_err_0 = mean_at("cgda_fr", "label", 0.0, em_error_col)
+    label_err_hi = mean_at("cgda_fr", "label", 0.9, em_error_col)
+    combined_err_0 = mean_at("cgda_fr", "combined", 0.0, em_error_col)
+    combined_err_hi = mean_at("cgda_fr", "combined", 0.9, em_error_col)
     lines.append(
         "CGDA-FR fails when the unsupervised target class estimate degrades. "
-        "Class-structure error increased with skew: in label-only shift it rose "
+        f"{em_error_name} increased with skew: in label-only shift it rose "
         f"from {fmt(label_err_0)} at Delta p = 0.00 to {fmt(label_err_hi)} at "
         f"Delta p = {fmt(label_delta_hi, 2)}; in combined shift it rose from "
         f"{fmt(combined_err_0)} to {fmt(combined_err_hi)}."
@@ -1767,14 +1892,26 @@ def write_summary(output_dir: Path) -> None:
 
     cgda = df[df["method"] == "cgda_fr"].copy()
     if not cgda.empty:
-        worst = cgda.sort_values(["cgda_minority_recovery", "cgda_cluster_balanced_accuracy"]).head(1).iloc[0]
+        if "cgda_em_label_minority_recall" in cgda.columns:
+            worst = cgda.sort_values(
+                ["cgda_em_label_minority_recall", "cgda_em_label_balanced_accuracy"]
+            ).head(1).iloc[0]
+            recovery = float(worst["cgda_em_label_minority_recall"])
+            recovery_bacc = float(worst["cgda_em_label_balanced_accuracy"])
+            recovery_name = "mapped EM-label"
+        else:
+            worst = cgda.sort_values(
+                ["cgda_minority_recovery", "cgda_cluster_balanced_accuracy"]
+            ).head(1).iloc[0]
+            recovery = float(worst["cgda_minority_recovery"])
+            recovery_bacc = float(worst["cgda_cluster_balanced_accuracy"])
+            recovery_name = "oracle-aligned cluster"
         lines.append(
-            "The lowest observed target-cluster minority recovery was "
-            f"{worst['cgda_minority_recovery']:.3f} at condition `{worst['condition']}`, "
+            f"The lowest observed {recovery_name} minority recovery was "
+            f"{recovery:.3f} at condition `{worst['condition']}`, "
             f"target angle {int(worst['target_angle'])}, skew {worst['skew']}, "
-            f"seed {int(worst['seed'])}. That run had cluster balanced accuracy "
-            f"{worst['cgda_cluster_balanced_accuracy']:.3f} and class-structure "
-            f"error {worst['cgda_class_structure_error']:.3f}."
+            f"seed {int(worst['seed'])}. That run had mapped-label balanced accuracy "
+            f"{recovery_bacc:.3f}."
         )
     else:
         lines.append("No CGDA-FR rows were available to diagnose target class-estimation failures.")

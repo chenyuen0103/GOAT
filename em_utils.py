@@ -4,6 +4,7 @@ from typing import Dict, Any, Optional, List, Tuple, Union
 import math
 import numpy as np
 import torch
+import weakref
 from torch.utils.data import Dataset
 from sklearn.mixture import GaussianMixture
 from scipy.optimize import linear_sum_assignment
@@ -176,6 +177,8 @@ def build_em_bundle(em_models, args):
                 "weights": [float(wi) for wi in w.tolist()],
                 "bics": [float(m["bic"]) for m in trimmed],
                 "anchor_idx": anchor_idx,
+                "anchor_cfg": dict(anchor["cfg"]),
+                "grid_configs": [dict(m["cfg"]) for m in em_models],
             },
         )
 
@@ -186,7 +189,14 @@ def build_em_bundle(em_models, args):
         mapping=best.get("mapping", None),
         labels_em=np.asarray(best["labels_mapped"], dtype=int),
         P_soft=np.asarray(best["mapped_soft"], dtype=float),
-        info={"criterion": args.em_select, "bic": float(best["bic"]), "ll": float(best["final_ll"]), "cost": float(best.get("cost", math.nan))},
+        info={
+            "criterion": args.em_select,
+            "bic": float(best["bic"]),
+            "ll": float(best["final_ll"]),
+            "cost": float(best.get("cost", math.nan)),
+            "selected_cfg": dict(best["cfg"]),
+            "grid_configs": [dict(m["cfg"]) for m in em_models],
+        },
     )
 
 
@@ -549,10 +559,17 @@ def fit_many_em_on_target(
     reg: float = 1e-4,
     max_iter: int = 300,
     rng_base: int = 0,
+    seed_mode: str = "offset",
+    map_results: bool = True,
     args=None,
 ) -> List[Dict]:
     """
     Run a grid of EM configurations on encoded target embeddings.
+
+    In ``seed_mode='offset'``, ``seeds`` are deterministic offsets from
+    ``rng_base``.  ``seed_mode='absolute'`` preserves the legacy behavior in
+    which the listed seeds are used directly.  Both the configured and
+    effective RNG seeds are retained in each configuration record.
     Returns a list of dicts (one per config):
       {
         'cfg': {'K', 'cov_type', 'pca_dim', 'seed},
@@ -578,21 +595,12 @@ def fit_many_em_on_target(
         K_default = 10
     K_for_classes = max([K_default] + [int(k) for k in (K_list or [])]) if K_list else K_default
 
-    # Mapping prerequisites
-    use_proto = (getattr(args, "em_match", "pseudo") == "prototypes")
-    if use_proto and not hasattr(args, "_cached_source_stats"):
-        raise RuntimeError("Prototype mapping requested but args._cached_source_stats is missing.")
-    if (not use_proto) and not hasattr(args, "_cached_pseudolabels"):
-        raise RuntimeError("Pseudo mapping requested but args._cached_pseudolabels is missing.")
-    # no interactive breakpoints in library code
-    mu_s = Sigma_s = priors_s = None
-    if use_proto:
-        mu_s, Sigma_s, priors_s = args._cached_source_stats
-
     Ks        = [int(k) for k in (K_list if K_list else [K_default])]
     Covs      = [str(c) for c in cov_types]
     Pcas      = [None if (p in [None, 0]) else int(p) for p in pca_dims]
     Seeds     = [int(s) for s in seeds]
+    if seed_mode not in {"offset", "absolute"}:
+        raise ValueError("seed_mode must be one of {'offset', 'absolute'}")
     total_cfg = len(Ks) * len(Covs) * len(Pcas) * len(Seeds)
 
     # >>> NEW: compute & print total GMM count at the start
@@ -607,7 +615,16 @@ def fit_many_em_on_target(
         for cov_type in Covs:
             for pca_dim in Pcas:
                 for seed in Seeds:
-                    cfg = dict(K=K, cov_type=cov_type, pca_dim=pca_dim, seed=seed)
+                    rng_seed = int(seed) if seed_mode == "absolute" else int(rng_base) + int(seed)
+                    cfg = dict(
+                        K=K,
+                        cov_type=cov_type,
+                        pca_dim=pca_dim,
+                        seed=seed,
+                        rng_base=int(rng_base),
+                        rng_seed=rng_seed,
+                        seed_mode=seed_mode,
+                    )
                     # Update caption (safe for no-op tqdm)
                     try:
                         bar.set_postfix_str(f"K={K}, cov={cov_type}, pca={pca_dim}, seed={seed}")
@@ -627,7 +644,7 @@ def fit_many_em_on_target(
                         return_transforms=True,
                         verbose=False,                 # avoid clashing prints with tqdm
                         subsample_init=N,
-                        rng=seed if seed is not None else rng_base,
+                        rng=rng_seed,
                         # Optional: if your EM supports per-iteration tqdm via a hook, wire it:
                         # show_iter_progress=getattr(args, "em_show_iter_progress", False),
                     )
@@ -647,41 +664,11 @@ def fit_many_em_on_target(
                     n_params = _count_gmm_params(K, D_eff, cov_type)
                     bic_val  = _bic(final_ll if final_ll is not None and not math.isnan(final_ll) else -1e12,
                                     n_params, n_samples)
-                    # breakpoint()
-                    # ---- Map clusters -> classes ----
-                    if use_proto:
-                        mapping, labels_mapped, cost_obj = map_em_clusters(
-                            em_res, method="prototypes", n_classes=K_for_classes,
-                            mus_s=mu_s, Sigma_s=Sigma_s, priors_s=priors_s
-                        )
-                        cost = _scalarize_mapping_cost(cost_obj, mode="prototypes")
-                    else:
-                        mapping, labels_mapped, cost_obj = map_em_clusters(
-                            em_res, method="pseudo", n_classes=K_for_classes,
-                            pseudo_labels=args._cached_pseudolabels, metric='FR'
-                        )
-                        cost = _scalarize_mapping_cost(cost_obj, mode="pseudo")
-
-                    gamma = np.asarray(em_res["gamma"])      # (N x K_clusters)
-                    mapped_soft = _map_cluster_posts_to_classes(gamma, mapping, K=K_for_classes)
-
-                
-                    if isinstance(cost, dict):
-                        cost_scalar = float(np.nansum(list(cost.values())))
-                    else:
-                        cost_scalar = float(np.nansum(np.asarray(cost, dtype=float)))
-
-
                     results.append(dict(
                         cfg=cfg,
                         em_res=em_res,
                         final_ll=(float(final_ll) if final_ll is not None else float("nan")),
                         bic=float(bic_val),
-                        cost=float(cost_scalar),              # <-- scalar, comparable across runs
-                        cost_matrix=np.asarray(cost_obj),     # <-- keep matrix for diagnostics
-                        mapped_soft=mapped_soft,
-                        labels_mapped=np.asarray(labels_mapped, dtype=int),
-                        mapping=mapping,
                     ))
 
                     # advance the grid bar
@@ -695,7 +682,111 @@ def fit_many_em_on_target(
     except Exception:
         pass
 
-    return results
+    if not map_results:
+        return results
+    return map_em_models_to_classes(results, args=args, n_classes=K_for_classes)
+
+
+def map_em_models_to_classes(
+    raw_models: List[Dict],
+    *,
+    args,
+    n_classes: int,
+) -> List[Dict]:
+    """Map immutable raw EM fits for one requested cluster-labeling scheme.
+
+    The returned dictionaries are new objects. ``raw_models`` can therefore be
+    loaded from a shared prepared artifact and safely reused by isolated workers
+    using different mapping schemes.
+    """
+
+    method = str(getattr(args, "em_match", "pseudo"))
+    use_proto = method == "prototypes"
+    if use_proto and not hasattr(args, "_cached_source_stats"):
+        raise RuntimeError("Prototype mapping requested but args._cached_source_stats is missing.")
+    if not use_proto and not hasattr(args, "_cached_pseudolabels"):
+        raise RuntimeError("Pseudo mapping requested but args._cached_pseudolabels is missing.")
+
+    mu_s = Sigma_s = priors_s = None
+    if use_proto:
+        mu_s, Sigma_s, priors_s = args._cached_source_stats
+
+    mapped_models: List[Dict] = []
+    for raw in raw_models:
+        em_res = raw["em_res"]
+        if use_proto:
+            mapping, labels_mapped, cost_obj = map_em_clusters(
+                em_res,
+                method="prototypes",
+                n_classes=int(n_classes),
+                mus_s=mu_s,
+                Sigma_s=Sigma_s,
+                priors_s=priors_s,
+            )
+            cost = _scalarize_mapping_cost(cost_obj, mode="prototypes")
+        else:
+            mapping, labels_mapped, cost_obj = map_em_clusters(
+                em_res,
+                method="pseudo",
+                n_classes=int(n_classes),
+                pseudo_labels=args._cached_pseudolabels,
+                metric="FR",
+            )
+            cost = _scalarize_mapping_cost(cost_obj, mode="pseudo")
+
+        gamma = np.asarray(em_res["gamma"])
+        mapped_soft = _map_cluster_posts_to_classes(
+            gamma, mapping, K=int(n_classes)
+        )
+        cost_scalar = float(np.nansum(np.asarray(cost, dtype=float)))
+        mapped_models.append(
+            {
+                **raw,
+                "cost": cost_scalar,
+                "cost_matrix": np.asarray(cost_obj),
+                "mapped_soft": mapped_soft,
+                "labels_mapped": np.asarray(labels_mapped, dtype=int),
+                "mapping": dict(mapping),
+            }
+        )
+    return mapped_models
+
+
+def compact_raw_em_models_for_artifact(raw_models: List[Dict]) -> List[Dict]:
+    """Drop reproducible working arrays and compact diagonal covariances.
+
+    ``X`` is the standardized input and can dominate the serialized artifact.
+    It is not needed after BIC/LL have been computed. Diagonal EM covariance
+    matrices are stored as vectors; all mapping helpers already accept that form.
+    """
+
+    compact: List[Dict] = []
+    for raw in raw_models:
+        cfg = dict(raw["cfg"])
+        em_res = dict(raw["em_res"])
+        em_res.pop("X", None)
+        em_res.pop("scaler", None)
+        em_res.pop("pca", None)
+        if str(cfg.get("cov_type", "")).lower() == "diag":
+            sigmas = em_res.get("Sigma")
+            if isinstance(sigmas, dict):
+                em_res["Sigma"] = {
+                    int(key): (
+                        np.diag(np.asarray(value)).copy()
+                        if np.asarray(value).ndim == 2
+                        else np.asarray(value).copy()
+                    )
+                    for key, value in sigmas.items()
+                }
+        compact.append(
+            {
+                "cfg": cfg,
+                "em_res": em_res,
+                "final_ll": float(raw["final_ll"]),
+                "bic": float(raw["bic"]),
+            }
+        )
+    return compact
 
 def score_em_by_cost(cost_matrix, cluster_sizes=None, class_priors=None, tau=1.0):
     C = np.asarray(cost_matrix, dtype=float)  # shape (Kc, K)
@@ -804,6 +895,11 @@ def select_best_em(results: List[Dict], criterion: str = "bic") -> Dict:
 
 
 _EM_CACHE = {}
+
+
+def clear_em_representation_cache() -> None:
+    """Clear prepared EM features held by the process-local cache."""
+    _EM_CACHE.clear()
 
 def run_em_on_encoded(
     enc_ds,
@@ -1052,23 +1148,47 @@ def prepare_em_representation(
     """
     Produces standardized (and optionally PCA-compressed) features for EM.
     Ensures C-contiguous float32 by default (fast BLAS).
-    Caching is now *per-enc_ds* to avoid mixing domains.
+    Implicit caching is tied to the lifetime of the exact ``enc_ds`` object.
+    This matters because CPython may recycle ``id(enc_ds)`` after a temporary
+    encoded view is released.  A bare object-id key can therefore return
+    features from an earlier domain in a long-running sweep.
     """
 
-    # Make cache key depend on the specific encoded dataset object
-    # so angle 22 and angle 45 do NOT share the same entry.
-    if cache_key is None:
+    explicit_cache_key = cache_key is not None
+    owner_ref = None
+    if not explicit_cache_key:
         cache_key = (
             f"id={id(enc_ds)}|"
             f"{pool}|pca={int(do_pca)}|dim={pca_dim}|dtype={dtype}"
         )
 
+        # A weak owner reference validates identity without keeping temporary
+        # dataset wrappers alive.  Its callback also bounds cache growth.
+        try:
+            def _drop_stale_entry(ref, *, key=cache_key):
+                cached = _EM_CACHE.get(key)
+                if cached is not None and cached.get("owner_ref") is ref:
+                    _EM_CACHE.pop(key, None)
+
+            owner_ref = weakref.ref(enc_ds, _drop_stale_entry)
+        except TypeError:
+            # If an unusual dataset object cannot be weak-referenced, implicit
+            # caching is unsafe. Callers can still supply an explicit stable key.
+            cache_key = None
+
     # Try cache
-    if cache_key in _EM_CACHE:
+    cached = _EM_CACHE.get(cache_key) if cache_key is not None else None
+    if cached is not None:
+        if not explicit_cache_key:
+            cached_owner = cached.get("owner_ref")
+            if cached_owner is None or cached_owner() is not enc_ds:
+                _EM_CACHE.pop(cache_key, None)
+                cached = None
+
+    if cached is not None:
         if verbose:
             print(f"[prep] cache hit for key={cache_key}")
-        c = _EM_CACHE[cache_key]
-        return c["X_std"], c["scaler"], c["pca"], cache_key
+        return cached["X_std"], cached["scaler"], cached["pca"], cache_key
 
     # --- Compute features from scratch ---
     X = to_features_from_encoded(enc_ds, pool=pool)  # expected (N,D)
@@ -1097,9 +1217,15 @@ def prepare_em_representation(
         if verbose:
             print(f"[prep] PCA -> {X.shape}")
 
-    if verbose:
-        print(f"[prep] caching key={cache_key}")
-    _EM_CACHE[cache_key] = {"X_std": X, "scaler": scaler, "pca": _pca}
+    if cache_key is not None:
+        if verbose:
+            print(f"[prep] caching key={cache_key}")
+        _EM_CACHE[cache_key] = {
+            "X_std": X,
+            "scaler": scaler,
+            "pca": _pca,
+            "owner_ref": owner_ref,
+        }
     return X, scaler, _pca, cache_key
 
 def _make_inits(X_init, K: int, cov_type: str, n_init: int, reg: float, rng):
@@ -1701,6 +1827,13 @@ def _match_by_prototypes_metric(mu_clusters_in,
     C, d2 = mus_s.shape
     assert d == d2, f"d mismatch: {d} vs {d2}"
 
+    m = metric.lower()
+    if m == "euclidean":
+        D = ((mu_clusters[:, None, :] - mus_s[None, :, :]) ** 2).sum(axis=2)
+        r, c = linear_sum_assignment(D)
+        mapping = {int(cluster_keys[i]): int(class_keys[j]) for i, j in zip(r, c)}
+        return mapping, D
+
     # Covariances (allow None => identity)
     Sigma_clusters, kindA = _stack_sigmas(Sigma_clusters_in)   # (K,d) or (K,d,d) or None
     Sigma_s,       kindB  = _stack_sigmas(Sigma_s_in)
@@ -1731,8 +1864,6 @@ def _match_by_prototypes_metric(mu_clusters_in,
         return Sig_k, Sig_c
 
     D = np.zeros((K, C), dtype=float)
-    m = metric.lower()
-
     for i in range(K):
         mu_k = mu_clusters[i]
         for j in range(C):
@@ -1884,7 +2015,15 @@ def map_em_clusters(
     # cost_obj = distance matrix D (for later scalarization by caller)
     return mapping_dict, labels_mapped, D
 
-def fit_source_gaussian_params(X, y, pool: str = "gap"):
+def fit_source_gaussian_params(
+    X,
+    y,
+    pool: str = "gap",
+    *,
+    covariance: str = "full",
+):
+    if covariance not in {"full", "none"}:
+        raise ValueError("covariance must be one of {'full', 'none'}")
     y = np.asarray(y, dtype=int)
     if pool == "gap":
         X = _pool_features(X, pool=pool)
@@ -1892,21 +2031,24 @@ def fit_source_gaussian_params(X, y, pool: str = "gap"):
         X = X.reshape(X.shape[0], -1)
     classes = np.unique(y)
     d = X.shape[1]
-    mus, priors, Sigma_s = {}, {}, {}
+    mus, priors = {}, {}
+    Sigma_s = {} if covariance == "full" else None
     for c in classes:
         Xc = X[y == c]
         if len(Xc) == 0:
             # fallback: zeros with small ridge to avoid singulars
             mus[c] = np.zeros(d, dtype=float)
-            Sigma_s[c] = np.eye(d, dtype=float)
+            if Sigma_s is not None:
+                Sigma_s[c] = np.eye(d, dtype=float)
             priors[c] = 0.0
         else:
             mu_c = Xc.mean(axis=0)
-            Z = Xc - mu_c
-            # unbiased sample covariance + ridge
-            S = (Z.T @ Z) / max(len(Xc) - 1, 1) + 1e-6 * np.eye(d)
             mus[c] = mu_c
-            Sigma_s[c] = S
+            if Sigma_s is not None:
+                Z = Xc - mu_c
+                # unbiased sample covariance + ridge
+                S = (Z.T @ Z) / max(len(Xc) - 1, 1) + 1e-6 * np.eye(d)
+                Sigma_s[c] = S
             priors[c] = float(len(Xc)) / float(len(X))
     return mus, Sigma_s, priors
 

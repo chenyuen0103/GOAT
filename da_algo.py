@@ -660,6 +660,7 @@ def self_train(args,
     label_source: str = "pseudo",
     use_labels: bool = False,
     *,
+    train_on_target: bool = True,
     return_stats: bool = False,
     cov_type: str = "diag",   # "diag" | "full"
     reg: float = 1e-6,
@@ -668,13 +669,17 @@ def self_train(args,
     if label_source not in {"pseudo", "em", "soft_em"}:
         raise ValueError("label_source must be one of {'pseudo','em','soft_em'}")
 
-    steps = len(datasets)
+    # The final dataset is always the evaluation target.  Historically it was
+    # also always a training step, which makes geometry ablations difficult to
+    # interpret.  Keep that behavior by default, but allow an eval-only target.
+    steps = len(datasets) if train_on_target else max(0, len(datasets) - 1)
     teacher = copy.deepcopy(source_model).to(device)
     targetset = datasets[-1]
 
     targetloader = DataLoader(targetset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     print("------------Direct adapt performance----------")
-    _, direct_acc = test(targetloader, teacher)
+    _, direct_acc, y_pred, y_true = test(targetloader, teacher, return_preds=True)
+    st_acc = direct_acc
     train_acc_by_domain = []
     test_acc_by_domain = [direct_acc]
 

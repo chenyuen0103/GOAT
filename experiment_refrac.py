@@ -50,6 +50,15 @@ from experiment_new import (
     set_all_seeds,
 )
 from a_star_util import *
+from em_utils import (
+    compact_raw_em_models_for_artifact,
+    map_em_models_to_classes,
+)
+from goat.core.prepared_artifacts import (
+    PreparedArtifactStore,
+    fingerprint_encoded_dataset,
+    metadata_fingerprint,
+)
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -127,11 +136,19 @@ def _encoded_cache_dir(args, *, target: Optional[int] = None) -> str:
     mismatch encoded sample order/labels and shift initial test points.
     """
     dataset = getattr(args, "dataset", None)
+    model_token = str(getattr(args, "_encoder_cache_token", "unversioned"))
     if dataset == "mnist":
         if target is None:
             raise ValueError("target must be provided for mnist cache path.")
-        return f"cache{args.ssl_weight}/target{target}/small_dim{args.small_dim}/"
-    return f"{dataset}/cache{args.ssl_weight}/{_seed_tag(args)}/small_dim{args.small_dim}/"
+        return (
+            f"cache{args.ssl_weight}/target{target}/prepared_v1/{model_token}/"
+            f"small_dim{args.small_dim}/"
+        )
+    gt_tag = f"gt{int(getattr(args, 'gt_domains', 0))}"
+    return (
+        f"{dataset}/cache{args.ssl_weight}/{_seed_tag(args)}/prepared_v1/"
+        f"{model_token}/{gt_tag}/small_dim{args.small_dim}/"
+    )
 
 
 def _snapshot_target_em_labels(args, target_ds) -> None:
@@ -338,6 +355,17 @@ def build_reference_model(
         in_dim=config.in_dim,
         out_dim=config.out_dim,
     )
+    checkpoint_path = os.path.abspath(config.model_path)
+    try:
+        stat = os.stat(checkpoint_path)
+        checkpoint_identity = {
+            "path": checkpoint_path,
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+    except OSError:
+        checkpoint_identity = {"path": checkpoint_path, "missing": True}
+    args._encoder_cache_token = metadata_fingerprint(checkpoint_identity)[:16]
     ref_encoder = nn.Sequential(
         model.encoder,
         nn.Flatten(start_dim=1),
@@ -409,6 +437,11 @@ def encode_real_domains(
     e_src = _normalize_dataset_targets(e_src)
     e_tgt = _normalize_dataset_targets(e_tgt)
     encoded_intersets = [_normalize_dataset_targets(ds) for ds in encoded_intersets]
+    # Read-only preparation boundary. Consumers must clone dataset wrappers and
+    # label fields before mutation; feature tensors may be shared.
+    args._prepared_e_src = e_src
+    args._prepared_e_tgt = e_tgt
+    args._prepared_encoded_intersets = tuple(encoded_intersets)
     return e_src, e_tgt, encoded_intersets
 
 
@@ -430,13 +463,54 @@ def attach_shared_pca(args, encoded_intersets, *, seed: Optional[int] = None):
 def maybe_cache_source_stats(args, encoded_src):
     """Store source Gaussian stats once if prototype matching is requested."""
 
-    if getattr(args, "em_match", "pseudo") != "prototypes":
-        return None
-    mu_s, Sigma_s, priors_s = fit_source_gaussian_params(
-        X=encoded_src.data,
-        y=encoded_src.targets,
+    needs_prototypes = (
+        getattr(args, "em_match", "pseudo") == "prototypes"
+        or bool(getattr(args, "prepare_only", False))
     )
-    args._cached_source_stats = (mu_s, Sigma_s, priors_s)
+    if not needs_prototypes:
+        return None
+
+    prepared_root = str(getattr(args, "prepared_artifact_root", "") or "").strip()
+    if prepared_root:
+        metadata = {
+            "artifact": "source-prototypes",
+            "dataset": str(getattr(args, "dataset", "unknown")),
+            "seed": int(getattr(args, "seed", 0)),
+            "gt_domains": int(getattr(args, "gt_domains", 0)),
+            "feature_sha256": fingerprint_encoded_dataset(
+                encoded_src, label_fields=("targets",)
+            ),
+            "pool": "gap",
+            "covariance": "none",
+        }
+        store = PreparedArtifactStore(prepared_root)
+        artifact_key = store.key(metadata)
+        with store.lock("source_prototypes", artifact_key):
+            source_stats = store.load(
+                "source_prototypes",
+                metadata,
+                required=(
+                    bool(getattr(args, "require_prepared_artifacts", False))
+                    and not bool(getattr(args, "prepare_only", False))
+                ),
+            )
+            if source_stats is None:
+                source_stats = fit_source_gaussian_params(
+                    X=encoded_src.data,
+                    y=encoded_src.targets,
+                    covariance="none",
+                )
+                path = store.save("source_prototypes", metadata, source_stats)
+                print(f"[EM] Saved prepared source prototypes: {path}")
+            else:
+                print(f"[EM] Loaded prepared source prototypes: {artifact_key}")
+    else:
+        source_stats = fit_source_gaussian_params(
+            X=encoded_src.data,
+            y=encoded_src.targets,
+            covariance="none",
+        )
+    args._cached_source_stats = source_stats
     return args._cached_source_stats
 
 
@@ -463,25 +537,73 @@ def fit_em_bundle_for_dataset(
     cov_types: Optional[Sequence[str]] = None,
     seeds: Optional[Sequence[int]] = None,
 ):
-    """Fit many EMs on ``encoded_dataset`` and cache the selected bundle."""
+    """Fit or load raw EMs, then apply the worker-local mapping scheme."""
 
     k_list = getattr(args, "em_K_list", [n_classes])
     cov_types = cov_types or getattr(args, "em_cov_types", ["diag"])
     seeds = seeds or getattr(args, "em_seeds", [0, 1, 2])
     pca_dims = getattr(args, "em_pca_dims", [None])
 
-    print(f"[EM] Fitting bundles for {description} ...")
-    em_models = fit_many_em_on_target(
-        encoded_dataset,
-        K_list=k_list,
-        cov_types=cov_types,
-        seeds=seeds,
-        pool="gap",
-        pca_dims=pca_dims,
-        reg=1e-4,
-        max_iter=300,
-        rng_base=getattr(args, "seed", 0),
+    def _fit_raw_models():
+        fitted = fit_many_em_on_target(
+            encoded_dataset,
+            K_list=k_list,
+            cov_types=cov_types,
+            seeds=seeds,
+            pool="gap",
+            pca_dims=pca_dims,
+            reg=1e-4,
+            max_iter=300,
+            rng_base=getattr(args, "seed", 0),
+            seed_mode=getattr(args, "em_seed_mode", "offset"),
+            map_results=False,
+            args=args,
+        )
+        return compact_raw_em_models_for_artifact(fitted)
+
+    prepared_root = str(getattr(args, "prepared_artifact_root", "") or "").strip()
+    if prepared_root:
+        metadata = {
+            "artifact": "raw-em-grid",
+            "dataset": str(getattr(args, "dataset", "unknown")),
+            "seed": int(getattr(args, "seed", 0)),
+            "gt_domains": int(getattr(args, "gt_domains", 0)),
+            "domain": str(description),
+            "feature_sha256": fingerprint_encoded_dataset(encoded_dataset),
+            "n_classes": int(n_classes),
+            "K_list": [int(value) for value in k_list],
+            "cov_types": [str(value) for value in cov_types],
+            "seeds": [int(value) for value in seeds],
+            "pca_dims": [None if value in (None, 0) else int(value) for value in pca_dims],
+            "rng_base": int(getattr(args, "seed", 0)),
+            "seed_mode": str(getattr(args, "em_seed_mode", "offset")),
+            "pool": "gap",
+            "reg": 1e-4,
+            "max_iter": 300,
+        }
+        store = PreparedArtifactStore(prepared_root)
+        artifact_key = store.key(metadata)
+        with store.lock("raw_em", artifact_key):
+            raw_models = store.load(
+                "raw_em",
+                metadata,
+                required=bool(getattr(args, "require_prepared_artifacts", False)),
+            )
+            if raw_models is None:
+                print(f"[EM] Preparing immutable raw EM artifact for {description} ...")
+                raw_models = _fit_raw_models()
+                path = store.save("raw_em", metadata, raw_models)
+                print(f"[EM] Saved prepared raw EM artifact: {path}")
+            else:
+                print(f"[EM] Loaded prepared raw EM artifact for {description}: {artifact_key}")
+    else:
+        print(f"[EM] Fitting raw models for {description} ...")
+        raw_models = _fit_raw_models()
+
+    em_models = map_em_models_to_classes(
+        raw_models,
         args=args,
+        n_classes=int(n_classes),
     )
     rows = print_em_model_accuracies(em_models, raw_dataset.targets)
     rows = [{**r, "original_idx": i} for i, r in enumerate(rows)]
@@ -640,35 +762,38 @@ def run_core_methods(
     # ---------------- GOAT / GOAT-Classwise ----------------
     # Only meaningful (and only safe) when we actually generate synthetic domains
     if generated_domains > 0:
-        for goat_method in goat_methods:
-            _apply_canonical_target_em(args, tgt_trainset, all_sets=all_sets)
-            _assert_target_em_is_canonical(args, target_ds=tgt_trainset)
-            _assert_target_em_alignment(
-                args,
-                context=f"run_core_methods/pre-goat-{goat_method}",
-                target_ds=tgt_trainset,
-                all_sets=all_sets,
-            )
-            set_all_seeds(args.seed)
-            start = time.time()
-            goat_src = _clone()
-            goat_cp = copy.deepcopy(goat_src)
-            payload = run_goat(
-                goat_cp,
-                goat_src,
-                src_trainset,
-                tgt_trainset,
-                all_sets,
-                deg_idx,
-                generated_domains,
-                epochs=5,
-                target=target_label,
-                args=args,
-                gen_method=goat_method,
-            )
-            key = "goat" if goat_method == "w2" else f"goat_{goat_method}"
-            name = "GOAT" if goat_method == "w2" else f"GOAT-{goat_method.upper()}"
-            results[key] = _wrap_result(name, payload, time.time() - start, has_em=False)
+        if not bool(getattr(args, "skip_pooled_goat", False)):
+            for goat_method in goat_methods:
+                _apply_canonical_target_em(args, tgt_trainset, all_sets=all_sets)
+                _assert_target_em_is_canonical(args, target_ds=tgt_trainset)
+                _assert_target_em_alignment(
+                    args,
+                    context=f"run_core_methods/pre-goat-{goat_method}",
+                    target_ds=tgt_trainset,
+                    all_sets=all_sets,
+                )
+                set_all_seeds(args.seed)
+                start = time.time()
+                goat_src = _clone()
+                goat_cp = copy.deepcopy(goat_src)
+                payload = run_goat(
+                    goat_cp,
+                    goat_src,
+                    src_trainset,
+                    tgt_trainset,
+                    all_sets,
+                    deg_idx,
+                    generated_domains,
+                    epochs=5,
+                    target=target_label,
+                    args=args,
+                    gen_method=goat_method,
+                )
+                key = "goat" if goat_method == "w2" else f"goat_{goat_method}"
+                name = "GOAT" if goat_method == "w2" else f"GOAT-{goat_method.upper()}"
+                results[key] = _wrap_result(name, payload, time.time() - start, has_em=False)
+        else:
+            print("[run_core_methods] Skipping mapping-invariant pooled GOAT in this worker.")
 
         # GOAT-Classwise
         _apply_canonical_target_em(args, tgt_trainset, all_sets=all_sets)
@@ -862,20 +987,9 @@ def run_goat_classwise(
         encoded_intersets = cached_setup["encoded_intersets"]
         pseudolabels      = cached_setup["pseudolabels"]
 
-        # Keep GOAT-CW startup behavior aligned with GOAT / run_main_algo_cached:
-        # warm the current source_model on the real-domain chain before synthetic ST.
-        # Without this, cached mode starts synthetic ST from a colder model state and
-        # shifts the first test point ("gen 0") relative to other methods.
-        set_all_seeds(args.seed)
-        _direct_acc_all_fresh, st_acc_all_fresh, _train_acc_list_all_fresh, _test_acc_list_all_fresh, _ = self_train(
-            args,
-            source_model,
-            all_sets,
-            epochs=epochs,
-            label_source="pseudo",
-        )
-        direct_acc_all = _direct_acc_all_fresh
-        st_acc_all = st_acc_all_fresh
+        # ``self_train`` deep-copies its input model and does not return the
+        # adapted model. Re-running it here used to discard the trained copy and
+        # only reproduce metrics already present in ``cached_setup``.
     else:
         # 1) Baselines
         set_all_seeds(args.seed)
@@ -1418,7 +1532,7 @@ def run_main_algo_cached(
             encoded_intersets[i],
             encoded_intersets[i + 1],
             cov_type="full",
-            save_path=plot_dir,
+            save_path=None if bool(getattr(args, "no_plots", False)) else plot_dir,
             args=args,
         )
         pair_domains = out[0]
@@ -1439,6 +1553,16 @@ def run_main_algo_cached(
     )
 
     # 12) Plots
+    if bool(getattr(args, "no_plots", False)):
+        return (
+            train_acc_by_domain,
+            test_acc_by_domain,
+            st_acc,
+            st_acc_all,
+            generated_acc,
+            acc_em_pseudo,
+        )
+
     plot_pca_classes_grid(
         encoded_intersets,
         classes=(3, 6, 8, 9) if "mnist" in args.dataset else (0, 1),
@@ -1721,6 +1845,12 @@ def _plot_series_with_baselines(
         plt.savefig(save_path, dpi=150)
         print(f"[MNIST-EXP] Saved {save_path}")
     plt.close()
+
+
+def _plot_results_if_enabled(args, **kwargs) -> None:
+    if bool(getattr(args, "no_plots", False)):
+        return
+    _plot_series_with_baselines(**kwargs)
 
 def _last_as_float(curve):
     """Take a curve (list/np/torch/scalar) and return its last value as float."""
@@ -2046,8 +2176,6 @@ def run_mnist_experiment(target: int, gt_domains: int, generated_domains: int, a
     src_trainset = get_single_rotate(False, 0)
     tgt_trainset = get_single_rotate(False, target)
     all_sets, deg_idx = _build_rotated_domains(tgt_trainset, target, gt_domains)
-    cache_dir = _encoded_cache_dir(args, target=target)
-
     # ------------ reference model ------------
     model_cfg = ModelConfig(
         encoder_builder=ENCODER,
@@ -2066,6 +2194,7 @@ def run_mnist_experiment(target: int, gt_domains: int, generated_domains: int, a
     ref_model, ref_encoder = build_reference_model(
         args, model_cfg, src_trainset, tgt_trainset
     )
+    cache_dir = _encoded_cache_dir(args, target=target)
 
     # ------------ encode real domains ------------
     e_src, e_tgt, encoded_intersets = encode_real_domains(
@@ -2079,25 +2208,22 @@ def run_mnist_experiment(target: int, gt_domains: int, generated_domains: int, a
         target_label=target,
     )
 
-    shared_pca = fit_global_pca(
-        domains=encoded_intersets,
-        classes=None,
-        pool="auto",
-        n_components=2,
-        per_domain_cap=10000,
-        random_state=args.seed if hasattr(args, "seed") else 0,
-    )
-    args.shared_pca = shared_pca
-
-    # Optional: cache source Gaussian params for prototype matching
-    if getattr(args, "em_match", "pseudo") == "prototypes":
-        mu_s, Sigma_s, priors_s = fit_source_gaussian_params(
-            X=e_src.data, y=e_src.targets
+    if not bool(getattr(args, "no_plots", False)):
+        args.shared_pca = fit_global_pca(
+            domains=encoded_intersets,
+            classes=None,
+            pool="auto",
+            n_components=2,
+            per_domain_cap=10000,
+            random_state=args.seed if hasattr(args, "seed") else 0,
         )
-        args._cached_source_stats = (mu_s, Sigma_s, priors_s)
+    else:
+        args.shared_pca = None
+
+    maybe_cache_source_stats(args, e_src)
 
     # ------------ EM on each real domain (only if we will actually use it) ------------
-    if generated_domains > 0:
+    if generated_domains > 0 or bool(getattr(args, "prepare_only", False)):
         with torch.no_grad():
             teacher = copy.deepcopy(ref_model).to(device).eval()
 
@@ -2128,6 +2254,10 @@ def run_mnist_experiment(target: int, gt_domains: int, generated_domains: int, a
     else:
         # No EM fitting in the GST / gen=0 case
         em_acc_target = float("nan")
+
+    if bool(getattr(args, "prepare_only", False)):
+        print("[prepare] MNIST encoded features and raw EM artifacts are ready.")
+        return {}
 
     # ------------ run main methods (ours_fr, ours_eta, GOAT, GOAT-CW) ------------
     results = run_core_methods(
@@ -2160,7 +2290,8 @@ def run_mnist_experiment(target: int, gt_domains: int, generated_domains: int, a
         n_real_segments = None
 
     # ------------ plot ------------
-    _plot_series_with_baselines(
+    _plot_results_if_enabled(
+        args,
         **_prepare_plot_kwargs(
             args,
             results,
@@ -2258,11 +2389,14 @@ def run_portraits_experiment(gt_domains: int, generated_domains: int, args=None)
         cache_dir=_encoded_cache_dir(args),
         target_label=1,
     )
-    attach_shared_pca(args, encoded_intersets)
+    if not bool(getattr(args, "no_plots", False)):
+        attach_shared_pca(args, encoded_intersets)
+    else:
+        args.shared_pca = None
     maybe_cache_source_stats(args, e_src)
 
     # Fit EM bundles only when we will actually generate/use synthetic domains.
-    if generated_domains > 0:
+    if generated_domains > 0 or bool(getattr(args, "prepare_only", False)):
         teacher = copy.deepcopy(ref_model).to(device).eval()
         raw_domains = [src_trainset] + all_sets
         domain_keys = ["source"] + [f"real{i}" for i in range(len(all_sets) - 1)] + ["target"]
@@ -2281,6 +2415,10 @@ def run_portraits_experiment(gt_domains: int, generated_domains: int, args=None)
         print(f"[Portraits] EM→class accuracy: {em_acc_now:.4f}")
     else:
         print("[Portraits] generated_domains=0: skipping EM bundle fitting.")
+
+    if bool(getattr(args, "prepare_only", False)):
+        print("[prepare] Portraits encoded features and raw EM artifacts are ready.")
+        return {}
 
     results = run_core_methods(
         args,
@@ -2302,7 +2440,8 @@ def run_portraits_experiment(gt_domains: int, generated_domains: int, args=None)
     )
 
     # ---------- plot ----------
-    _plot_series_with_baselines(
+    _plot_results_if_enabled(
+        args,
         **_prepare_plot_kwargs(
             args,
             results,
@@ -2425,11 +2564,14 @@ def run_covtype_experiment(gt_domains: int, generated_domains: int, args=None):
         cache_dir=_encoded_cache_dir(args),
         target_label=1,
     )
-    attach_shared_pca(args, encoded_intersets)
+    if not bool(getattr(args, "no_plots", False)):
+        attach_shared_pca(args, encoded_intersets)
+    else:
+        args.shared_pca = None
     maybe_cache_source_stats(args, e_src)
 
     # Fit EM bundles only when we will actually generate/use synthetic domains.
-    if generated_domains > 0:
+    if generated_domains > 0 or bool(getattr(args, "prepare_only", False)):
         teacher = copy.deepcopy(ref_model).to(device).eval()
         raw_domains = [src_trainset] + all_sets
         domain_keys = ["source"] + [f"real{i}" for i in range(len(all_sets) - 1)] + ["target"]
@@ -2448,6 +2590,10 @@ def run_covtype_experiment(gt_domains: int, generated_domains: int, args=None):
         print(f"[CovType] EM→class accuracy: {em_acc_now:.4f}")
     else:
         print("[CovType] generated_domains=0: skipping EM bundle fitting.")
+
+    if bool(getattr(args, "prepare_only", False)):
+        print("[prepare] CovType encoded features and raw EM artifacts are ready.")
+        return {}
 
     results = run_core_methods(
         args,
@@ -2469,7 +2615,8 @@ def run_covtype_experiment(gt_domains: int, generated_domains: int, args=None):
     )
 
     # ---------- plot ----------
-    _plot_series_with_baselines(
+    _plot_results_if_enabled(
+        args,
         **_prepare_plot_kwargs(
             args,
             results,
@@ -2597,24 +2744,21 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
         cache_dir=_encoded_cache_dir(args),
         target_label=1,
     )
-    shared_pca = fit_global_pca(
-        domains=encoded_intersets,
-        classes=None,
-        pool="auto",
-        n_components=2,
-        per_domain_cap=10000,
-        random_state=args.seed if hasattr(args, "seed") else 0,
-    )
-    args.shared_pca = shared_pca
-
-    # Optional: cache source Gaussian params for prototype matching
-    if getattr(args, "em_match", "pseudo") == "prototypes":
-        mu_s, Sigma_s, priors_s = fit_source_gaussian_params(
-            X=e_src.data, y=e_src.targets
+    if not bool(getattr(args, "no_plots", False)):
+        args.shared_pca = fit_global_pca(
+            domains=encoded_intersets,
+            classes=None,
+            pool="auto",
+            n_components=2,
+            per_domain_cap=10000,
+            random_state=args.seed if hasattr(args, "seed") else 0,
         )
-        args._cached_source_stats = (mu_s, Sigma_s, priors_s)
+    else:
+        args.shared_pca = None
+
+    maybe_cache_source_stats(args, e_src)
     # Fit EM bundles only when we will actually generate/use synthetic domains.
-    if generated_domains > 0:
+    if generated_domains > 0 or bool(getattr(args, "prepare_only", False)):
         # ---- (E) Frozen teacher for pseudo-labels on every REAL domain ----
         with torch.no_grad():
             teacher = copy.deepcopy(ref_model).to(device).eval()
@@ -2636,6 +2780,10 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
         print(f"[ColorMNIST] EM→class accuracy: {em_acc_now:.4f}")
     else:
         print("[ColorMNIST] generated_domains=0: skipping EM bundle fitting.")
+
+    if bool(getattr(args, "prepare_only", False)):
+        print("[prepare] Color-MNIST encoded features and raw EM artifacts are ready.")
+        return {}
     src_trainset.targets_em = src_trainset.targets  # for plotting
     results = run_core_methods(
         args,
@@ -2648,7 +2796,8 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
         target_label=1,
     )
 
-    _plot_series_with_baselines(
+    _plot_results_if_enabled(
+        args,
         **_prepare_plot_kwargs(
             args,
             results,
@@ -2698,6 +2847,11 @@ def run_color_mnist_experiment(gt_domains: int, generated_domains: int, args=Non
 
 
 def main(cli_args: argparse.Namespace) -> None:
+    prepared_root = str(getattr(cli_args, "prepared_artifact_root", "") or "").strip()
+    if bool(getattr(cli_args, "prepare_only", False)) and not prepared_root:
+        raise ValueError("--prepare-only requires --prepared-artifact-root")
+    if bool(getattr(cli_args, "require_prepared_artifacts", False)) and not prepared_root:
+        raise ValueError("--require-prepared-artifacts requires --prepared-artifact-root")
     set_all_seeds(cli_args.seed)
     print(cli_args)
 
@@ -2758,6 +2912,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--pseudo-confidence-q", type=float, default=0.9)
     parser.add_argument(
         "--plot-root",
         type=str,
@@ -2811,6 +2966,49 @@ if __name__ == "__main__":
         default="bic",
         help="Criterion to select best EM model",
     )
+    parser.add_argument("--em-seeds", nargs="+", type=int, default=[0, 1, 2])
+    parser.add_argument(
+        "--em-seed-mode",
+        choices=["offset", "absolute"],
+        default="offset",
+    )
+    parser.add_argument(
+        "--em-cov-types",
+        nargs="+",
+        choices=["diag", "full"],
+        default=["diag"],
+    )
+    parser.add_argument(
+        "--em-pca-dims",
+        nargs="+",
+        default=["none"],
+        help="EM PCA dimensions; use 'none' to disable PCA.",
+    )
+    parser.add_argument(
+        "--prepared-artifact-root",
+        default="",
+        help="Versioned immutable artifacts shared by isolated sweep workers.",
+    )
+    parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="Prepare encoded features and raw EM artifacts, then exit before adaptation.",
+    )
+    parser.add_argument(
+        "--require-prepared-artifacts",
+        action="store_true",
+        help="Fail instead of fitting EM if a required prepared artifact is missing or invalid.",
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Skip PCA/statistical plot artifacts during batch sweeps.",
+    )
+    parser.add_argument(
+        "--skip-pooled-goat",
+        action="store_true",
+        help="Skip mapping-invariant pooled GOAT when another worker already produced it.",
+    )
     parser.add_argument(
         "--goat-gen-methods",
         type=str,
@@ -2831,4 +3029,8 @@ if __name__ == "__main__":
         ),
     )
     args = parser.parse_args()
+    args.em_pca_dims = [
+        None if str(value).strip().lower() in {"none", "null", "0", "-1"} else int(value)
+        for value in args.em_pca_dims
+    ]
     main(args)
